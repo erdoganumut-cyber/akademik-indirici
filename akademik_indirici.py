@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.1.2"
 
 CHUNK_SIZE = 64 * 1024              # parça parça indirme boyutu (64 KB)
 HTML_READ_LIMIT = 5 * 1024 * 1024   # PDF bağlantısı aramak için okunacak en fazla HTML
@@ -2739,9 +2739,13 @@ def parse_oai_page(xml_bytes: bytes):
 
 
 def harvest_dergipark(session, since: datetime, until: datetime, progress=None, cancel=None):
-    """DergiPark'a 'since' tarihinden beri eklenen/güncellenen makaleleri sayfa sayfa getirir."""
-    params = {"verb": "ListRecords", "metadataPrefix": "oai_dc",
-              "from": since.strftime("%Y-%m-%dT%H:%M:%SZ"), "until": until.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    """DergiPark'a 'since' tarihinden beri eklenen/güncellenen makaleleri sayfa sayfa getirir.
+
+    DergiPark kayıt tarihlerini saatsiz (yalnızca gün) veriyor; saatli bir 'from' o günün
+    kayıtlarını dışarıda bırakır. Bu yüzden gün bazında ve bir gün örtüşmeyle sorulur
+    (örtüşen kayıtlar kütüphanede zaten olduğu için yeniden eklenmez)."""
+    start = (since - timedelta(days=1)).strftime("%Y-%m-%d")
+    params = {"verb": "ListRecords", "metadataPrefix": "oai_dc", "from": start}
     pages = fetched = 0
     while True:
         if cancel is not None and cancel.is_set():
@@ -2767,7 +2771,7 @@ def harvest_dergipark(session, since: datetime, until: datetime, progress=None, 
 
 def search_crossref(session, query: str, since: datetime, rows: int = 100):
     params = {"query.bibliographic": query, "rows": rows,
-              "filter": f"from-created-date:{since.strftime('%Y-%m-%d')}",
+              "filter": f"from-created-date:{(since - timedelta(days=1)).strftime('%Y-%m-%d')}",
               # Yalnızca Crossref'in kabul ettiği (denenmiş) alanlar: geçersiz tek bir alan bütün
               # sorguyu reddettirir. Cilt/sayı/sayfa, eşleşen kayıtlar için ayrıca tam kayıttan alınır.
               "select": CROSSREF_SELECT}
@@ -2796,6 +2800,8 @@ def write_scan_report(path: Path, info: dict, found: list, added_items: list) ->
     """found: [{"record", "hits", "status", "item_id"}] · added_items: o hafta eklenen kaynaklar"""
     groups = {}
     for entry in found:
+        if entry["status"] == "known":          # önceki taramalarda zaten raporlandı
+            continue
         for group in entry["hits"]:
             groups.setdefault(group, []).append(entry)
     status_label = {"pdf": ("PDF indirildi", "ok"), "nopdf": ("PDF yok", "warn"),
