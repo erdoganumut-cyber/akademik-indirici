@@ -67,7 +67,10 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.3"
+APP_VERSION = "2.6"
+# Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
+# eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
+MIN_LAUNCHER = "2.6"
 
 CHUNK_SIZE = 64 * 1024              # parça parça indirme boyutu (64 KB)
 HTML_READ_LIMIT = 5 * 1024 * 1024   # PDF bağlantısı aramak için okunacak en fazla HTML
@@ -530,7 +533,7 @@ _WANTED_META = {
     "citation_lastpage", "citation_publisher", "citation_language", "citation_book_title",
     "citation_inbook_title", "citation_conference_title", "citation_dissertation_institution",
     "citation_technical_report_institution", "citation_isbn", "dc.publisher", "dc.language",
-    "citation_keywords", "keywords", "dc.subject",
+    "citation_keywords", "keywords", "dc.subject", "citation_issn", "prism.issn", "prism.eissn",
 }
 
 
@@ -615,7 +618,7 @@ def parse_attrs(tag: str) -> dict:
 def parse_citation_meta(page: str) -> dict:
     """Google Scholar / Dublin Core <meta> etiketlerini okur (ilk değer geçerli).
     Tüm yazarlar ayrıca meta["_authors"] listesinde tutulur."""
-    meta, authors, keywords = {}, [], []
+    meta, authors, keywords, issns = {}, [], [], []
     for tag in _META_TAG_RE.findall(page):
         attrs = parse_attrs(tag)
         key = (attrs.get("name") or attrs.get("property") or "").lower()
@@ -625,12 +628,16 @@ def parse_citation_meta(page: str) -> dict:
             authors.append(attrs["content"])
         if key in ("citation_keywords", "dc.subject") and attrs.get("content"):
             keywords.extend(split_keywords(attrs["content"]))
+        if key in ("citation_issn", "prism.issn", "prism.eissn") and attrs.get("content"):
+            issns.append(attrs["content"])
         if key in _WANTED_META and attrs.get("content") and key not in meta:
             meta[key] = attrs["content"]
     if authors:
         meta["_authors"] = authors
     if keywords:
         meta["_keywords"] = keywords
+    if issns:
+        meta["_issn"] = issns
     return meta
 
 
@@ -880,7 +887,7 @@ def history_key(url: str) -> str:
 
 
 def history_path() -> Path:
-    return settings_path().parent / "indirme_gecmisi.json"
+    return data_dir() / "indirme_gecmisi.json"
 
 
 def load_history() -> dict:
@@ -1456,7 +1463,7 @@ ITEM_TYPES = {
 }
 TYPE_BY_LABEL = {label: key for key, label in ITEM_TYPES.items()}
 RECORD_FIELDS = ("title", "authors", "year", "type", "container", "volume", "issue", "pages",
-                 "publisher", "doi", "url", "editors", "institution", "language", "keywords")
+                 "publisher", "doi", "url", "editors", "institution", "language", "keywords", "issn")
 
 _CROSSREF_TYPES = {
     "journal-article": "article", "book-chapter": "chapter", "book-section": "chapter",
@@ -1488,6 +1495,42 @@ def fold(text: str) -> str:
     text = unicodedata.normalize("NFKD", tr_lower(text))
     text = "".join(c for c in text if not unicodedata.combining(c))
     return text.replace("ı", "i")
+
+
+_ISSN_RE = re.compile(r"(?<![\dXx-])(\d{4})[-\u2010-\u2015 ]?(\d{3}[\dXx])(?![\dXx])")
+
+
+def issn_valid(code: str) -> bool:
+    """8 karakterlik ISSN'in denetim hanesi doğru mu? (yıl aralıklarını ayıklar: 2026-2027)"""
+    if not re.fullmatch(r"\d{7}[\dX]", code):
+        return False
+    total = sum(int(c) * w for c, w in zip(code[:7], range(8, 1, -1)))
+    check = (11 - total % 11) % 11
+    return code[7] == ("X" if check == 10 else str(check))
+
+
+def norm_issn(value) -> str:
+    """'1234-567x', '1234567X', 123456 (Excel'de baştaki sıfırı düşmüş) → '1234567X' ya da ''"""
+    code = re.sub(r"[^0-9Xx]", "", str(value or "")).upper()
+    if 4 <= len(code) < 8 and code.isdigit():
+        code = code.zfill(8)
+    return code if issn_valid(code) else ""
+
+
+def find_issns(text) -> list:
+    if isinstance(text, (list, tuple)):
+        text = " ".join(str(t) for t in text)
+    out = []
+    for a, b in _ISSN_RE.findall(str(text or "")):
+        code = norm_issn(a + b)
+        if code and code not in out:
+            out.append(code)
+    return out
+
+
+def join_issns(values) -> str:
+    codes = find_issns(values) if not isinstance(values, str) else find_issns(values)
+    return "; ".join(f"{c[:4]}-{c[4:]}" for c in codes)
 
 
 def tr_sort_key(text: str):
@@ -1647,6 +1690,7 @@ def finalize_record(rec: dict) -> dict:
     rec["title"] = rec["title"].rstrip(" .")
     rec["pages"] = re.sub(r"^(?:pp?\.|ss?\.)\s*", "", rec["pages"]).replace("--", "–").replace("-", "–")
     rec["doi"] = normalize_doi(rec["doi"]) or ""
+    rec["issn"] = join_issns(find_issns(rec["issn"]))
     m = re.search(r"\b(1[5-9]\d\d|20\d\d)\b", rec["year"] or "")
     rec["year"] = m.group(1) if m else ""
     if rec["type"] not in ITEM_TYPES:
@@ -1682,6 +1726,7 @@ def record_from_crossref(msg: dict) -> dict:
         "issue": clean_text(msg.get("issue", "")), "pages": clean_text(msg.get("page", "")),
         "publisher": clean_text(msg.get("publisher", "")), "doi": msg.get("DOI", ""),
         "institution": clean_text(institution), "language": msg.get("language", ""),
+        "issn": join_issns(msg.get("ISSN") or []),
     }
 
 
@@ -1732,6 +1777,7 @@ def record_from_meta(meta: dict, url: str = "") -> dict:
                        or meta.get("citation_technical_report_institution") or "",
         "language": meta.get("citation_language") or meta.get("dc.language") or "",
         "keywords": join_keywords(meta.get("_keywords") or split_keywords(meta.get("keywords", ""))),
+        "issn": join_issns(meta.get("_issn") or []),
     }
 
 
@@ -2111,6 +2157,7 @@ _EXTRA_COLUMNS = {
     "source": "TEXT DEFAULT ''",        # indirme / tarama / klasör / elle
     "matched": "TEXT DEFAULT ''",       # taramada eşleşen grup ve kelimeler
     "keywords": "TEXT DEFAULT ''",      # makalenin kendi anahtar kelimeleri ('; ' ile)
+    "issn": "TEXT DEFAULT ''",          # derginin ISSN'leri ('1234-5678; 2345-6789'), Scopus eşleştirmesi için
 }
 
 
@@ -2128,18 +2175,125 @@ def clean_tags(text_or_list) -> list:
 class Library:
     """Kaynakların künyesi, etiketleri, notları ve PDF tam metni (dosyalar yerinde kalır)."""
 
-    def __init__(self, path=None):
+    def __init__(self, path=None, root=None, relative=None):
         self.path = Path(path) if path else settings_path().parent / "kutuphane.db"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.db = sqlite3.connect(str(self.path), check_same_thread=False, timeout=30)
         self.db.row_factory = sqlite3.Row
+        self._ensure_schema()
+        self.configure_paths(root, relative)
+
+    def _ensure_schema(self):
         with self.lock, self.db:
             self.db.executescript(_SCHEMA)
             have = {r[1] for r in self.db.execute("PRAGMA table_info(items)")}
             for column, decl in _EXTRA_COLUMNS.items():
                 if column not in have:
                     self.db.execute(f"ALTER TABLE items ADD COLUMN {column} {decl}")
+
+    # --- PDF yolları: ortak kütüphanede kütüphane klasörüne göre (göreli) saklanır -----------
+    def configure_paths(self, root=None, relative=None):
+        settings = load_settings() if root is None or relative is None else {}
+        root = root if root is not None else settings.get("library_folder")
+        self.root = Path(root) if root else None
+        self.relative = bool(settings.get("shared_library")) if relative is None else bool(relative)
+
+    def _abs(self, stored):
+        if not stored:
+            return stored or ""
+        if not os.path.isabs(stored):
+            return str(self.root / stored) if self.root else stored
+        if self.root and not os.path.exists(stored):        # başka bilgisayardan kalma mutlak yol
+            alt = self.root / Path(stored.replace("\\", "/")).name
+            if alt.is_file():
+                return str(alt)
+        return stored
+
+    def _stored(self, path) -> str:
+        if not path:
+            return ""
+        path = str(path)
+        if self.relative and self.root and os.path.isabs(path):
+            root = os.path.normcase(os.path.abspath(str(self.root))).rstrip("\\/")
+            full = os.path.normcase(os.path.abspath(path))
+            if full.startswith(root + os.sep):
+                return Path(os.path.relpath(os.path.abspath(path), os.path.abspath(str(self.root)))).as_posix()
+        return path
+
+    def relativize_paths(self) -> int:
+        """Kütüphane klasöründeki PDF'lerin yollarını göreli yapar (ortak kütüphaneye geçerken)."""
+        changed = 0
+        with self.lock, self.db:
+            for item_id, fp in self.db.execute("SELECT id, file_path FROM items WHERE file_path!=''").fetchall():
+                new = self._stored(self._abs(fp))
+                if new != fp:
+                    self.db.execute("UPDATE items SET file_path=? WHERE id=?", (new, item_id))
+                    changed += 1
+        return changed
+
+    # --- ortak kütüphane: anlık kopya al/ver, birleştir --------------------------------
+    def backup_to(self, path):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        dest = sqlite3.connect(str(path))
+        try:
+            with self.lock:
+                self.db.commit()
+                self.db.backup(dest)
+        finally:
+            dest.close()
+
+    def restore_from(self, path):
+        src = sqlite3.connect(f"file:{Path(path).as_posix()}?mode=ro", uri=True)
+        try:
+            with self.lock:
+                self.db.commit()
+                src.backup(self.db)
+        finally:
+            src.close()
+        self._ensure_schema()
+
+    def merge_from(self, other) -> tuple:
+        """Diğer kütüphanedeki kaynakları ekler; ortak olanlarda etiketleri, kartları ve boş alanları
+        birleştirir. Dönüş: (eklenen, güncellenen)"""
+        added = updated = 0
+        for item in other.all_items():
+            target = (self.find_by_sha(item["sha256"]) if item.get("sha256") else None) \
+                or self.find_by_doi(item["doi"]) or self.find_by_title(item["title"])
+            if target is None:
+                rec = {k: item.get(k) for k in RECORD_FIELDS}
+                with self.lock, self.db:
+                    target, _ = self.add(rec, file_path=item["file_path"] or None, sha=item.get("sha256") or "",
+                                         tags=item["tags"], source=item.get("source") or "",
+                                         is_new=bool(item.get("is_new")), matched=item.get("matched") or "")
+                    self.db.execute("UPDATE items SET added=?, notes=? WHERE id=?",
+                                    (item.get("added") or "", item.get("notes") or "", target))
+                added += 1
+            else:
+                mine = self.get(target)
+                fill = {k: item[k] for k in RECORD_FIELDS if not mine.get(k) and item.get(k)}
+                if not (mine["file_path"] and os.path.exists(mine["file_path"])) and item["file_path"] \
+                        and os.path.exists(item["file_path"]):
+                    fill.update(file_path=item["file_path"], sha256=item.get("sha256") or "")
+                if fill:
+                    self.update(target, fill)
+                before = len(mine["tags"])
+                self.add_tags(target, item["tags"])
+                if len(self.get(target)["tags"]) != before or fill:
+                    updated += 1
+            have = {fold(c["quote"]) + "|" + c["page"] for c in self.cards(target)}
+            for c in other.cards(item["id"]):
+                if fold(c["quote"]) + "|" + c["page"] not in have:
+                    self.add_card(target, c["page"], c["quote"], c["comment"])
+            with self.lock:
+                row = other.db.execute("SELECT content FROM fulltext WHERE item_id=?", (item["id"],)).fetchone()
+                mine_ft = self.db.execute("SELECT 1 FROM fulltext WHERE item_id=?", (target,)).fetchone()
+            if row and row[0] and not mine_ft:
+                with self.lock, self.db:
+                    self.db.execute("INSERT OR REPLACE INTO fulltext (item_id, content) VALUES (?, ?)",
+                                    (target, row[0]))
+        return added, updated
 
     # --- okuma ---------------------------------------------------------------
     def _to_item(self, row) -> dict:
@@ -2149,6 +2303,8 @@ class Library:
                 item[key] = json.loads(item[key] or "[]")
             except ValueError:
                 item[key] = []
+        if "file_path" in item:
+            item["file_path"] = self._abs(item["file_path"])
         return item
 
     def get(self, item_id: int):
@@ -2213,7 +2369,8 @@ class Library:
 
     def find_by_path(self, path):
         with self.lock:
-            row = self.db.execute("SELECT id FROM items WHERE file_path=?", (str(path),)).fetchone()
+            row = self.db.execute("SELECT id FROM items WHERE file_path IN (?, ?)",
+                                  (str(path), self._stored(path))).fetchone()
         return row[0] if row else None
 
     def fulltext_ids(self, words) -> set:
@@ -2249,13 +2406,13 @@ class Library:
             cur = self.db.execute(
                 "INSERT INTO items (title, authors, year, type, container, volume, issue, pages, "
                 "publisher, doi, url, editors, institution, language, file_path, sha256, added, "
-                "source, is_new, matched, keywords) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "source, is_new, matched, keywords, issn) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (rec["title"], json.dumps(rec["authors"], ensure_ascii=False), rec["year"], rec["type"],
                  rec["container"], rec["volume"], rec["issue"], rec["pages"], rec["publisher"],
                  rec["doi"], rec["url"], json.dumps(rec["editors"], ensure_ascii=False),
-                 rec["institution"], rec["language"], str(file_path or ""), sha,
+                 rec["institution"], rec["language"], self._stored(file_path), sha,
                  datetime.now().strftime("%Y-%m-%d"), source, 1 if is_new else 0, matched,
-                 rec["keywords"]))
+                 rec["keywords"], rec["issn"]))
             item_id = cur.lastrowid
             if fulltext:
                 self.set_fulltext(item_id, fulltext)
@@ -2269,6 +2426,8 @@ class Library:
             if key not in allowed:
                 continue
             values[key] = json.dumps(value, ensure_ascii=False) if key in ("authors", "editors") else value
+            if key == "file_path":
+                values[key] = self._stored(value)
         if not values:
             return
         with self.lock, self.db:
@@ -2577,7 +2736,7 @@ def attach_pdf(library, item_id: int, path, library_folder=None, move=True):
 DERGIPARK_OAI = "https://dergipark.org.tr/api/public/oai/"
 CROSSREF_SEARCH = "https://api.crossref.org/works"
 CROSSREF_SELECT = ("DOI,title,subtitle,author,editor,container-title,issued,published-print,"
-                   "published-online,type,abstract,subject,URL")
+                   "published-online,type,abstract,subject,URL,ISSN")
 SCAN_INTERVAL_DAYS = 7
 SCAN_FIRST_WINDOW_DAYS = 7          # ilk taramada geriye dönük bakılacak gün
 SCAN_MAX_OAI_PAGES = 600
@@ -2590,12 +2749,14 @@ DEFAULT_KEYWORDS = """\
 # ve Türkçe karakter farkı gözetilmez, kelimenin sonuna gelen ekler de yakalanır
 # ('halk oyun' → halk oyunları, halk oyunlarının...).
 # 'bağlam:' satırı gruptaki her terim için; 'terim ; bağlam: a, b' yalnızca o terim için:
-# terimle birlikte bu kelimelerden biri de geçmelidir (çok anlamlı kısa terimler için).
+# terimle birlikte bu kelimelerden biri de geçmelidir (çok anlamlı terimler için).
+# Terim yalnızca özette geçiyorsa bağlam kelimesi başlıkta ya da anahtar kelimelerde
+# aranır; böylece özetinde bir kez 'collective memory' geçen mimarlık yazısı gelmez.
 # 'kök → tam hâli': eşleştirmede kök, Crossref aramasında tam hâli kullanılır.
 # '#' ile başlayan satırlar açıklamadır.
 
 [Halk dansları ve sahneleme]
-bağlam: halk, oyun, dans, dance, folklor, folklore, folk
+bağlam: dans, dance, halk oyun, folk, folklor, folklore, koreograf, choreograph, oyun havası, zeybek, halay, horon
 halk oyun → halk oyunları
 halk dans → halk dansları
 folk dance
@@ -2621,12 +2782,12 @@ labanotation
 laban notasyon → laban notasyonu
 kinetografi
 kinetography
-benesh
+benesh ; bağlam: dans, dance, notation, notasyon, movement, hareket
 laban hareket analiz → laban hareket analizi
 laban movement analysis
 
 [Dijital dönüşüm, MR ve hareket yakalama]
-bağlam: dans, dance, oyun, folklor, folklore, miras, heritage, kültür, cultur, gelenek, tradition
+bağlam: dans, dance, halk oyun, folk, folklor, folklore, koreograf, choreograph, somut olmayan, intangible, ritüel, ritual, zeybek, halay, horon
 hareket yakala → hareket yakalama
 motion captur → motion capture
 karma gerçeklik
@@ -2644,26 +2805,25 @@ poz tahmin → poz tahmini
 markerless
 
 [Somut olmayan kültürel miras]
-bağlam: miras, heritage, dans, dance, gelenek, tradition, kültür, cultur
 somut olmayan kültürel miras
 intangible cultural heritage
 yaşayan insan hazine → yaşayan insan hazineleri
 living human treasure
-miras statüsü
-heritage status
+miras statüsü ; bağlam: somut olmayan, intangible, unesco, gelenek, tradition, dans, dance, folklor, folklore
+heritage status ; bağlam: somut olmayan, intangible, unesco, gelenek, tradition, dans, dance, folklor, folklore
 dans belgeleme
 dance documentation
-safeguarding
+safeguarding ; bağlam: somut olmayan, intangible, kültürel miras, cultural heritage, unesco, folklor, folklore, dans, dance
 
 [Geleneksel sohbet toplantıları ve kültürel bellek]
 geleneksel sohbet toplantı → geleneksel sohbet toplantıları
 sohbet toplantı → sohbet toplantıları
 traditional sohbet
 sohbet meeting
-kültürel bellek
-cultural memory
-toplumsal bellek
-collective memory
+kültürel bellek ; bağlam: sohbet, folklor, folklore, sözlü, oral, ritüel, ritual, dans, dance, halk kültür, folk, halk müzi, türkü, aşık, ozan, halkbilim
+cultural memory ; bağlam: sohbet, folklor, folklore, sözlü, oral, ritüel, ritual, dans, dance, halk kültür, folk, halk müzi, türkü, aşık, ozan, halkbilim
+toplumsal bellek ; bağlam: sohbet, folklor, folklore, sözlü, oral, ritüel, ritual, dans, dance, halk kültür, folk, halk müzi, türkü, aşık, ozan, halkbilim
+collective memory ; bağlam: sohbet, folklor, folklore, sözlü, oral, ritüel, ritual, dans, dance, halk kültür, folk, halk müzi, türkü, aşık, ozan, halkbilim
 birikme gece → birikme geceleri
 ateş gezme → ateş gezmesi
 sıra gecesi
@@ -2678,15 +2838,15 @@ dijital kültür
 digital culture
 e-kültürle → e-kültürleme
 dijital kültürlenme
-kültürel aktarım
-cultural transmission
+kültürel aktarım ; bağlam: dijital, digital, sosyal medya, social media, dans, dance, folklor, folklore, halk kültür, somut olmayan, intangible, gelenek
+cultural transmission ; bağlam: dijital, digital, social media, dance, folklore, folk, intangible, tradition
 algoritmik kültür
 algorithmic culture
 platform kültür → platform kültürü
 platform culture
 
 [Gelenek, icra ve yorum]
-bağlam: dans, dance, oyun, müzik, music, halk, folk, gelenek, tradition, sanat, art
+bağlam: dans, dance, halk oyun, folk, folklor, folklore, koreograf, choreograph, halk müzi, türk müzi, geleneksel müzik, traditional music, türkü, zeybek, halay
 icracı
 yorumcu
 otantiklik
@@ -2715,7 +2875,7 @@ aksak ritim
 asma davul
 
 [Dans, kimlik ve kültür politikası]
-bağlam: dans, dance, oyun, folklor, folklore, müzik, music, halk, folk
+bağlam: dans, dance, halk oyun, folk dance, folklor, folklore, koreograf, choreograph, halk müzi, folk music, zeybek, halay, horon
 kimlik
 identity
 ulus inşa → ulus inşası
@@ -2732,17 +2892,20 @@ milliyetçilik
 nationalism
 
 [Yöresel oyunlar]
-bağlam: oyun, dans, halk, folk, dance, yöre, folklor
+bağlam: halk oyun, oyun, dans, dance, folk, folklor, yöre
 zeybek
 horon
 halay
-bar
-teke
+bar oyun → bar oyunları
+erzurum bar → erzurum barları
+teke yöre → teke yöresi
+teke zeybe → teke zeybeği
 kılıç kalkan
 kaşık oyun → kaşık oyunları
-karşılama
+karşılama ; bağlam: halk oyun, oyun havası, dans, dance, rumeli, trakya, roman
 
 [Dans ve bedenlenmiş biliş]
+bağlam: dans, dance, koreograf, choreograph, hareket, movement, müzik, music, ritim, rhythm
 bedenlenmiş biliş
 embodied cognition
 embodiment ; bağlam: dance, dans
@@ -2759,14 +2922,39 @@ kinesthetic empathy
 
 
 def keywords_path() -> Path:
-    return settings_path().parent / "anahtar_kelimeler.txt"
+    return data_dir() / "anahtar_kelimeler.txt"
+
+
+# Önceki sürümlerin varsayılan listeleri: kullanıcı bunları hiç değiştirmediyse yenisine geçilir
+OLD_DEFAULT_KEYWORD_HASHES = {"cb93bc396b7182e6610e9ceec3fb010cf3ebd45421ba2d2925e219cfd047df38"}
+
+
+def _text_hash(text: str) -> str:
+    return hashlib.sha256((text or "").strip().encode("utf-8")).hexdigest()
+
+
+def keywords_customized() -> bool:
+    """Kullanıcı kendi listesini mi kullanıyor (varsayılandan farklı ve eski varsayılan değil)?"""
+    try:
+        text = keywords_path().read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return _text_hash(text) not in OLD_DEFAULT_KEYWORD_HASHES | {_text_hash(DEFAULT_KEYWORDS)}
 
 
 def load_keywords_text() -> str:
     try:
-        return keywords_path().read_text(encoding="utf-8")
+        text = keywords_path().read_text(encoding="utf-8")
     except OSError:
         return DEFAULT_KEYWORDS
+    if _text_hash(text) in OLD_DEFAULT_KEYWORD_HASHES:     # eski varsayılan → güncel varsayılan
+        try:
+            save_keywords_text(DEFAULT_KEYWORDS)
+            diag("anahtar kelimeler yeni varsayılan listeye güncellendi")
+        except OSError:
+            pass
+        return DEFAULT_KEYWORDS
+    return text
 
 
 def save_keywords_text(text: str):
@@ -2810,8 +2998,15 @@ def parse_keyword_groups(text: str) -> list:
     return [g for g in groups if g["terms"]]
 
 
+_SOFTEN = {"k": "[kg]", "p": "[pb]", "t": "[td]"}
+
+
 def _word_start(word: str):
-    return re.compile(r"(?<!\w)" + re.escape(fold(word)))
+    """Kelime başından eşleşir; Türkçe ünsüz yumuşamasını da tanır (bellek → belleği, kimlik → kimliği)."""
+    w = fold(word).strip()
+    if len(w) >= 4 and w[-1] in _SOFTEN:
+        return re.compile(r"(?<!\w)" + re.escape(w[:-1]) + _SOFTEN[w[-1]])
+    return re.compile(r"(?<!\w)" + re.escape(w))
 
 
 class KeywordMatcher:
@@ -2827,14 +3022,22 @@ class KeywordMatcher:
                 terms.append((t["term"], _word_start(t["term"]), ctx, t.get("query") or t["term"]))
             self.groups.append((g["name"], terms))
 
-    def match(self, text: str) -> dict:
-        """{grup adı: [eşleşen terimler]}"""
-        body = fold(text)
+    def match(self, text: str, strong: str = None) -> dict:
+        """{grup adı: [eşleşen terimler]}
+        strong: başlık + anahtar kelimeler. Verilirse, terim yalnızca özette (text) geçtiğinde
+        bağlam kelimesi strong içinde aranır (özette bir kez geçen genel terimler gürültü yapmasın)."""
+        body = fold(text if strong is None else strong + " " + text)
+        head = body if strong is None else fold(strong)
         hits = {}
         for name, terms in self.groups:
             for term, rx, ctx, _ in terms:
-                if rx.search(body) and (not ctx or any(c.search(body) for c in ctx)):
-                    hits.setdefault(name, []).append(term)
+                if not rx.search(body):
+                    continue
+                if ctx:
+                    where = body if rx.search(head) else head
+                    if not any(c.search(where) for c in ctx):
+                        continue
+                hits.setdefault(name, []).append(term)
         return hits
 
     def search_terms(self) -> list:
@@ -2930,6 +3133,7 @@ def parse_oai_page(xml_bytes: bytes):
             "language": languages[0] if languages else "",
             "url": url, "doi": doi or "", "type": "article", "source": "DergiPark",
             "keywords": join_keywords(k for subj in values("subject") for k in split_keywords(subj)),
+            "issn": join_issns(find_issns(" ".join(values("source") + values("identifier")))),
         })
     token_el = root.find(".//oai:resumptionToken", _NS)
     token = token_el.text.strip() if token_el is not None and token_el.text and token_el.text.strip() else None
@@ -3005,6 +3209,7 @@ def write_scan_report(path: Path, info: dict, found: list, added_items: list) ->
             continue
         for group in entry["hits"]:
             groups.setdefault(group, []).append(entry)
+    scopus = load_scopus()
     status_label = {"pdf": ("PDF indirildi", "ok"), "nopdf": ("PDF yok", "warn"),
                     "institution": ("Kurum erişimi gerekebilir", "inst"), "known": ("Zaten kütüphanede", "muted")}
 
@@ -3020,11 +3225,13 @@ def write_scan_report(path: Path, info: dict, found: list, added_items: list) ->
         db = database_for_doi(rec.get("doi", "")) if entry["status"] == "institution" else ""
         meta = " · ".join(x for x in (authors, rec.get("container"), rec.get("year")) if x)
         terms = ", ".join(dict.fromkeys(entry["hits"][group]))
+        sc = scopus_label(dict(rec, issn=shown["issn"]), scopus)
+        sc_chip = f'<span class="chip sc">{_h(sc)}</span>' if sc else ""
         title = _h(rec.get("title") or "(başlıksız)")
         title_html = f'<a href="{_h(link)}">{title}</a>' if link else title
         return (f'<li><div class="t">{title_html}</div><div class="m">{_h(meta)}</div>'
                 f'<div class="c"><span class="chip {cls}">{_h(label)}{" · " + _h(db) if db else ""}</span>'
-                f'<span class="chip">{_h(rec.get("source", ""))}</span>'
+                f'{sc_chip}<span class="chip">{_h(rec.get("source", ""))}</span>'
                 f'<span class="kw">eşleşen: {_h(terms)}</span></div></li>')
 
     sections = []
@@ -3066,7 +3273,7 @@ li{{background:var(--card);border:1px solid var(--line);border-radius:10px;paddi
 .m{{color:var(--muted);font-size:13px;margin-top:2px}}.c{{margin-top:6px;display:flex;flex-wrap:wrap;gap:6px;align-items:center}}
 .chip{{font-size:12px;border:1px solid var(--line);border-radius:999px;padding:1px 9px;color:var(--muted)}}
 .chip.ok{{color:var(--ok);border-color:var(--ok)}}.chip.warn{{color:var(--warn);border-color:var(--warn)}}
-.chip.inst{{color:var(--inst);border-color:var(--inst)}}.kw{{font-size:12px;color:var(--muted)}}
+.chip.inst{{color:var(--inst);border-color:var(--inst)}}.chip.sc{{color:#e9711c;border-color:#e9711c}}.kw{{font-size:12px;color:var(--muted)}}
 .empty{{color:var(--muted)}}footer{{color:var(--muted);font-size:12px;margin-top:40px}}
 </style></head><body><main>
 <h1>Haftalık Tarama Raporu</h1>
@@ -3209,9 +3416,9 @@ class ScanWorker(threading.Thread):
 
         def consider(rec):
             # dergi adı bilerek dışarıda: 'Millî Folklor'da çıkan her makale 'folklor' bağlamı sayılmasın
-            text = " ".join([rec.get("title", ""), " ".join(rec.get("all_titles", [])),
-                             " ".join(rec.get("subjects", [])), rec.get("description", "")])
-            hits = matcher.match(text)
+            strong = " ".join([rec.get("title", ""), " ".join(rec.get("all_titles", [])),
+                               " ".join(rec.get("subjects", [])), rec.get("keywords", "")])
+            hits = matcher.match(rec.get("description", ""), strong=strong)
             if hits:
                 k = key_of(rec)
                 if k in candidates:
@@ -3380,12 +3587,596 @@ def run_headless_scan():
     """Zamanlanmış görev: arayüz açmadan tarar, raporu yazar ve tarayıcıda açar."""
     settings = load_settings()
     library = Library()
+    sync = LibrarySync(library)
+    try:
+        if sync.status() == "al":
+            sync.pull()
+            settings = load_settings()
+    except Exception:
+        diag_exception("tarama öncesi eşitleme")
     events = queue.Queue()
     worker = ScanWorker(library, settings, events, threading.Event())
     worker.run()
+    try:
+        if sync.status() in ("gonder", "ilk"):
+            sync.push()
+            write_phone_export(library, settings.get("library_folder"))
+    except Exception:
+        diag_exception("tarama sonrası eşitleme")
     library.close()
     if worker.report_path and settings.get("open_report", True):
         webbrowser.open(Path(worker.report_path).as_uri())
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  5b) ORTAK KÜTÜPHANE (Google Drive / OneDrive): kütüphane klasörü bulutta durur; her
+#      bilgisayar kendi kopyasıyla çalışır, kopyalar klasördeki "_Kütüphane Verisi"nde buluşur.
+#      Veritabanı doğrudan bulutta açılmaz (eşitleme onu bozabilir); anlık kopyası alınıp verilir.
+# ════════════════════════════════════════════════════════════════════════════
+
+SHARED_DIR_NAME = "_Kütüphane Verisi"
+SHARED_DB_NAME = "kutuphane.db"
+SHARED_META_NAME = "kutuphane_bilgi.json"
+SHARED_STATE_NAME = "tarama_durumu.json"
+PHONE_EXPORT_NAME = "Kütüphane (telefon için).xlsx"
+SESSION_FRESH_MINUTES = 12
+
+
+def machine_name() -> str:
+    import platform
+    return os.environ.get("COMPUTERNAME") or platform.node() or "bilgisayar"
+
+
+def shared_dir(settings=None):
+    """Ortak kütüphane açıksa ve klasöre ulaşılabiliyorsa '_Kütüphane Verisi' klasörü, değilse None."""
+    s = settings if settings is not None else _load_settings_raw()
+    folder = s.get("library_folder")
+    if not s.get("shared_library") or not folder or not os.path.isdir(folder):
+        return None
+    return Path(folder) / SHARED_DIR_NAME
+
+
+def data_dir() -> Path:
+    """Anahtar kelimeler, Scopus listesi ve indirme geçmişi: ortak kütüphanede bulutta, değilse bu bilgisayarda."""
+    shared = shared_dir()
+    if shared is not None:
+        try:
+            shared.mkdir(parents=True, exist_ok=True)
+            return shared
+        except OSError:
+            pass
+    return settings_path().parent
+
+
+def _read_json(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def _file_stat(path):
+    try:
+        st = os.stat(path)
+        return [st.st_mtime_ns, st.st_size]
+    except OSError:
+        return None
+
+
+def _file_hash(path) -> str:
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
+    return h.hexdigest()
+
+
+def _rotate_backups(folder: Path, prefix: str, keep: int = 5):
+    files = sorted(folder.glob(prefix + "*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in files[keep:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
+class LibrarySync:
+    """Bu bilgisayarın kütüphanesi ile buluttaki ortak kopya arasındaki eşitleme.
+    Durumlar: kapali · ilk (bulutta kopya yok) · esit · gonder (burada değişti) ·
+    al (öbür bilgisayarda değişti) · cakisma (ikisinde de değişti)"""
+
+    def __init__(self, library):
+        self.lib = library
+
+    # yardımcılar
+    def folder(self):
+        return shared_dir()
+
+    def _state(self) -> dict:
+        return _load_settings_raw().get("sync") or {}
+
+    def _save_state(self, **kw):
+        s = _load_settings_raw()
+        state = s.get("sync") or {}
+        state.update(kw)
+        s["sync"] = state
+        save_settings(s)
+
+    def meta(self) -> dict:
+        folder = self.folder()
+        return _read_json(folder / SHARED_META_NAME) if folder else {}
+
+    def local_changed(self) -> bool:
+        state = self._state()
+        if not state.get("local_hash"):
+            return self.lib.count() > 0
+        if _file_stat(self.lib.path) == state.get("local_stat"):
+            return False
+        changed = _file_hash(self.lib.path) != state["local_hash"]
+        if not changed:                                   # yalnızca tarih değişmiş
+            self._save_state(local_stat=_file_stat(self.lib.path))
+        return changed
+
+    def shared_changed(self) -> bool:
+        meta = self.meta()
+        return bool(meta.get("rev")) and meta.get("rev") != self._state().get("shared_rev")
+
+    def status(self) -> str:
+        folder = self.folder()
+        if folder is None:
+            return "kapali"
+        if not (folder / SHARED_DB_NAME).is_file():
+            return "ilk"
+        local, shared = self.local_changed(), self.shared_changed()
+        if local and shared:
+            return "cakisma"
+        return "gonder" if local else "al" if shared else "esit"
+
+    def _mark_synced(self, rev):
+        self._save_state(local_hash=_file_hash(self.lib.path), local_stat=_file_stat(self.lib.path),
+                         shared_rev=rev, last_sync=datetime.now().strftime("%d.%m.%Y %H:%M"))
+
+    def _backup_local(self):
+        folder = settings_path().parent / "Yedekler"
+        self.lib.backup_to(folder / f"kutuphane_{datetime.now():%Y%m%d_%H%M%S}.db")
+        _rotate_backups(folder, "kutuphane_")
+
+    # işlemler
+    def push(self, force=False) -> str:
+        folder = self.folder()
+        if folder is None:
+            return "kapali"
+        if not force and self.shared_changed():
+            return "cakisma"
+        folder.mkdir(parents=True, exist_ok=True)
+        target = folder / SHARED_DB_NAME
+        if target.is_file():                                  # önceki ortak kopya yedeklenir
+            backups = folder / "Yedekler"
+            backups.mkdir(exist_ok=True)
+            try:
+                shutil.copy2(target, backups / f"ortak_{datetime.now():%Y%m%d_%H%M%S}.db")
+                _rotate_backups(backups, "ortak_")
+            except OSError:
+                pass
+        tmp = folder / (SHARED_DB_NAME + ".tmp")
+        if tmp.exists():
+            tmp.unlink()
+        self.lib.backup_to(tmp)
+        os.replace(tmp, target)
+        import uuid
+        rev = uuid.uuid4().hex
+        _write_json(folder / SHARED_META_NAME, {"rev": rev, "machine": machine_name(), "items": self.lib.count(),
+                                                "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                                "version": APP_VERSION})
+        self._mark_synced(rev)
+        diag(f"ortak kütüphaneye gönderildi ({self.lib.count()} kaynak)")
+        return "gonderildi"
+
+    def _local_copy_of_shared(self) -> Path:
+        """Buluttaki kopyayı önce yerel geçici dosyaya alır (eşitleme sürerken okumamak için)."""
+        tmp = settings_path().parent / "ortak_gecici.db"
+        shutil.copy2(self.folder() / SHARED_DB_NAME, tmp)
+        return tmp
+
+    def pull(self) -> str:
+        meta = self.meta()
+        tmp = self._local_copy_of_shared()
+        self._backup_local()
+        self.lib.restore_from(tmp)
+        tmp.unlink(missing_ok=True)
+        self._mark_synced(meta.get("rev"))
+        diag(f"ortak kütüphane alındı ({meta.get('machine')}, {meta.get('saved_at')})")
+        return "alindi"
+
+    def merge(self) -> tuple:
+        """Ortak kopya esas alınır, bu bilgisayarda olup orada olmayanlar eklenir, sonra gönderilir."""
+        meta = self.meta()
+        mine_path = settings_path().parent / "yerel_gecici.db"
+        self.lib.backup_to(mine_path)
+        self._backup_local()
+        tmp = self._local_copy_of_shared()
+        self.lib.restore_from(tmp)
+        tmp.unlink(missing_ok=True)
+        mine = Library(mine_path, root=self.lib.root, relative=self.lib.relative)
+        try:
+            result = self.lib.merge_from(mine)
+        finally:
+            mine.close()
+            mine_path.unlink(missing_ok=True)
+        self._save_state(shared_rev=meta.get("rev"))
+        self.push(force=True)
+        return result
+
+    def other_sessions(self) -> list:
+        """Ortak kütüphaneyi şu an açık tutan başka bilgisayarlar."""
+        folder = self.folder()
+        if folder is None:
+            return []
+        out, now = [], time.time()
+        for f in folder.glob("oturum_*.json"):
+            info = _read_json(f)
+            if info.get("machine") and info["machine"] != machine_name() \
+                    and now - float(info.get("ts", 0)) < SESSION_FRESH_MINUTES * 60:
+                out.append(info["machine"])
+        return out
+
+    def heartbeat(self, closing=False):
+        folder = self.folder()
+        if folder is None:
+            return
+        path = folder / f"oturum_{re.sub(r'[^A-Za-z0-9_-]', '_', machine_name())}.json"
+        try:
+            if closing:
+                path.unlink(missing_ok=True)
+            else:
+                _write_json(path, {"machine": machine_name(), "ts": time.time()})
+        except OSError:
+            pass
+
+
+# ── Telefon için Excel dökümü (Drive uygulaması/Google E-Tablolar ile açılır) ─────
+
+def _xlsx_cell(ref, value):
+    text = xml_escape(str(value or ""))
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+    return f'<c r="{ref}" t="inlineStr" s="{1 if ref[1:] == "1" else 0}"><is><t xml:space="preserve">{text}</t></is></c>'
+
+
+def _xlsx_sheet(rows, widths) -> str:
+    def col(i):
+        name = ""
+        i += 1
+        while i:
+            i, rem = divmod(i - 1, 26)
+            name = chr(65 + rem) + name
+        return name
+    body = "".join(f'<row r="{r}">' + "".join(_xlsx_cell(f"{col(c)}{r}", v) for c, v in enumerate(row)) + "</row>"
+                   for r, row in enumerate(rows, 1))
+    cols = "".join(f'<col min="{i + 1}" max="{i + 1}" width="{w}" customWidth="1"/>' for i, w in enumerate(widths))
+    return ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" '
+            'state="frozen"/></sheetView></sheetViews>'
+            f'<cols>{cols}</cols><sheetData>{body}</sheetData></worksheet>')
+
+
+def write_xlsx(path, sheets):
+    """sheets: [(ad, satırlar, sütun_genişlikleri)] — ek kütüphane gerektirmeyen yalın xlsx."""
+    path = Path(path)
+    names = "".join(f'<sheet name="{xml_escape(n[:31])}" sheetId="{i}" r:id="rId{i}"/>'
+                    for i, (n, _, _) in enumerate(sheets, 1))
+    rels = "".join(f'<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+                   f'relationships/worksheet" Target="worksheets/sheet{i}.xml"/>' for i in range(1, len(sheets) + 1))
+    rels += (f'<Relationship Id="rId{len(sheets) + 1}" Type="http://schemas.openxmlformats.org/officeDocument/'
+             f'2006/relationships/styles" Target="styles.xml"/>')
+    overrides = "".join(f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/'
+                        f'vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+                        for i in range(1, len(sheets) + 1))
+    tmp = path.with_name(path.name + ".tmp")
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml",
+                    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.'
+                    'openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="'
+                    'application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" '
+                    'ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="'
+                    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+                    '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-'
+                    f'officedocument.spreadsheetml.styles+xml"/>{overrides}</Types>')
+        zf.writestr("_rels/.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships '
+                    'xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" '
+                    'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+                    'Target="xl/workbook.xml"/></Relationships>')
+        zf.writestr("xl/workbook.xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook '
+                    'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.'
+                    f'openxmlformats.org/officeDocument/2006/relationships"><sheets>{names}</sheets></workbook>')
+        zf.writestr("xl/_rels/workbook.xml.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                    f'{rels}</Relationships>')
+        zf.writestr("xl/styles.xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet '
+                    'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font>'
+                    '<sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font>'
+                    '</fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill '
+                    'patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/>'
+                    '<bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" '
+                    'fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" '
+                    'fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="top" wrapText="1"/>'
+                    '</xf><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs>'
+                    '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+                    '</styleSheet>')
+        for i, (_, rows, widths) in enumerate(sheets, 1):
+            zf.writestr(f"xl/worksheets/sheet{i}.xml", _xlsx_sheet(rows, widths))
+    os.replace(tmp, path)
+    return path
+
+
+def write_phone_export(library, folder) -> Path:
+    """Kütüphanenin telefondan okunacak dökümü: kaynaklar ve alıntı kartları iki sayfada."""
+    scopus = load_scopus()
+    items = sorted(library.all_items(), key=lambda i: (tr_sort_key(first_author_label(i)), i["year"]))
+    rows = [["Yazar", "Yıl", "Başlık", "Dergi / Kitap", "Etiketler", "Scopus", "PDF dosyası", "APA 7",
+             "Alıntı kartları", "DOI / Link", "Eklenme"]]
+    cards_rows = [["Kaynak", "Sayfa", "Alıntı", "Yorum", "Atıf"]]
+    for item in items:
+        cards = library.cards(item["id"])
+        has_pdf = bool(item["file_path"]) and os.path.exists(item["file_path"])
+        rows.append([first_author_label(item), item["year"], item["title"], item["container"],
+                     ", ".join(item["tags"]), scopus_label(item, scopus) if scopus else "",
+                     Path(item["file_path"]).name if has_pdf else "PDF yok", apa_text(item, "tr"),
+                     "\n".join(f"s. {c['page']}: “{c['quote']}”" + (f" — {c['comment']}" if c["comment"] else "")
+                               for c in cards),
+                     ("https://doi.org/" + item["doi"]) if item["doi"] else item["url"], item["added"]])
+        for c in cards:
+            cards_rows.append([f"{first_author_label(item)} ({item['year'] or 't.y.'}) {shorten(item['title'], 60)}",
+                               c["page"], c["quote"], c["comment"], card_citation_text(c, item)])
+    return write_xlsx(Path(folder) / PHONE_EXPORT_NAME,
+                      [("Kaynaklar", rows, [20, 6, 50, 28, 24, 10, 30, 60, 50, 30, 11]),
+                       ("Alıntı Kartları", cards_rows, [36, 8, 60, 40, 30])])
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  6a) SCOPUS LİSTESİ: Elsevier'in yayımladığı kaynak listesi (xlsx) bir kez içe aktarılır;
+#      kaynaklar dergi ISSN'ine ya da adına göre "Scopus'ta" diye işaretlenir.
+# ════════════════════════════════════════════════════════════════════════════
+
+SCOPUS_LIST_PAGE = "https://www.elsevier.com/resources/scopus-titlelists"
+SCOPUS_LABELS = {"aktif": "Scopus", "pasif": "Scopus (pasif)", "cikarildi": "Scopus'tan çıkarıldı"}
+_XLSX_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+_REL_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+
+
+def scopus_path() -> Path:
+    return data_dir() / "scopus_listesi.json"
+
+
+def journal_key(title: str) -> str:
+    """Dergi adını karşılaştırma için sadeleştirir ('The Journal of X & Y' = 'journal of x and y')."""
+    t = fold(title or "").replace("&", " and ")
+    t = re.sub(r"\(.*?\)", " ", t)
+    t = re.sub(r"^the\s+", "", t.strip())
+    return re.sub(r"[^a-z0-9]+", "", t)
+
+
+def _col_index(ref: str) -> int:
+    n = 0
+    for ch in re.match(r"[A-Z]+", ref).group(0):
+        n = n * 26 + ord(ch) - 64
+    return n - 1
+
+
+def xlsx_sheets(path):
+    """xlsx dosyasındaki sayfaları (ad, satır üreteci) olarak verir; ek kütüphane gerektirmez."""
+    zf = zipfile.ZipFile(path)
+    shared = []
+    if "xl/sharedStrings.xml" in zf.namelist():
+        with zf.open("xl/sharedStrings.xml") as fh:
+            for _, el in ET.iterparse(fh):
+                if el.tag == _XLSX_NS + "si":
+                    shared.append("".join(t.text or "" for t in el.iter(_XLSX_NS + "t")))
+                    el.clear()
+    rels = {}
+    if "xl/_rels/workbook.xml.rels" in zf.namelist():
+        for rel in ET.fromstring(zf.read("xl/_rels/workbook.xml.rels")):
+            rels[rel.get("Id")] = rel.get("Target", "")
+    workbook = ET.fromstring(zf.read("xl/workbook.xml"))
+    sheets = []
+    for sh in workbook.iter(_XLSX_NS + "sheet"):
+        target = rels.get(sh.get(_REL_NS + "id"), "")
+        target = target.lstrip("/")
+        target = target if target.startswith("xl/") else "xl/" + target
+        sheets.append((sh.get("name") or "", target))
+
+    def rows(target):
+        with zf.open(target) as fh:
+            for _, el in ET.iterparse(fh):
+                if el.tag != _XLSX_NS + "row":
+                    continue
+                row = {}
+                for c in el.iter(_XLSX_NS + "c"):
+                    kind, ref = c.get("t"), c.get("r") or "A1"
+                    if kind == "inlineStr":
+                        value = "".join(t.text or "" for t in c.iter(_XLSX_NS + "t"))
+                    else:
+                        v = c.find(_XLSX_NS + "v")
+                        value = v.text if v is not None and v.text is not None else ""
+                        if kind == "s" and value.isdigit() and int(value) < len(shared):
+                            value = shared[int(value)]
+                    row[_col_index(ref)] = value.strip()
+                el.clear()
+                if row:
+                    width = max(row) + 1
+                    yield [row.get(i, "") for i in range(width)]
+
+    return [(name, (lambda t=target: rows(t))) for name, target in sheets if target in zf.namelist()]
+
+
+def _find_columns(header) -> dict:
+    cols = {}
+    for i, h in enumerate(fold(x) for x in header):
+        if "issn" in h:
+            electronic = "e-issn" in h or "eissn" in h or "electronic" in h or h.startswith("e ")
+            cols.setdefault("eissn" if electronic else "issn", i)
+        elif "title" in h and "title" not in cols and "history" not in h and "related" not in h:
+            cols["title"] = i
+        elif "active or inactive" in h or h in ("active", "status", "active/inactive"):
+            cols["status"] = i
+        elif "discontinued" in h and "quality" in h:
+            cols.setdefault("discontinued", i)
+        elif h.startswith("source type"):
+            cols["type"] = i
+    return cols
+
+
+def parse_scopus_xlsx(path) -> dict:
+    """Scopus kaynak listesini okur → {"issn": {kod: [başlık, durum]}, "titles": {anahtar: [...]}}"""
+    issn, titles, discontinued, count = {}, {}, set(), 0
+    main_found = False
+    for name, rows in xlsx_sheets(path):
+        it = rows()
+        header, cols = None, {}
+        for _ in range(8):                          # başlık satırı ilk birkaç satırdan biri
+            try:
+                header = next(it)
+            except StopIteration:
+                header = None
+                break
+            cols = _find_columns(header)
+            if "title" in cols and ("issn" in cols or "eissn" in cols):
+                break
+        if not header or "title" not in cols or not ({"issn", "eissn"} & set(cols)):
+            continue
+        is_discontinued_sheet = "discontinu" in fold(name) or "removed" in fold(name)
+        if not is_discontinued_sheet and main_found:
+            continue
+        for row in it:
+            get = lambda k: row[cols[k]] if k in cols and cols[k] < len(row) else ""   # noqa: E731
+            title = get("title")
+            codes = [c for c in (norm_issn(get("issn")), norm_issn(get("eissn"))) if c]
+            if not title and not codes:
+                continue
+            if is_discontinued_sheet:
+                discontinued.update(codes)
+                continue
+            status = "pasif" if fold(get("status")).startswith("inactive") else "aktif"
+            if get("discontinued") and fold(get("discontinued")) not in ("no", "0", "-"):
+                status = "cikarildi"
+            entry = [title, status]
+            for c in codes:
+                issn[c] = entry
+            if title:
+                titles.setdefault(journal_key(title), entry)
+            count += 1
+        if not is_discontinued_sheet:
+            main_found = True
+    if not count:
+        raise ValueError("Dosyada Scopus kaynak listesi bulunamadı (ISSN ve başlık sütunları yok).")
+    for c in discontinued:
+        if c in issn:
+            issn[c][1] = "cikarildi"
+        else:
+            issn[c] = ["", "cikarildi"]
+    return {"issn": issn, "titles": titles, "count": count}
+
+
+_SCOPUS_CACHE = {"key": None, "data": None}
+
+
+def load_scopus():
+    path = scopus_path()
+    try:
+        key = path.stat().st_mtime
+    except OSError:
+        return None
+    if _SCOPUS_CACHE["key"] != key:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                _SCOPUS_CACHE.update(key=key, data=json.load(fh))
+        except (OSError, ValueError):
+            return None
+    return _SCOPUS_CACHE["data"]
+
+
+def import_scopus_list(xlsx_path) -> dict:
+    data = parse_scopus_xlsx(xlsx_path)
+    data.update(file=Path(xlsx_path).name, imported=datetime.now().strftime("%d.%m.%Y"))
+    path = scopus_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, separators=(",", ":"))
+    os.replace(tmp, path)
+    _SCOPUS_CACHE["key"] = None
+    return data
+
+
+def scopus_info(item, data=None):
+    """Kaynağın dergisi Scopus listesinde mi? → ("aktif"|"pasif"|"cikarildi", dergi adı) ya da None.
+    Önce ISSN'e, yoksa dergi adına bakılır. Liste yüklenmemişse None."""
+    data = data if data is not None else load_scopus()
+    if not data:
+        return None
+    for code in find_issns(item.get("issn") or ""):
+        hit = data["issn"].get(code)
+        if hit:
+            return hit[1], hit[0] or item.get("container", "")
+    if item.get("type") in ("article", "conference", "other", "chapter") and item.get("container"):
+        hit = data["titles"].get(journal_key(item["container"]))
+        if hit:
+            return hit[1], hit[0]
+    return None
+
+
+def scopus_label(item, data=None) -> str:
+    info = scopus_info(item, data)
+    return SCOPUS_LABELS[info[0]] if info else ""
+
+
+class ScopusImportWorker(threading.Thread):
+    """Listeyi içe aktarır, sonra DOI'si olup ISSN'i eksik kaynakların ISSN'ini Crossref'ten tamamlar."""
+
+    MAX_LOOKUPS = 600
+
+    def __init__(self, xlsx_path, library, events, cancel_event):
+        super().__init__(daemon=True)
+        self.xlsx_path, self.library, self.events, self.cancel = xlsx_path, library, events, cancel_event
+
+    def run(self):
+        try:
+            self.events.put(("scopus", "status", "Liste okunuyor… (bir dakika sürebilir)"))
+            data = import_scopus_list(self.xlsx_path)
+            self.events.put(("scopus", "status", f"{data['count']:,} kaynak içe aktarıldı.".replace(",", ".")))
+            todo = [i for i in self.library.all_items() if i["doi"] and not i.get("issn")][:self.MAX_LOOKUPS]
+            session = make_session()
+            for n, item in enumerate(todo, 1):
+                if self.cancel.is_set():
+                    break
+                rec = crossref_record(session, item["doi"])
+                if rec and rec.get("issn"):
+                    self.library.update(item["id"], {"issn": rec["issn"]})
+                if n % 10 == 0 or n == len(todo):
+                    self.events.put(("scopus", "status", f"Dergi ISSN'leri tamamlanıyor: {n}/{len(todo)}"))
+                time.sleep(0.15)
+            items = self.library.all_items()
+            found = sum(1 for i in items if (scopus_info(i, data) or ("",))[0] in ("aktif", "pasif"))
+            self.events.put(("scopus", "done", f"Liste yüklendi · kütüphanenizde {found} kaynak Scopus'taki "
+                                               f"dergilerde"))
+            diag(f"Scopus listesi içe aktarıldı: {data['count']} kaynak, eşleşen {found}")
+        except Exception as exc:
+            diag_exception("Scopus listesi")
+            self.events.put(("scopus", "error", f"Liste okunamadı: {exc}"))
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -3401,7 +4192,7 @@ MCP_INSTRUCTIONS = (
     "PDF içeriğini okumak için pdf_metni_oku'yu kullan; alıntı yaparken sayfa numarasını belirt."
 )
 
-STATUS_FILTER_VALUES = ["hepsi", "pdf_var", "pdf_yok", "yeni", "karti_olan"]
+STATUS_FILTER_VALUES = ["hepsi", "pdf_var", "pdf_yok", "yeni", "karti_olan", "scopus", "scopus_disi"]
 
 
 def search_items(library, query="", tag="", status="hepsi", fulltext=False, year_min=None,
@@ -3409,6 +4200,7 @@ def search_items(library, query="", tag="", status="hepsi", fulltext=False, year
     """Arayüzdeki arama/filtre mantığının aynısı (Claude araçları için)."""
     items = library.all_items()
     cards = library.card_counts()
+    scopus = load_scopus()
     words = [w for w in fold(query or "").split() if w]
     extra = set()
     if words:
@@ -3419,6 +4211,8 @@ def search_items(library, query="", tag="", status="hepsi", fulltext=False, year
     for item in items:
         item["has_pdf"] = bool(item["file_path"]) and Path(item["file_path"]).is_file()
         item["cards"] = cards.get(item["id"], 0)
+        sc = scopus_info(item, scopus) if scopus else None
+        item["_scopus"] = SCOPUS_LABELS[sc[0]] if sc else ""
         blob = fold(" ".join([item["title"], people_to_text(item["authors"]), item["container"], item["year"],
                               item["notes"] or "", " ".join(item["tags"]), item["doi"], item.get("keywords", ""),
                               item.get("matched", "")]))
@@ -3427,7 +4221,9 @@ def search_items(library, query="", tag="", status="hepsi", fulltext=False, year
         if tag and fold(tag) not in {fold(t) for t in item["tags"]}:
             continue
         ok = {"hepsi": True, "pdf_var": item["has_pdf"], "pdf_yok": not item["has_pdf"],
-              "yeni": bool(item["is_new"]), "karti_olan": item["cards"] > 0}.get(status or "hepsi", True)
+              "yeni": bool(item["is_new"]), "karti_olan": item["cards"] > 0,
+              "scopus": item["_scopus"] in ("Scopus", "Scopus (pasif)"),
+              "scopus_disi": item["_scopus"] not in ("Scopus", "Scopus (pasif)")}.get(status or "hepsi", True)
         if not ok:
             continue
         try:
@@ -3448,7 +4244,8 @@ def _brief(item) -> dict:
             "dergi_kitap": item["container"], "tur": ITEM_TYPES.get(item["type"], "Diğer"),
             "etiketler": item["tags"], "anahtar_kelimeler": split_keywords(item.get("keywords", "")),
             "pdf_var": bool(item["file_path"]) and Path(item["file_path"]).is_file(),
-            "yeni": bool(item["is_new"]), "doi": item["doi"]}
+            "yeni": bool(item["is_new"]), "doi": item["doi"],
+            "scopus": item["_scopus"] if "_scopus" in item else scopus_label(item)}
 
 
 def _ids(value) -> list:
@@ -3472,7 +4269,9 @@ class McpTools:
              {"type": "object", "properties": {
                  "sorgu": s("Aranacak kelimeler (boş: hepsi)"),
                  "etiket": s("Yalnızca bu etiketi taşıyanlar"),
-                 "durum": {"type": "string", "enum": STATUS_FILTER_VALUES, "description": "Durum filtresi"},
+                 "durum": {"type": "string", "enum": STATUS_FILTER_VALUES,
+                           "description": "Durum filtresi (scopus: dergisi Scopus listesinde olanlar; liste "
+                                          "uygulamada yüklendiyse çalışır)"},
                  "pdf_icinde_ara": {"type": "boolean", "description": "PDF tam metninde de ara"},
                  "yil_min": {"type": "integer"}, "yil_max": {"type": "integer"},
                  "limit": {"type": "integer", "description": "En fazla sonuç (varsayılan 50)"}}}),
@@ -3543,7 +4342,7 @@ class McpTools:
         detail.update({
             "yazarlar": people_to_text(item["authors"]), "editorler": people_to_text(item["editors"]),
             "cilt": item["volume"], "sayi": item["issue"], "sayfalar": item["pages"], "yayinevi": item["publisher"],
-            "kurum": item["institution"], "url": item["url"], "pdf_yolu": item["file_path"],
+            "kurum": item["institution"], "url": item["url"], "pdf_yolu": item["file_path"], "issn": item["issn"],
             "eklenme": item["added"], "kaynagi": item.get("source", ""), "tarama_eslesmesi": item.get("matched", ""),
             "kurum_erisimi_veritabani": database_for_doi(item["doi"]),
             "apa": apa_text(item, "tr"), "metin_ici_atif": intext_citation(item),
@@ -3673,6 +4472,8 @@ class McpTools:
                 tags[t] = tags.get(t, 0) + 1
         settings = load_settings()
         return {"toplam": len(items), "pdf_yok": sum(1 for i in items if not i["has_pdf"]),
+                "scopus_dergilerinde": (sum(1 for i in items if i["_scopus"] in ("Scopus", "Scopus (pasif)"))
+                                        if load_scopus() else "Scopus listesi yüklenmedi"),
                 "yeni": sum(1 for i in items if i["is_new"]), "alinti_karti_olan": sum(1 for i in items if i["cards"]),
                 "etiketler": dict(sorted(tags.items(), key=lambda kv: -kv[1])),
                 "son_tarama": settings.get("last_scan"), "son_rapor": settings.get("last_report"),
@@ -3688,6 +4489,26 @@ def run_mcp_server():
     tools = McpTools(library)
     definitions = tools.definitions()
     diag("Claude bağlantısı (MCP) başladı")
+    sync = LibrarySync(library)
+    writes = {"etiket_ekle", "etiket_kaldir", "kunye_guncelle", "alinti_karti_ekle", "incelendi_isaretle",
+              "kutuphaneden_cikar", "linkleri_indir"}
+    last_push = [0.0]
+
+    def sync_safely(action):
+        try:
+            state = sync.status()
+            if action == "start" and state == "al":
+                sync.pull()
+            elif action in ("write", "exit") and state in ("gonder", "ilk"):
+                if action == "exit" or time.time() - last_push[0] > 120:
+                    sync.push()
+                    last_push[0] = time.time()
+            elif state == "cakisma":
+                diag("MCP: ortak kütüphanede çakışma var; uygulama açılınca çözülecek")
+        except Exception:
+            diag_exception("MCP eşitleme")
+
+    sync_safely("start")
 
     def send(message):
         stdout.write((json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8"))
@@ -3720,6 +4541,8 @@ def run_mcp_server():
                 params = msg.get("params") or {}
                 try:
                     data = tools.call(params.get("name", ""), params.get("arguments") or {})
+                    if params.get("name") in writes:
+                        sync_safely("write")
                     result = {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False, indent=1)}],
                               "isError": False}
                 except Exception as exc:
@@ -3734,6 +4557,7 @@ def run_mcp_server():
         except Exception as exc:
             diag_exception("MCP")
             send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": str(exc)}})
+    sync_safely("exit")
     library.close()
 
 
@@ -3753,6 +4577,7 @@ def mcpb_manifest() -> dict:
         "author": {"name": "Akademik Kaynak İndirici"},
         "server": {"type": "binary", "entry_point": f"server/{exe}",
                    "mcp_config": {"command": "${__dirname}/server/" + exe, "args": ["--mcp"], "env": {}}},
+        "icon": "icon.png",
         "tools": [{"name": n, "description": d} for n, d, _ in tools],
         "compatibility": {"platforms": ["win32"]},
     }
@@ -3763,6 +4588,7 @@ def pack_mcpb(server_dir, out_path):
     server_dir, out_path = Path(server_dir), Path(out_path)
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("manifest.json", json.dumps(mcpb_manifest(), ensure_ascii=False, indent=2))
+        zf.writestr("icon.png", icon_png(256))
         for f in sorted(server_dir.rglob("*")):
             if f.parent == server_dir and f.stem == "AkademikIndirici":
                 continue                          # arayüz programı uzantıda gerekmez
@@ -3840,7 +4666,7 @@ def settings_path() -> Path:
     return Path(base) / "AkademikIndirici" / "ayarlar.json"
 
 
-def load_settings() -> dict:
+def _load_settings_raw() -> dict:
     try:
         with open(settings_path(), encoding="utf-8") as fh:
             data = json.load(fh)
@@ -3849,14 +4675,585 @@ def load_settings() -> dict:
         return {}
 
 
+def load_settings() -> dict:
+    """Bu bilgisayarın ayarları; ortak kütüphanede son tarama bilgisi buluttaki ortak dosyadan gelir."""
+    data = _load_settings_raw()
+    shared = shared_dir(data)
+    if shared is not None:
+        state = _read_json(shared / SHARED_STATE_NAME)
+        if state.get("last_scan"):
+            data["last_scan"] = state["last_scan"]
+            name = state.get("last_report_name")
+            if name:
+                data["last_report"] = str(Path(data["library_folder"]) / "Tarama Raporları" / name)
+    return data
+
+
 def save_settings(data: dict):
     try:
         path = settings_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(data, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
     except OSError:
         pass
+    shared = shared_dir(data)
+    if shared is not None and data.get("last_scan"):
+        try:
+            state = _read_json(shared / SHARED_STATE_NAME)
+            if not state.get("last_scan") or data["last_scan"] > state["last_scan"]:
+                _write_json(shared / SHARED_STATE_NAME, {
+                    "last_scan": data["last_scan"], "machine": machine_name(),
+                    "last_report_name": Path(data["last_report"]).name if data.get("last_report") else ""})
+        except OSError:
+            pass
+
+
+# ── Uygulama simgesi: açık kitaba inen ok (16–256 piksel, tek .ico içinde) ─────────────
+# Derleme tarifi (AkademikIndirici.spec) exe simgesini de buradan üretir.
+APP_ICON_ICO_B64 = (
+    "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"
+)
+
+
+def app_icon_bytes() -> bytes:
+    import base64
+    return base64.b64decode(APP_ICON_ICO_B64)
+
+
+def icon_png(size: int = 256) -> bytes:
+    """.ico içindeki en yakın boyutlu PNG."""
+    import struct
+    data = app_icon_bytes()
+    count = struct.unpack_from("<H", data, 4)[0]
+    best = None
+    for i in range(count):
+        w, _, _, _, _, _, length, offset = struct.unpack_from("<BBBBHHII", data, 6 + 16 * i)
+        w = w or 256
+        if best is None or abs(w - size) < abs(best[0] - size):
+            best = (w, data[offset:offset + length])
+    return best[1]
+
+
+def icon_file() -> str:
+    """Pencere simgesi için .ico dosyası (bu bilgisayarda bir kez yazılır)."""
+    path = settings_path().parent / "uygulama.ico"
+    data = app_icon_bytes()
+    try:
+        if not path.is_file() or path.read_bytes() != data:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+    except OSError:
+        return ""
+    return str(path)
+
+
+def set_window_icon(win, delay: int = 0):
+    """Pencereye uygulama simgesini koyar (CustomTkinter'in kendi simgesinin yerine)."""
+    def apply():
+        try:
+            if sys.platform == "win32":
+                path = icon_file()
+                if path:
+                    win.iconbitmap(path)
+            else:
+                import tkinter
+                import base64
+                photo = tkinter.PhotoImage(master=win, data=base64.b64encode(icon_png(64)).decode())
+                win._app_icon = photo
+                win.iconphoto(False, photo)
+        except Exception:
+            pass
+    if delay:
+        win.after(delay, apply)
+    else:
+        apply()
+
+
+# ── Kendiliğinden güncelleme: program her açılışta GitHub'daki güncel kodu alır ─────────
+# exe yalnızca Python'u ve kütüphaneleri taşır; uygulamanın kodu daha yeniyse önbellekten yüklenir.
+# Yeni dosya indirilip çalıştırılmaz, yeni süreç başlatılmaz: kod aynı program içinde içe aktarılır.
+
+UPDATE_URL = "https://raw.githubusercontent.com/erdoganumut-cyber/akademik-indirici/main/akademik_indirici.py"
+UPDATE_ENV = "AKADEMIK_GUNCEL_KOD"
+LAUNCHER_ENV = "AKADEMIK_EXE_SURUMU"
+
+
+def version_tuple(v) -> tuple:
+    return tuple(int(x) for x in re.findall(r"\d+", str(v or "0"))) or (0,)
+
+
+def code_constant(text: str, name: str) -> str:
+    m = re.search(rf'^{name}\s*=\s*"([^"]+)"', text or "", re.M)
+    return m.group(1) if m else ""
+
+
+def update_dir() -> Path:
+    return settings_path().parent / "guncelleme"
+
+
+def cached_update():
+    """(yol, sürüm, gereken_exe_sürümü) ya da (None, '', '')"""
+    path = update_dir() / "akademik_indirici.py"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None, "", ""
+    return path, code_constant(text, "APP_VERSION"), code_constant(text, "MIN_LAUNCHER") or "0"
+
+
+def launcher_version() -> str:
+    return os.environ.get(LAUNCHER_ENV) or APP_VERSION
+
+
+def updates_enabled() -> bool:
+    return (getattr(sys, "frozen", False) or bool(os.environ.get("AKADEMIK_GUNCELLEME_TESTI"))) \
+        and load_settings().get("auto_update", True)
+
+
+def fetch_update(timeout=(3, 20)):
+    """GitHub'daki kod bu programdan ve önbellektekinden yeniyse indirir. Dönüş: yeni sürüm ya da None."""
+    r = requests.get(UPDATE_URL, timeout=timeout, headers={"Cache-Control": "no-cache",
+                                                            "User-Agent": f"AkademikIndirici/{APP_VERSION}"})
+    if r.status_code != 200:
+        return None
+    text = r.content.decode("utf-8")
+    version = code_constant(text, "APP_VERSION")
+    _, cached, _ = cached_update()
+    newest = max(version_tuple(launcher_version()), version_tuple(cached))
+    if not version or version_tuple(version) <= newest or "def main(" not in text:
+        return None
+    compile(text, "akademik_indirici.py", "exec")            # yarım/bozuk indirme çalıştırılmasın
+    folder = update_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    tmp = folder / "akademik_indirici.py.tmp"
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, folder / "akademik_indirici.py")
+    diag(f"güncelleme indirildi: v{version}")
+    return version
+
+
+def run_updated_code() -> bool:
+    """Önbellekteki kod bu programdan yeniyse onu çalıştırır. Çalıştırdıysa True."""
+    if os.environ.get(UPDATE_ENV):
+        return False
+    path, version, needs = cached_update()
+    if not path or version_tuple(version) <= version_tuple(APP_VERSION):
+        return False
+    bad = update_dir() / "hatali_surum.txt"
+    if bad.is_file() and bad.read_text(encoding="utf-8").strip() == version:
+        return False
+    if version_tuple(needs) > version_tuple(APP_VERSION):
+        os.environ["AKADEMIK_EXE_ESKI"] = version             # arayüz kullanıcıya söyler
+        return False
+    import importlib.util
+    os.environ[UPDATE_ENV] = version
+    os.environ[LAUNCHER_ENV] = APP_VERSION
+    try:
+        spec = importlib.util.spec_from_file_location("akademik_guncel", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["akademik_guncel"] = module
+        spec.loader.exec_module(module)
+    except Exception:
+        diag_exception(f"güncel kod v{version} yüklenemedi; programın kendi sürümü açılıyor")
+        bad.write_text(version, encoding="utf-8")
+        os.environ.pop(UPDATE_ENV, None)
+        return False
+    module.main()
+    return True
 
 
 # ── Tanılama kaydı: uygulama beklenmedik biçimde kapanırsa nedenini görmek için ─────
@@ -3969,6 +5366,41 @@ def open_file(path: Path):
         subprocess.Popen(["xdg-open", str(path)])
 
 
+def choice_dialog(parent, title, text, options):
+    """Birden çok düğmeli soru penceresi. Dönüş: seçilen düğmenin sırası ya da None (kapatıldı)."""
+    win = ctk.CTkToplevel(parent)
+    win.title(title)
+    set_window_icon(win, delay=260)
+    win.resizable(False, False)
+    win.transient(parent)
+    result = [None]
+    ctk.CTkLabel(win, text=title, font=ctk.CTkFont(size=15, weight="bold"), anchor="w").pack(
+        fill="x", padx=20, pady=(18, 6))
+    ctk.CTkLabel(win, text=text, justify="left", anchor="w", wraplength=520).pack(fill="x", padx=20)
+    row = ctk.CTkFrame(win, fg_color="transparent")
+    row.pack(fill="x", padx=20, pady=18)
+
+    def pick(i):
+        result[0] = i
+        win.destroy()
+    for i, label in enumerate(options):
+        style = {} if i == 0 else {"fg_color": "transparent", "border_width": 1, "text_color": TEXT}
+        ctk.CTkButton(row, text=label, command=lambda i=i: pick(i), **style).pack(side="left", padx=(0, 8))
+    win.protocol("WM_DELETE_WINDOW", win.destroy)
+
+    def place():
+        win.update_idletasks()
+        x = parent.winfo_rootx() + max(0, (parent.winfo_width() - win.winfo_width()) // 2)
+        y = parent.winfo_rooty() + max(0, (parent.winfo_height() - win.winfo_height()) // 3)
+        win.geometry(f"+{x}+{y}")
+        win.lift()
+        win.focus_force()
+        win.grab_set()
+    win.after(50, place)
+    parent.wait_window(win)
+    return result[0]
+
+
 def add_italic_tag(textbox):
     """CTkTextbox'a, kutunun kendi yazısıyla aynı boyutta 'i' (italik) etiketi ekler."""
     from tkinter import font as tkfont
@@ -3986,6 +5418,7 @@ class BibliographyDialog(ctk.CTkToplevel):
     def __init__(self, master, records, lang="tr"):
         super().__init__(master)
         self.title(f"Kaynakça · {len(records)} kaynak")
+        set_window_icon(self, delay=260)
         self.geometry("820x600")
         self.records = records
         self.lang = lang
@@ -4050,7 +5483,8 @@ class BibliographyDialog(ctk.CTkToplevel):
 class LibraryTab:
     """'Kütüphanem' sekmesi: tablo, arama/filtre, künye düzenleme, alıntı kartları, kaynakça."""
 
-    STATUS_FILTERS = ["Tümü", "Yeni (taramadan)", "PDF'i olanlar", "PDF'i olmayanlar", "Kartı olanlar"]
+    STATUS_FILTERS = ["Tümü", "Yeni (taramadan)", "PDF'i olanlar", "PDF'i olmayanlar", "Kartı olanlar",
+                      "Scopus'taki dergiler"]
 
     def __init__(self, parent, app):
         self.app = app
@@ -4104,15 +5538,15 @@ class LibraryTab:
         frame.grid(row=1, column=0, sticky="nsew", padx=(8, 6))
         frame.grid_columnconfigure(0, weight=1)
         frame.grid_rowconfigure(0, weight=1)
-        cols = ("pdf", "author", "year", "title", "tags")
+        cols = ("pdf", "author", "year", "title", "scopus", "tags")
         self.tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="extended",
                                  style="Lib.Treeview")
         for col, text, width, stretch in (("pdf", "", 34, False), ("author", "Yazar", 150, False),
                                           ("year", "Yıl", 52, False), ("title", "Başlık", 360, True),
-                                          ("tags", "Etiketler", 150, False)):
+                                          ("scopus", "Scopus", 74, False), ("tags", "Etiketler", 150, False)):
             self.tree.heading(col, text=text, command=lambda c=col: self._sort(c))
             self.tree.column(col, width=width, minwidth=30, stretch=stretch,
-                             anchor="center" if col in ("pdf", "year") else "w")
+                             anchor="center" if col in ("pdf", "year", "scopus") else "w")
         self.tree.grid(row=0, column=0, sticky="nsew", padx=(6, 0), pady=6)
         sb = ctk.CTkScrollbar(frame, command=self.tree.yview)
         sb.grid(row=0, column=1, sticky="ns", pady=6)
@@ -4151,17 +5585,18 @@ class LibraryTab:
                 ("year", "Yıl", ""), ("container", "Dergi / Kitap", ""),
                 ("volume", "Cilt", ""), ("issue", "Sayı", ""), ("pages", "Sayfa", "45–67"),
                 ("publisher", "Yayınevi", ""), ("editors", "Editörler", "Soyad, Ad; Soyad, Ad"),
-                ("institution", "Kurum (tez)", ""), ("doi", "DOI", "10.xxxx/…"), ("url", "Link", ""),
+                ("institution", "Kurum (tez)", ""), ("doi", "DOI", "10.xxxx/…"),
+                ("issn", "ISSN", "1234-5678"), ("url", "Link", ""),
                 ("keywords", "Anahtar kelimeler", "makalenin kendi anahtar kelimeleri"),
                 ("tags", "Etiketler", "virgülle ayırın")], start=1):
             entry = ctk.CTkEntry(form, placeholder_text=hint, height=30)
             self._field(form, row, label, entry)
             self.f[key] = entry
         self.f_type = ctk.CTkOptionMenu(form, values=list(ITEM_TYPES.values()), height=30)
-        self._field(form, 14, "Tür", self.f_type)
+        self._field(form, row + 1, "Tür", self.f_type)
         self.matched_label = ctk.CTkLabel(form, text="", text_color=MUTED, font=ctk.CTkFont(size=11),
                                           anchor="w", justify="left", wraplength=360)
-        self.matched_label.grid(row=15, column=0, columnspan=2, sticky="ew", padx=4, pady=(6, 0))
+        self.matched_label.grid(row=row + 2, column=0, columnspan=2, sticky="ew", padx=4, pady=(6, 0))
 
         btns = ctk.CTkFrame(tab, fg_color="transparent")
         btns.grid(row=2, column=0, sticky="ew", pady=(6, 0))
@@ -4281,9 +5716,12 @@ class LibraryTab:
         self.items = self.lib.all_items()
         self.by_id = {i["id"]: i for i in self.items}
         card_counts = self.lib.card_counts()
+        scopus = load_scopus()
         for item in self.items:
             item["has_pdf"] = bool(item["file_path"]) and Path(item["file_path"]).is_file()
             item["cards"] = card_counts.get(item["id"], 0)
+            info = scopus_info(item, scopus) if scopus else None
+            item["_scopus"] = info[0] if info else ""
             item["_blob"] = fold(" ".join([item["title"], people_to_text(item["authors"]), item["container"],
                                            item["year"], item["notes"], " ".join(item["tags"]), item["doi"],
                                            item.get("matched", ""), item.get("keywords", "")]))
@@ -4308,12 +5746,14 @@ class LibraryTab:
             if tag != "Tüm etiketler" and tag not in item["tags"]:
                 return False
             return {"Tümü": True, "Yeni (taramadan)": item["is_new"], "PDF'i olanlar": item["has_pdf"],
-                    "PDF'i olmayanlar": not item["has_pdf"], "Kartı olanlar": item["cards"] > 0}[status]
+                    "PDF'i olmayanlar": not item["has_pdf"], "Kartı olanlar": item["cards"] > 0,
+                    "Scopus'taki dergiler": item["_scopus"] in ("aktif", "pasif")}[status]
 
         shown = [i for i in self.items if visible(i)]
         keys = {"author": lambda i: tr_sort_key(first_author_label(i)), "year": lambda i: i["year"] or "0",
                 "title": lambda i: tr_sort_key(i["title"]), "tags": lambda i: tr_sort_key(", ".join(i["tags"])),
-                "pdf": lambda i: i["has_pdf"], "added": lambda i: (i["added"], i["id"])}
+                "pdf": lambda i: i["has_pdf"], "added": lambda i: (i["added"], i["id"]),
+                "scopus": lambda i: {"aktif": 2, "pasif": 1}.get(i["_scopus"], 0)}
         shown.sort(key=keys[self.sort_col], reverse=self.sort_rev)
         self.tree.delete(*self.tree.get_children())
         for item in shown:
@@ -4325,7 +5765,9 @@ class LibraryTab:
             mark = "📄" if item["has_pdf"] else "—"
             title = ("● " if item["is_new"] else "") + item["title"]
             self.tree.insert("", "end", iid=str(item["id"]), tags=tags_,
-                             values=(mark, first_author_label(item), item["year"], title, ", ".join(item["tags"])))
+                             values=(mark, first_author_label(item), item["year"], title,
+                                     {"aktif": "✓", "pasif": "pasif", "cikarildi": "✗"}.get(item["_scopus"], ""),
+                                     ", ".join(item["tags"])))
         keep = [s for s in selected if self.tree.exists(s)]
         if keep:
             self.tree.selection_set(keep)
@@ -4340,7 +5782,7 @@ class LibraryTab:
         if self.sort_col == col:
             self.sort_rev = not self.sort_rev
         else:
-            self.sort_col, self.sort_rev = col, col in ("year", "pdf")
+            self.sort_col, self.sort_rev = col, col in ("year", "pdf", "scopus")
         self.refresh()
 
     def select(self, item_id):
@@ -4407,6 +5849,11 @@ class LibraryTab:
             info.append(f"eklendi: {item['added']}")
         if item.get("matched"):
             info.append(f"eşleşen: {item['matched']}")
+        sc = scopus_info(item)
+        if sc:
+            info.append(f"{SCOPUS_LABELS[sc[0]]}: {sc[1]}")
+        elif load_scopus():
+            info.append("Scopus listesinde bulunamadı")
         self.matched_label.configure(text=" · ".join(info))
         self.reviewed_btn.configure(state="normal" if item["is_new"] else "disabled")
         self._render_cards()
@@ -4848,6 +6295,22 @@ class ScanTab:
                      font=ctk.CTkFont(size=12), wraplength=330, justify="left",
                      anchor="w").grid(row=r, column=0, sticky="ew", padx=10, pady=(2, 0)); r += 1
 
+        section("Scopus listesi")
+        ctk.CTkLabel(side, text="Elsevier'in Scopus kaynak listesini (Excel) bir kez yükleyin; dergisi Scopus'ta "
+                                "olan kaynaklar kütüphanede ve raporlarda işaretlenir. Liste yılda iki kez "
+                                "güncellenir.", text_color=MUTED, font=ctk.CTkFont(size=12), wraplength=330,
+                     justify="left", anchor="w").grid(row=r, column=0, sticky="ew", padx=10); r += 1
+        sc = ctk.CTkFrame(side, fg_color="transparent")
+        sc.grid(row=r, column=0, sticky="w", padx=10, pady=6); r += 1
+        self.scopus_btn = ctk.CTkButton(sc, text="Listeyi Yükle…", width=130, command=self.load_scopus_list)
+        self.scopus_btn.pack(side="left")
+        ctk.CTkButton(sc, text="İndirme Sayfası", width=120, fg_color="transparent", border_width=1,
+                      text_color=TEXT, command=lambda: webbrowser.open(SCOPUS_LIST_PAGE)).pack(side="left", padx=8)
+        self.scopus_label = ctk.CTkLabel(side, text="", text_color=MUTED, font=ctk.CTkFont(size=12),
+                                         anchor="w", justify="left", wraplength=330)
+        self.scopus_label.grid(row=r, column=0, sticky="ew", padx=10); r += 1
+        self.refresh_scopus_label()
+
         section("Claude bağlantısı")
         ctk.CTkLabel(side, text="Claude masaüstü uygulaması kütüphanenizde arama, etiketleme, alıntı kartı, "
                                 "kaynakça ve PDF okuma yapabilir. Bağladıktan sonra Claude'u tamamen kapatıp "
@@ -4867,6 +6330,24 @@ class ScanTab:
         lf.grid_columnconfigure(0, weight=1)
         ctk.CTkEntry(lf, textvariable=self.app.folder_var, height=30).grid(row=0, column=0, sticky="ew")
         ctk.CTkButton(lf, text="Seç…", width=60, command=self.app.choose_library_folder).grid(row=0, column=1, padx=(6, 0))
+        self.shared_var = ctk.BooleanVar(value=bool(s.get("shared_library")))
+        ctk.CTkCheckBox(side, text="Ortak kütüphane (Google Drive: tüm bilgisayarlarımda)",
+                        variable=self.shared_var, command=self.toggle_shared).grid(
+            row=r, column=0, sticky="w", padx=10, pady=(8, 3)); r += 1
+        sh = ctk.CTkFrame(side, fg_color="transparent")
+        sh.grid(row=r, column=0, sticky="ew", padx=10); r += 1
+        sh.grid_columnconfigure(0, weight=1)
+        self.sync_label = ctk.CTkLabel(sh, text="", text_color=MUTED, font=ctk.CTkFont(size=12), anchor="w",
+                                       justify="left", wraplength=240)
+        self.sync_label.grid(row=0, column=0, sticky="ew")
+        self.sync_btn = ctk.CTkButton(sh, text="Şimdi Eşitle", width=100, height=26, font=ctk.CTkFont(size=12),
+                                      command=self.sync_clicked)
+        self.sync_btn.grid(row=0, column=1, padx=(6, 0))
+        self.refresh_sync_label()
+        self.update_var = ctk.BooleanVar(value=s.get("auto_update", True))
+        ctk.CTkCheckBox(side, text=f"Açılışta güncellemeleri al (şu an v{APP_VERSION})", variable=self.update_var,
+                        command=self.app.save_all_settings).grid(row=r, column=0, sticky="w", padx=10, pady=(8, 3))
+        r += 1
         self.autotag_var = ctk.BooleanVar(value=s.get("auto_tag", True))
         ctk.CTkCheckBox(side, text="Yeni gelen kaynaklara anahtar kelime ve grup etiketini otomatik ekle",
                         variable=self.autotag_var, command=self.app.save_all_settings).grid(
@@ -4886,7 +6367,10 @@ class ScanTab:
     # ── anahtar kelimeler ───────────────────────────────────────────────────
     def _count_terms(self):
         groups = parse_keyword_groups(self.kw_box.get("1.0", "end"))
-        self.kw_info.configure(text=f"{len(groups)} grup · {sum(len(g['terms']) for g in groups)} terim")
+        text = f"{len(groups)} grup · {sum(len(g['terms']) for g in groups)} terim"
+        if keywords_customized():
+            text += " · v2.4'te daraltılmış yeni varsayılan liste var ('Varsayılana Dön')"
+        self.kw_info.configure(text=text)
 
     def _save_keywords(self):
         text = self.kw_box.get("1.0", "end").rstrip() + "\n"
@@ -4975,6 +6459,155 @@ class ScanTab:
         folder = Path(self.app.library_folder() or settings_path().parent) / "Tarama Raporları"
         folder.mkdir(parents=True, exist_ok=True)
         open_in_file_manager(folder)
+
+    # ── ortak kütüphane ─────────────────────────────────────────────────────
+    def refresh_sync_label(self):
+        s = _load_settings_raw()
+        if not s.get("shared_library"):
+            self.sync_label.configure(text="Kapalı: kütüphane yalnızca bu bilgisayarda.", text_color=MUTED)
+            self.sync_btn.configure(state="disabled")
+            return
+        self.sync_btn.configure(state="normal")
+        if shared_dir(s) is None:
+            self.sync_label.configure(text="Bulut klasörüne ulaşılamıyor (Google Drive açık mı?). Bu bilgisayarda "
+                                           "çalışmaya devam edebilirsiniz.", text_color=LOG_COLORS["warn"])
+            return
+        last = (s.get("sync") or {}).get("last_sync")
+        meta = self.app.sync.meta()
+        who = f" · son gönderen: {meta['machine']}" if meta.get("machine") else ""
+        self.sync_label.configure(text=f"Açık · son eşitleme: {last or '—'}{who}", text_color=LOG_COLORS["success"])
+
+    def sync_clicked(self):
+        done = self.app.sync_now()
+        self.app.toast({"gonderildi": "Ortak kütüphaneye gönderildi.", "alindi": "Ortak kütüphane alındı.",
+                        "esit": "Ortak kütüphane zaten güncel.", "birlestirildi": "Birleştirildi."}.get(done, "Tamam."))
+
+    def toggle_shared(self):
+        app = self.app
+        if not self.shared_var.get():
+            self._disable_shared()
+            return
+        folder = app.library_folder()
+        if not folder or not os.path.isdir(folder):
+            messagebox.showwarning(APP_NAME, "Önce kütüphane klasörünü Google Drive içinde seçin "
+                                             "(ör. G:\\Drive'ım\\Akademik Kütüphanem).", parent=self.parent)
+            self.shared_var.set(False)
+            return
+        if not any(k in fold(folder) for k in ("drive", "onedrive", "dropbox", "icloud")):
+            if not messagebox.askyesno(APP_NAME, f"Kütüphane klasörü bir bulut klasörü gibi görünmüyor:\n{folder}\n\n"
+                                                 "Ortak kütüphane için klasörün Google Drive'da olması gerekir. "
+                                                 "Yine de açılsın mı?", parent=self.parent):
+                self.shared_var.set(False)
+                return
+        lib = app.library
+        outside = [i for i in lib.all_items() if i["file_path"] and os.path.exists(i["file_path"])
+                   and not os.path.normcase(os.path.abspath(i["file_path"])).startswith(
+                       os.path.normcase(os.path.abspath(folder)).rstrip("\\/") + os.sep)]
+        if outside and messagebox.askyesno(
+                APP_NAME, f"{len(outside)} kaynağın PDF'i kütüphane klasörünün dışında duruyor; öbür "
+                          "bilgisayarlar bunları göremez.\n\nKütüphane klasörüne taşınsınlar mı?", parent=self.parent):
+            moved = 0
+            for item in outside:
+                try:
+                    new = place_in_library(Path(item["file_path"]), item, folder)
+                    lib.update(item["id"], {"file_path": str(new)})
+                    moved += 1
+                except OSError:
+                    diag_exception(f"taşınamadı: {item['file_path']}")
+            app.toast(f"{moved} PDF kütüphane klasörüne taşındı.")
+        local_dir = settings_path().parent
+        current = _load_settings_raw()
+        current["shared_library"] = True
+        current.pop("sync", None)
+        save_settings(current)
+        shared = shared_dir()
+        shared.mkdir(parents=True, exist_ok=True)
+        for name in ("anahtar_kelimeler.txt", "scopus_listesi.json", "indirme_gecmisi.json"):
+            if (local_dir / name).is_file() and not (shared / name).exists():
+                shutil.copy2(local_dir / name, shared / name)
+        (shared / "BENİ OKU.txt").write_text(
+            "Bu klasör Akademik Kaynak İndirici'nin ortak kütüphane verisidir (künyeler, etiketler, alıntı "
+            "kartları, anahtar kelimeler).\nSilmeyin ve içindeki dosyaları elle değiştirmeyin.\n", encoding="utf-8")
+        lib.configure_paths()
+        lib.relativize_paths()
+        if (shared / SHARED_DB_NAME).is_file():
+            meta = app.sync.meta()
+            if lib.count() == 0:
+                app.sync.pull()
+            else:
+                choice = choice_dialog(
+                    self.parent, "Bu klasörde başka bir kütüphane var",
+                    f"{meta.get('machine', 'Başka bir bilgisayar')} bu klasöre {meta.get('items', '?')} kaynaklık "
+                    f"bir kütüphane koymuş. Bu bilgisayarda da {lib.count()} kaynak var.\n\n"
+                    "• Birleştir (önerilen): iki kütüphane toplanır.\n"
+                    "• Ortaktakini kullan: bu bilgisayardaki kütüphane yedeklenip bırakılır.",
+                    ["Birleştir", "Ortaktakini kullan"])
+                if choice == 0:
+                    added, updated = app.sync.merge()
+                    app.toast(f"Birleştirildi: {added} kaynak eklendi, {updated} güncellendi.")
+                elif choice == 1:
+                    app.sync.pull()
+                else:
+                    self.shared_var.set(False)
+                    self._disable_shared()
+                    return
+        else:
+            app.sync.push(force=True)
+        app.sync.heartbeat()
+        app._write_phone_export()
+        app.library_tab.refresh()
+        self.refresh_sync_label()
+        self.refresh_scopus_label()
+        diag(f"ortak kütüphane açıldı: {shared}")
+        messagebox.showinfo(APP_NAME, "Ortak kütüphane açıldı.\n\nÖbür bilgisayarda: Google Drive'ı kurun, programda "
+                                      "kütüphane klasörü olarak aynı Drive klasörünü seçin ve bu kutuyu işaretleyin.\n\n"
+                                      f"Telefonda: Drive'da '{PHONE_EXPORT_NAME}' dosyasını açın; PDF'ler aynı "
+                                      "klasörde.", parent=self.parent)
+
+    def _disable_shared(self):
+        shared = shared_dir()
+        if shared is not None:                            # son hâli gönder, ortak dosyaları buraya geri al
+            self.app.sync_now(quiet=True)
+            local_dir = settings_path().parent
+            for name in ("anahtar_kelimeler.txt", "scopus_listesi.json", "indirme_gecmisi.json"):
+                if (shared / name).is_file():
+                    try:
+                        shutil.copy2(shared / name, local_dir / name)
+                    except OSError:
+                        pass
+            self.app.sync.heartbeat(closing=True)
+        current = _load_settings_raw()
+        current["shared_library"] = False
+        save_settings(current)
+        self.app.library.configure_paths()
+        self.refresh_sync_label()
+
+    # ── Scopus listesi ──────────────────────────────────────────────────────
+    def refresh_scopus_label(self):
+        data = load_scopus()
+        if data:
+            text = (f"Yüklü: {data.get('file', 'liste')} · {data.get('count', 0):,} kaynak · "
+                    f"{data.get('imported', '')}").replace(",", ".")
+            self.scopus_label.configure(text=text, text_color=LOG_COLORS["success"])
+        else:
+            self.scopus_label.configure(text="Liste yüklenmedi.", text_color=MUTED)
+
+    def load_scopus_list(self):
+        path = filedialog.askopenfilename(parent=self.parent, title="Scopus kaynak listesini seçin",
+                                          filetypes=[("Excel", "*.xlsx"), ("Tüm dosyalar", "*.*")])
+        if not path:
+            return
+        self.scopus_btn.configure(state="disabled")
+        ScopusImportWorker(path, self.app.library, self.app.events, threading.Event()).start()
+
+    def on_scopus(self, kind, text):
+        color = {"error": LOG_COLORS["error"], "done": LOG_COLORS["success"]}.get(kind, MUTED)
+        self.scopus_label.configure(text=text, text_color=color)
+        if kind in ("done", "error"):
+            self.scopus_btn.configure(state="normal")
+        if kind == "error":
+            messagebox.showerror(APP_NAME, text + "\n\nElsevier'in sitesinden indirdiğiniz .xlsx dosyasını "
+                                                  "seçtiğinizden emin olun.", parent=self.parent)
 
     # ── Claude bağlantısı ───────────────────────────────────────────────────
     def _mcp_ready(self) -> bool:
@@ -5128,7 +6761,10 @@ class App(ctk.CTk):
 
         settings = load_settings()
         self.settings = settings
+        set_window_icon(self)
         self.library = Library()
+        self.sync = LibrarySync(self.library)
+        self._last_focus_sync = 0.0
         self.folder_var = ctk.StringVar(value=settings.get("library_folder") or settings.get("folder") or "")
         self.email_var = ctk.StringVar(value=settings.get("email", ""))
         self.opt_doi = ctk.BooleanVar(value=settings.get("doi", True))
@@ -5172,6 +6808,7 @@ class App(ctk.CTk):
         self.after(15_000, self._watch_downloads)
         self._db_stamp = self._library_stamp()
         self.bind("<FocusIn>", self._on_focus, add="+")
+        self.after(5 * 60_000, self._sync_tick)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _library_stamp(self):
@@ -5183,6 +6820,13 @@ class App(ctk.CTk):
 
     def _on_focus(self, event):
         """Claude (ya da tarama görevi) kütüphaneyi değiştirdiyse pencereye dönünce listeyi tazele."""
+        if self.sync.folder() is not None and time.time() - self._last_focus_sync > 60:
+            self._last_focus_sync = time.time()
+            try:
+                if self.sync.shared_changed() and not self.sync.local_changed():
+                    self.sync_now()
+            except Exception:
+                diag_exception("odak eşitleme")
         stamp = self._library_stamp()
         if stamp != self._db_stamp:
             self._db_stamp = stamp
@@ -5190,6 +6834,96 @@ class App(ctk.CTk):
                 self.library_tab.refresh()
             except Exception:
                 diag_exception("odak yenileme")
+
+    # ── ortak kütüphane eşitlemesi ──────────────────────────────────────────────
+    def sync_now(self, startup=False, closing=False, quiet=False):
+        """Durumu yoklar: gerekirse gönderir, alır ya da çakışmada sorar. Dönüş: yapılan işlem."""
+        sync = self.sync
+        if sync.folder() is None:
+            return "kapali"
+        if startup:
+            others = sync.other_sessions()
+            if others:
+                messagebox.showwarning(APP_NAME, f"Ortak kütüphane şu anda {', '.join(others)} bilgisayarında da "
+                                                 "açık görünüyor.\n\nİkisinde birden değişiklik yaparsanız program "
+                                                 "hangisini tutacağınızı sorar. Mümkünse öbür bilgisayardaki "
+                                                 "programı kapatın.", parent=self)
+            sync.heartbeat()
+        done = ""
+        try:
+            state = sync.status()
+            if state in ("ilk", "gonder"):
+                done = sync.push()
+            elif state == "al":
+                done = sync.pull()
+                if not closing:
+                    self.library_tab.refresh()
+                    meta = sync.meta()
+                    self.toast(f"{meta.get('machine', 'Öbür bilgisayar')} bilgisayarındaki değişiklikler alındı.")
+            elif state == "cakisma":
+                done = self.resolve_conflict()
+            if done in ("gonderildi", "alindi", "birlestirildi") and not closing:
+                self._write_phone_export()
+        except Exception as exc:
+            diag_exception("eşitleme")
+            if not quiet:
+                messagebox.showwarning(APP_NAME, f"Ortak kütüphane eşitlenemedi:\n{exc}\n\nBulut klasörüne "
+                                                 "ulaşılabildiğini kontrol edin. Çalışmanız bu bilgisayarda "
+                                                 "güvende; bir sonraki eşitlemede yeniden denenir.", parent=self)
+        self._db_stamp = self._library_stamp()
+        try:
+            self.scan_tab.refresh_sync_label()
+        except Exception:
+            pass
+        return done or "esit"
+
+    def _sync_tick(self):
+        if self.sync.folder() is not None:
+            self.sync.heartbeat()
+            self.sync_now(quiet=True)
+        self.after(5 * 60_000, self._sync_tick)
+
+    def _write_phone_export(self):
+        folder = self.library_folder()
+        if not folder:
+            return
+
+        def work():
+            try:
+                write_phone_export(self.library, folder)
+            except Exception:
+                diag_exception("telefon dökümü")
+        threading.Thread(target=work, daemon=True).start()
+
+    def resolve_conflict(self) -> str:
+        meta = self.sync.meta()
+        other = meta.get("machine") or "öbür bilgisayar"
+        when = ""
+        try:
+            when = datetime.fromisoformat(meta["saved_at"]).astimezone().strftime("%d.%m.%Y %H:%M")
+        except (KeyError, ValueError):
+            pass
+        choice = choice_dialog(self, "Ortak kütüphane: iki yerde değişiklik var",
+                               f"Bu bilgisayarda yaptığınız değişiklikler henüz buluta gönderilmeden, {other} "
+                               f"bilgisayarı da ortak kütüphaneyi güncellemiş ({when}).\n\n"
+                               "• Birleştir: iki taraftaki kaynaklar, etiketler ve alıntı kartları toplanır "
+                               "(önerilen). Bir tarafta silinen kaynak öbüründe duruyorsa geri gelir.\n"
+                               f"• {other} kopyasını al: bu bilgisayardaki son değişiklikler bırakılır.\n"
+                               "• Bu bilgisayarınkini kullan: öbür bilgisayarın son değişiklikleri bırakılır.\n\n"
+                               "Hangisini seçerseniz seçin iki kopyanın da yedeği alınır.",
+                               ["Birleştir", f"{other} kopyasını al", "Bu bilgisayarınkini kullan"])
+        if choice == 0:
+            added, updated = self.sync.merge()
+            self.library_tab.refresh()
+            self.toast(f"Birleştirildi: {added} kaynak eklendi, {updated} kaynak güncellendi.")
+            return "birlestirildi"
+        if choice == 1:
+            self.sync.pull()
+            self.library_tab.refresh()
+            return "alindi"
+        if choice == 2:
+            return self.sync.push(force=True)
+        return "ertelendi"
 
     # ── yerleşim ────────────────────────────────────────────────────────────────
     def _section(self, parent, text, row, pady=(16, 2)):
@@ -5413,7 +7147,7 @@ class App(ctk.CTk):
                 "auto_scan": scan.auto_var.get(), "open_report": scan.open_report_var.get(),
                 "scan_dergipark": scan.src_dp.get(), "scan_crossref": scan.src_cr.get(),
                 "watch_downloads": scan.watch_var.get(), "scan_day": scan.day_menu.get(),
-                "auto_tag": scan.autotag_var.get(),
+                "auto_tag": scan.autotag_var.get(), "auto_update": scan.update_var.get(),
                 "scan_hour": scan.hour_menu.get(),
                 "institution_url": scan.inst_entry.get().strip() or DEFAULT_INSTITUTION_URL,
             })
@@ -5430,6 +7164,10 @@ class App(ctk.CTk):
                           "'Soyad (Yıl) - Başlık.pdf' adıyla toplanacak. Örneğin Belgeler içinde "
                           "'Akademik Kütüphanem' adlı bir klasör olabilir.", parent=self)
             self.choose_library_folder()
+        if self.sync.folder() is not None:          # ortak kütüphane: önce öbür bilgisayarlardakini al
+            self.sync_now(startup=True)
+            self.settings = load_settings()
+        self._update_notices()
         report = self.settings.get("last_report")
         seen = self.settings.get("seen_report")
         if report and report != seen and Path(report).is_file():
@@ -5437,6 +7175,20 @@ class App(ctk.CTk):
         if self.settings.get("auto_scan", True) and scan_due(self.settings) and self.library_folder():
             self._log("info", "Son taramanın üzerinden 7 gün geçmiş; haftalık tarama arka planda başlıyor.")
             self.scan_tab.start_scan(automatic=True)
+
+    def _update_notices(self):
+        current = _load_settings_raw()
+        if current.get("seen_version") != APP_VERSION:
+            if current.get("seen_version"):
+                self.toast(f"Program v{APP_VERSION} sürümüne güncellendi.")
+                self._log("success", f"Program kendiliğinden v{APP_VERSION} sürümüne güncellendi.")
+            current["seen_version"] = APP_VERSION
+            save_settings(current)
+        stale = os.environ.get("AKADEMIK_EXE_ESKI")
+        if stale:
+            self._log("warn", f"Yeni sürüm (v{stale}) hazır, ama yeni bir kütüphane gerektirdiği için programın "
+                              "kendisinin (exe) bir kez güncellenmesi gerekiyor. GitHub'daki son derlemeyi "
+                              "indirin; sonraki güncellemeler yine kendiliğinden gelir.")
 
     def notify_report(self, report, summary):
         self.notice_target = report
@@ -5586,6 +7338,7 @@ class App(ctk.CTk):
             self.folder_var.set(os.path.normpath(path))
             self._log("info", f"Kütüphane klasörü: {self.folder_var.get()}")
             self.save_all_settings()
+            self.library.configure_paths()
         elif not self.folder_var.get():
             self.folder_var.set(str(default_library_dir()))
             self.save_all_settings()
@@ -5717,6 +7470,10 @@ class App(ctk.CTk):
         elif kind == "done":
             self._finish(*message[1:])
             self.library_tab.refresh()
+        elif kind == "scopus":
+            self.scan_tab.on_scopus(message[1], message[2])
+            if message[1] in ("done", "error"):
+                self.library_tab.refresh()
         elif kind == "scan_status":
             self.scan_tab.on_status(message[1])
         elif kind == "scan_progress":
@@ -5766,6 +7523,9 @@ class App(ctk.CTk):
             self.scan_tab.cancel.set()
             scan.join(timeout=5)
         self.save_all_settings()
+        if self.sync.folder() is not None:
+            self.sync_now(closing=True, quiet=True)
+            self.sync.heartbeat(closing=True)
         try:
             self.library.close()
         except Exception:
@@ -5795,6 +7555,14 @@ def main():
         print(pack_mcpb(sys.argv[i + 1], sys.argv[i + 2]))
         return
     install_crash_logging()
+    if updates_enabled() and not os.environ.get(UPDATE_ENV):
+        if "--mcp" not in sys.argv:          # Claude bağlantısı ağı beklemesin; arayüzün indirdiğini kullanır
+            try:
+                fetch_update()
+            except Exception:
+                diag_exception("güncelleme denetimi")
+        if run_updated_code():
+            return
     if "--mcp" in sys.argv:                  # Claude masaüstü uygulaması bağlantısı
         run_mcp_server()
         return
