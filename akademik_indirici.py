@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.6"
+APP_VERSION = "2.7"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -7292,8 +7292,24 @@ class App(ctk.CTk):
         self.input_box.insert("insert", text)
 
     def _add_files(self):
-        paths = filedialog.askopenfilenames(parent=self, title="Kaynak dosyası seçin",
-                                            filetypes=SUPPORTED_FILES)
+        paths = list(filedialog.askopenfilenames(parent=self, title="Kaynak dosyası seçin",
+                                                 filetypes=SUPPORTED_FILES))
+        pdfs = [p for p in paths if p.lower().endswith(".pdf")]
+        if pdfs:
+            choice = choice_dialog(
+                self, "PDF'lerle ne yapalım?",
+                f"{len(pdfs)} PDF seçtiniz.\n\n"
+                "• Kütüphaneye ekle: PDF'ler makalenin kendisiyse. Künyesi çıkarılır, kütüphane klasörüne "
+                "alınır, etiketlenir.\n"
+                "• İçindeki linkleri indir: PDF bir kaynakça ya da literatür özetiyse. İçindeki linkler ve "
+                "DOI'ler bulunur, indirilmek üzere kutuya eklenir.",
+                ["Kütüphaneye ekle", "İçindeki linkleri indir"])
+            if choice is None:
+                paths = [p for p in paths if p not in pdfs]
+            elif choice == 0:
+                paths = [p for p in paths if p not in pdfs]
+                self.tabs.set("Kütüphanem")
+                self.library_tab._start_import(pdfs)
         for path in paths:
             name = os.path.basename(path)
             try:
