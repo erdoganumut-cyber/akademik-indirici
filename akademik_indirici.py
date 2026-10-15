@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.7"
+APP_VERSION = "2.8"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -1077,7 +1077,7 @@ class DownloadWorker(threading.Thread):
             item_id, _ = catalog_pdf(self.library, session, saved["path"], saved["sha"],
                                      meta=saved["meta"], url=url, doi=doi, tags=self.tags,
                                      log=self.log, library_folder=self.library_folder,
-                                     source="indirme")
+                                     source="indirme", auto_tags=self.options.get("auto_tags"))
             item = self.library.get(item_id)
             if item and item["file_path"]:
                 return Path(item["file_path"])
@@ -2514,7 +2514,7 @@ class Library:
 
 def catalog_pdf(library, session, path: Path, sha: str, meta=None, url="", doi=None,
                 tags=(), log=None, library_folder=None, move=True, source="", is_new=False,
-                matched=""):
+                matched="", auto_tags=None):
     """İndirilen ya da taranan bir PDF'i künyesiyle kütüphaneye ekler; dosyayı kütüphane
     klasörüne 'Soyad (Yıl) - Başlık.pdf' adıyla yerleştirir. Dönüş: (kimlik, yeni_mi)"""
     path = Path(path)
@@ -2543,7 +2543,7 @@ def catalog_pdf(library, session, path: Path, sha: str, meta=None, url="", doi=N
         record["url"] = url
     if not record.get("keywords"):
         record["keywords"] = join_keywords(extract_keywords_from_text(head))
-    tags = list(tags) + auto_group_tags(record, head)
+    tags = list(tags) + auto_group_tags(record, head, auto_tags)
     # Aynı dosya ya da DOI dosyasıyla birlikte zaten kütüphanedeyse taşımadan işaretle
     existing = library.find_by_sha(sha) or library.find_by_doi(record.get("doi"))
     if existing:
@@ -2624,7 +2624,8 @@ class LibraryScanWorker(threading.Thread):
     Mesajlar: ("scan", sıra, toplam, ad) · ("log", seviye, metin) · ("scan_done", eklenen, güncellenen, atlanan)"""
 
     def __init__(self, paths, library, events, cancel_event, tags=(), library_folder=None, move=False,
-                 report_folders=()):
+                 report_folders=(), auto_tags=None):
+        self.auto_tags = auto_tags
         super().__init__(daemon=True)
         self.report_folders = [Path(f) for f in report_folders]
         self.library_folder = library_folder
@@ -2661,7 +2662,7 @@ class LibraryScanWorker(threading.Thread):
                     _, created = catalog_pdf(self.library, session, path, sha, url=url,
                                              doi=doi_from_url(url) if url else None, tags=self.tags,
                                              library_folder=self.library_folder, move=self.move,
-                                             source="klasör")
+                                             source="klasör", auto_tags=self.auto_tags)
                     if created:
                         added += 1
                     else:
@@ -3014,11 +3015,14 @@ class KeywordMatcher:
 
     def __init__(self, groups):
         self.groups = []
+        self.ctx_words = {}
         for g in groups:
             group_ctx = [_word_start(w) for w in g.get("context") or []]
             terms = []
             for t in g["terms"]:
                 ctx = [_word_start(w) for w in t["context"]] if t.get("context") is not None else group_ctx
+                self.ctx_words[(g["name"], t["term"])] = (t["context"] if t.get("context") is not None
+                                                          else g.get("context") or [])
                 terms.append((t["term"], _word_start(t["term"]), ctx, t.get("query") or t["term"]))
             self.groups.append((g["name"], terms))
 
@@ -3040,13 +3044,18 @@ class KeywordMatcher:
                 hits.setdefault(name, []).append(term)
         return hits
 
-    def search_terms(self) -> list:
-        """Crossref'te aranacak sorgular (kısa/çok anlamlı terimlere bağlam eklenir)."""
+    def search_terms(self, with_context: bool = False) -> list:
+        """Crossref'te aranacak sorgular. with_context: bağlamlı terime bağlamın ilk kelimesi eklenir
+        ('authenticity' → 'authenticity dans'); geçmişe dönük taramada ilgililiği artırır."""
         out = []
         for name, terms in self.groups:
             for term, _, ctx, query in terms:
-                if ctx and len(term) < 9:
+                if ctx and len(term) < 9 and not with_context:
                     continue          # 'bar', 'teke' gibi terimler Crossref'te anlamsız sonuç verir
+                if with_context and ctx:
+                    words = self.ctx_words.get((name, term)) or []
+                    if not any(fold(w) in fold(query) for w in words):
+                        query = " ".join([query] + words[:2])        # ör. "authenticity dans dance"
                 out.append((name, query))
         return out
 
@@ -3065,9 +3074,10 @@ def get_matcher():
     return _MATCHER_CACHE["matcher"]
 
 
-def auto_group_tags(rec: dict, head: str = "") -> list:
-    """Kaynağın başlığı ve anahtar kelimeleri (yoksa PDF'in ilk sayfası) hangi gruplara uyuyor?"""
-    if not load_settings().get("auto_tag", True):
+def auto_group_tags(rec: dict, head: str = "", enabled=None) -> list:
+    """Kaynağın başlığı ve anahtar kelimeleri (yoksa PDF'in ilk sayfası) hangi gruplara uyuyor?
+    enabled: None ise ayardaki tercih, True/False ise bu ekleme için verilen seçim."""
+    if not (load_settings().get("auto_tag", True) if enabled is None else enabled):
         return []
     matcher = get_matcher()
     hits = matcher.match(" ".join([rec.get("title") or "", rec.get("keywords") or ""]))
@@ -3143,14 +3153,20 @@ def parse_oai_page(xml_bytes: bytes):
     return records, token, total, None
 
 
-def harvest_dergipark(session, since: datetime, until: datetime, progress=None, cancel=None):
+def harvest_dergipark(session, since, until=None, progress=None, cancel=None, set_spec=None,
+                      until_date=None):
     """DergiPark'a 'since' tarihinden beri eklenen/güncellenen makaleleri sayfa sayfa getirir.
 
     DergiPark kayıt tarihlerini saatsiz (yalnızca gün) veriyor; saatli bir 'from' o günün
     kayıtlarını dışarıda bırakır. Bu yüzden gün bazında ve bir gün örtüşmeyle sorulur
     (örtüşen kayıtlar kütüphanede zaten olduğu için yeniden eklenmez)."""
-    start = (since - timedelta(days=1)).strftime("%Y-%m-%d")
-    params = {"verb": "ListRecords", "metadataPrefix": "oai_dc", "from": start}
+    params = {"verb": "ListRecords", "metadataPrefix": "oai_dc"}
+    if since is not None:
+        params["from"] = (since - timedelta(days=1)).strftime("%Y-%m-%d")
+    if until_date:
+        params["until"] = until_date
+    if set_spec:
+        params["set"] = set_spec
     pages = fetched = 0
     while True:
         if cancel is not None and cancel.is_set():
@@ -3172,6 +3188,73 @@ def harvest_dergipark(session, since: datetime, until: datetime, progress=None, 
             return
         params = {"verb": "ListRecords", "resumptionToken": token}
         time.sleep(OAI_PAUSE)
+
+
+# Geçmişe dönük taramada adı alanla ilgili görünen DergiPark dergileri baştan sona taranır
+RELEVANT_JOURNAL_WORDS = ["folklor", "folklore", "halkbilim", "halk bilim", "halk kultur", "muzik", "music",
+                          "musik", "dans", "dance", "konserv", "conservator", "tiyatro", "theatre", "theater",
+                          "sahne", "sanat", "art$", "arts$", "kultur", "culture", "cultural", "turk dunyasi",
+                          "turkiyat", "turkoloji", "turkbilig", "etnograf", "etnoloji", "antropoloji",
+                          "anthropolog", "miras", "heritage", "alevilik", "bektasi", "gelenek", "tradition"]
+SOCIAL_JOURNAL_WORDS = ["sosyal bilim", "social science", "beseri", "insan bilim", "humanit", "edebiyat",
+                        "iletisim", "egitim fakultesi", "spor bilim", "sport"]
+
+
+def dergipark_sets(session) -> list:
+    """DergiPark'taki bütün dergiler: [(kısa ad, dergi adı)]"""
+    params = {"verb": "ListSets"}
+    out = []
+    for _ in range(200):
+        r = session.get(DERGIPARK_OAI, params=params, timeout=(15, 120), headers={"Accept": "application/xml"})
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        for st in root.iter("{%s}set" % _NS["oai"]):
+            spec = (st.findtext("oai:setSpec", "", _NS) or "").strip()
+            name = (st.findtext("oai:setName", "", _NS) or "").strip()
+            if spec:
+                out.append((spec, name))
+        token_el = root.find(".//oai:resumptionToken", _NS)
+        token = token_el.text.strip() if token_el is not None and token_el.text and token_el.text.strip() else None
+        if not token:
+            break
+        params = {"verb": "ListSets", "resumptionToken": token}
+        time.sleep(OAI_PAUSE)
+    return out
+
+
+def relevant_journal_sets(sets, include_social=False) -> list:
+    words = RELEVANT_JOURNAL_WORDS + (SOCIAL_JOURNAL_WORDS if include_social else [])
+    parts = [re.escape(w[:-1]) + "(?![a-z])" if w.endswith("$") else re.escape(w) for w in words]
+    rx = re.compile(r"(?<![a-z])(" + "|".join(parts) + ")")
+    return [(spec, name) for spec, name in sets if rx.search(fold(name)) or rx.search(fold(spec))]
+
+
+def search_crossref_deep(session, query: str, since=None, limit: int = 1000):
+    """Crossref'te tüm zamanlarda (ya da 'since' yayın tarihinden beri) ilgililik sırasıyla arar."""
+    params = {"query.bibliographic": query, "rows": min(1000, limit), "cursor": "*", "select": CROSSREF_SELECT}
+    if since is not None:
+        params["filter"] = f"from-pub-date:{since.strftime('%Y-%m-%d')}"
+    got = 0
+    while got < limit:
+        r = session.get(CROSSREF_SEARCH, params=params, timeout=(15, 90), headers={"Accept": "application/json"})
+        if r.status_code == 400:
+            raise DownloadError(f"Crossref sorguyu reddetti (HTTP 400): {r.text[:200]}")
+        r.raise_for_status()
+        message = r.json().get("message") or {}
+        items = message.get("items") or []
+        for msg in items:
+            rec = record_from_crossref(msg)
+            rec["description"] = clean_text(msg.get("abstract", ""))
+            rec["subjects"] = msg.get("subject") or []
+            rec["url"] = msg.get("URL", "")
+            rec["source"] = "Crossref"
+            yield rec
+        got += len(items)
+        cursor = message.get("next-cursor")
+        if not items or not cursor or len(items) < params["rows"]:
+            return
+        params = dict(params, cursor=cursor)
+        time.sleep(0.5)
 
 
 def search_crossref(session, query: str, since: datetime, rows: int = 100):
@@ -3246,7 +3329,7 @@ def write_scan_report(path: Path, info: dict, found: list, added_items: list) ->
 
     added_rows = "".join(
         f'<li><div class="t apa">{apa_html(i)}</div>'
-        f'<div class="m">{_h({"tarama": "Taramadan", "indirme": "İndirmeden", "klasör": "Klasörden"}.get(i.get("source"), "Elle"))}'
+        f'<div class="m">{_h({"tarama": "Taramadan", "geçmiş tarama": "Geçmiş taramadan", "indirme": "İndirmeden", "klasör": "Klasörden"}.get(i.get("source"), "Elle"))}'
         f'{" · PDF var" if i.get("file_path") else " · PDF yok"}</div></li>'
         for i in added_items)
     errors = "".join(f"<li>{_h(e)}</li>" for e in info.get("errors", []))
@@ -3276,18 +3359,17 @@ li{{background:var(--card);border:1px solid var(--line);border-radius:10px;paddi
 .chip.inst{{color:var(--inst);border-color:var(--inst)}}.chip.sc{{color:#e9711c;border-color:#e9711c}}.kw{{font-size:12px;color:var(--muted)}}
 .empty{{color:var(--muted)}}footer{{color:var(--muted);font-size:12px;margin-top:40px}}
 </style></head><body><main>
-<h1>Haftalık Tarama Raporu</h1>
+<h1>{_h(info.get('title') or 'Haftalık Tarama Raporu')}</h1>
 <p class="sub">{_h(info['since'])} – {_h(info['until'])} arası · Kaynaklar: {_h(', '.join(info.get('sources', [])))}</p>
 <div class="stats">
 <div class="stat"><b>{new_count}</b><span>yeni yayın</span></div>
 <div class="stat"><b>{pdf_count}</b><span>PDF indirildi</span></div>
 <div class="stat"><b>{info.get('dergipark', 0)}</b><span>DergiPark kaydı tarandı</span></div>
 <div class="stat"><b>{info.get('crossref', 0)}</b><span>Crossref kaydı tarandı</span></div>
-<div class="stat"><b>{len(added_items)}</b><span>kütüphaneye eklendi (tümü)</span></div>
+{f'<div class="stat"><b>{len(added_items)}</b><span>kütüphaneye eklendi (tümü)</span></div>' if added_items else ''}
 </div>
 {''.join(sections)}
-<section><h2>Bu dönemde kütüphaneye eklenen tüm kaynaklar <small>{len(added_items)}</small></h2>
-<ul>{added_rows or '<p class="empty">Yok.</p>'}</ul></section>
+{f'<section><h2>Bu dönemde kütüphaneye eklenen tüm kaynaklar <small>{len(added_items)}</small></h2><ul>{added_rows}</ul></section>' if added_items else ''}
 {f'<section><h2>Tarama sırasında oluşan sorunlar</h2><ul>{errors}</ul></section>' if errors else ''}
 <footer>{_h(APP_NAME)} v{_h(APP_VERSION)} · {_h(info.get('created', ''))}</footer>
 </main></body></html>"""
@@ -3355,6 +3437,51 @@ def release_scan_lock():
         pass
 
 
+# ── Geçmişe dönük tarama ayarları ve kaldığı yer ────────────────────────────
+RETRO_PERIODS = {"Son 1 yıl": 1, "Son 3 yıl": 3, "Son 5 yıl": 5, "Son 10 yıl": 10, "Tüm zamanlar": 0}
+RETRO_CROSSREF_LIMIT = {1: 300, 3: 600, 5: 1000, 10: 1500, 0: 2000}   # terim başına en ilgili kayıt
+RETRO_DOWNLOADS = {"Bulunanların hepsini dene": None, "En fazla 200 PDF": 200, "PDF indirme (yalnızca künye)": 0}
+RETRO_SCOPES = {"Alan dergileri (önerilen)": "alan", "Alan + sosyal bilimler dergileri": "sosyal",
+                "Bütün DergiPark (saatler sürer)": "tum"}
+
+
+def retro_period_label(years: int) -> str:
+    return next((k for k, v in RETRO_PERIODS.items() if v == years), f"Son {years} yıl")
+
+
+def _retro_key(retro: dict) -> str:
+    parts = [str(retro.get("years")), retro.get("scope", ""), str(retro.get("dergipark", True)),
+             str(retro.get("crossref", True)), ",".join(sorted(retro.get("groups") or []))]
+    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def retro_state_for(retro: dict) -> dict:
+    """Aynı seçeneklerle yarım kalmış tarama varsa onun durumu, yoksa yeni durum."""
+    saved = _read_json(data_dir() / "gecmis_tarama.json")
+    if saved.get("key") == _retro_key(retro):
+        saved.setdefault("done", [])
+        return saved
+    return {"key": _retro_key(retro), "done": [], "retro": retro,
+            "started": datetime.now().strftime("%d.%m.%Y %H:%M")}
+
+
+def pending_retro():
+    """Yarım kalmış geçmişe dönük tarama (ayarlarıyla) ya da None."""
+    saved = _read_json(data_dir() / "gecmis_tarama.json")
+    return saved if saved.get("key") and saved.get("retro") else None
+
+
+def save_retro_state(state):
+    path = data_dir() / "gecmis_tarama.json"
+    try:
+        if state is None:
+            path.unlink(missing_ok=True)
+        else:
+            _write_json(path, state)
+    except OSError:
+        pass
+
+
 class ScanWorker(threading.Thread):
     """Haftalık tarama. Mesajlar: ("scan_status", metin) · ("scan_progress", oran 0-1)
     · ("log", seviye, metin) · ("scan_finished", rapor_yolu | None, özet)"""
@@ -3394,6 +3521,8 @@ class ScanWorker(threading.Thread):
             release_scan_lock()
 
     def _run(self):
+        if self.settings.get("retro"):
+            return self._run_retro()
         now = utc_now()
         last = self.settings.get("last_scan")
         try:
@@ -3471,63 +3600,8 @@ class ScanWorker(threading.Thread):
 
         # 3) Kütüphaneye ekleme + açık erişim PDF
         found = []
-        library_folder = self.settings.get("library_folder") or None
-        if library_folder:
-            try:
-                Path(library_folder).mkdir(parents=True, exist_ok=True)
-            except OSError as exc:
-                info["errors"].append(f"Kütüphane klasörü oluşturulamadı: {describe_error(exc)}")
-                library_folder = None
-        downloader = DownloadWorker([], library_folder or str(Path.home()), {
-            "find_pdf": True, "save_html": False, "email": self.settings.get("email", ""),
-            "library": self.library, "library_folder": library_folder}, queue.Queue(), self.cancel)
-        attempts = 0
-        total = len(candidates)
-        for n, entry in enumerate(candidates.values(), start=1):
-            if self.cancel.is_set():
-                break
-            rec, hits = entry["record"], entry["hits"]
-            self.events.put(("scan_progress", 0.85 + 0.15 * n / max(total, 1)))
-            self.status(f"Yeni yayınlar kütüphaneye ekleniyor ({n}/{total})")
-            known = (self.library.find_by_doi(rec.get("doi")) or self.library.find_by_url(rec.get("url"))
-                     or self.library.find_by_title(rec.get("title")))
-            if known:
-                found.append({"record": rec, "hits": hits, "status": "known", "item_id": known})
-                continue
-            if rec.get("source") == "Crossref" and rec.get("doi"):
-                full = crossref_record(session, rec["doi"])         # cilt, sayı, sayfa, yayınevi
-                if full:
-                    rec = dict(merge_records(full, rec), source="Crossref", url=rec.get("url", ""))
-                    entry["record"] = rec
-            tags = list(hits)
-            matched = describe_hits(hits)
-            status, item_id = "nopdf", None
-            link = ("https://doi.org/" + rec["doi"]) if rec.get("doi") else rec.get("url")
-            if link and attempts < SCAN_MAX_DOWNLOADS and library_folder:
-                attempts += 1
-                try:
-                    downloader._last_saved = None
-                    downloader._tried = set()
-                    result = downloader._download_one(session, link, n)
-                    saved = downloader._last_saved
-                    if result[0] == "ok" and saved:
-                        item_id, _ = catalog_pdf(self.library, session, saved["path"], saved["sha"],
-                                                 meta=saved["meta"], url=rec.get("url") or link,
-                                                 doi=rec.get("doi") or None, tags=tags,
-                                                 library_folder=library_folder, source="tarama",
-                                                 is_new=True, matched=matched)
-                        status = "pdf"
-                except Exception as exc:
-                    info["errors"].append(f"{rec.get('title', '')[:60]}: {describe_error(exc)}")
-            if item_id is None:
-                record = {k: rec.get(k) for k in RECORD_FIELDS if rec.get(k)}
-                item_id, _ = self.library.add(record, tags=tags, source="tarama", is_new=True,
-                                              matched=matched)
-                if rec.get("doi") and database_for_doi(rec["doi"]):
-                    status = "institution"
-            else:
-                self.library.update(item_id, {"is_new": 1, "matched": matched})
-            found.append({"record": rec, "hits": hits, "status": status, "item_id": item_id})
+        self._prepare_downloads(info)
+        self._process(session, candidates, found, info, SCAN_MAX_DOWNLOADS, "tarama")
         session.close()
 
         if not reached:
@@ -3538,7 +3612,7 @@ class ScanWorker(threading.Thread):
             self.events.put(("scan_finished", None, self.summary))
             return
         added_items = self.library.items_added_since(since.strftime("%Y-%m-%d"))
-        folder = Path(library_folder or settings_path().parent) / "Tarama Raporları"
+        folder = Path(self.library_folder or settings_path().parent) / "Tarama Raporları"
         self.report_path = write_scan_report(folder / f"Tarama_{datetime.now():%Y-%m-%d_%H%M%S}.html",
                                              info, found, added_items)
         new = sum(1 for e in found if e["status"] != "known")
@@ -3553,6 +3627,211 @@ class ScanWorker(threading.Thread):
         self.events.put(("scan_progress", 1.0))
         self.events.put(("scan_finished", str(self.report_path), self.summary))
 
+
+    # ── bulunanları kütüphaneye işleme (haftalık ve geçmişe dönük ortak) ─────────────────
+    def _prepare_downloads(self, info):
+        self.library_folder = self.settings.get("library_folder") or None
+        if self.library_folder:
+            try:
+                Path(self.library_folder).mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                info["errors"].append(f"Kütüphane klasörü oluşturulamadı: {describe_error(exc)}")
+                self.library_folder = None
+        self.downloader = DownloadWorker([], self.library_folder or str(Path.home()), {
+            "find_pdf": True, "save_html": False, "email": self.settings.get("email", ""),
+            "library": self.library, "library_folder": self.library_folder}, queue.Queue(), self.cancel)
+        self.attempts = 0
+
+    def _process(self, session, candidates, found, info, max_downloads, source, label="Yeni yayınlar"):
+        library_folder, downloader = self.library_folder, self.downloader
+        total = len(candidates)
+        for n, entry in enumerate(list(candidates.values()), start=1):
+            if self.cancel.is_set():
+                break
+            rec, hits = entry["record"], entry["hits"]
+            if source == "tarama":
+                self.events.put(("scan_progress", 0.85 + 0.15 * n / max(total, 1)))
+            self.status(f"{label} kütüphaneye ekleniyor ({n}/{total})")
+            known = (self.library.find_by_doi(rec.get("doi")) or self.library.find_by_url(rec.get("url"))
+                     or self.library.find_by_title(rec.get("title")))
+            if known:
+                found.append({"record": rec, "hits": hits, "status": "known", "item_id": known})
+                continue
+            if rec.get("source") == "Crossref" and rec.get("doi"):
+                full = crossref_record(session, rec["doi"])         # cilt, sayı, sayfa, yayınevi
+                if full:
+                    rec = dict(merge_records(full, rec), source="Crossref", url=rec.get("url", ""))
+                    entry["record"] = rec
+            tags = list(hits)
+            matched = describe_hits(hits)
+            status, item_id = "nopdf", None
+            link = ("https://doi.org/" + rec["doi"]) if rec.get("doi") else rec.get("url")
+            if link and (max_downloads is None or self.attempts < max_downloads) and library_folder:
+                self.attempts += 1
+                try:
+                    downloader._last_saved = None
+                    downloader._tried = set()
+                    result = downloader._download_one(session, link, n)
+                    saved = downloader._last_saved
+                    if result[0] == "ok" and saved:
+                        item_id, _ = catalog_pdf(self.library, session, saved["path"], saved["sha"],
+                                                 meta=saved["meta"], url=rec.get("url") or link,
+                                                 doi=rec.get("doi") or None, tags=tags,
+                                                 library_folder=library_folder, source=source,
+                                                 is_new=True, matched=matched)
+                        status = "pdf"
+                except Exception as exc:
+                    info["errors"].append(f"{rec.get('title', '')[:60]}: {describe_error(exc)}")
+            if item_id is None:
+                record = {k: rec.get(k) for k in RECORD_FIELDS if rec.get(k)}
+                item_id, _ = self.library.add(record, tags=tags, source=source, is_new=True,
+                                              matched=matched)
+                if rec.get("doi") and database_for_doi(rec["doi"]):
+                    status = "institution"
+            else:
+                self.library.update(item_id, {"is_new": 1, "matched": matched})
+            found.append({"record": rec, "hits": hits, "status": status, "item_id": item_id})
+
+    # ── geçmişe dönük tarama: 'tüm zamanlar' dahil, kaldığı yerden sürdürülebilir ─────────────
+    def _run_retro(self):
+        retro = self.settings["retro"]
+        years = int(retro.get("years") or 0)
+        now = utc_now()
+        since = now - timedelta(days=365 * years) if years else None
+        groups = parse_keyword_groups(load_keywords_text())
+        if retro.get("groups"):
+            groups = [g for g in groups if g["name"] in retro["groups"]] or groups
+        matcher = KeywordMatcher(groups)
+        max_downloads = retro.get("max_downloads")              # None: hepsi, 0: indirme yok
+        state = retro_state_for(retro)
+        session = make_session()
+        period = retro_period_label(years)
+        info = {"since": since.strftime("%d.%m.%Y") if since else "en eski kayıt",
+                "until": now.strftime("%d.%m.%Y"), "sources": [], "errors": [], "dergipark": 0,
+                "crossref": 0, "created": datetime.now().strftime("%d.%m.%Y %H:%M"),
+                "title": f"Geçmişe Dönük Tarama · {period}"}
+        found, reached = [], []
+        self._prepare_downloads(info)
+
+        def year_ok(rec):
+            if not since:
+                return True
+            m = re.search(r"\b(1[5-9]\d\d|20\d\d)\b", str(rec.get("year") or ""))
+            return not m or int(m.group(1)) >= since.year
+
+        def collect(records, candidates, counter):
+            for rec in records:
+                info[counter] += 1
+                if not year_ok(rec):
+                    continue
+                strong = " ".join([rec.get("title", ""), " ".join(rec.get("all_titles", [])),
+                                   " ".join(rec.get("subjects", [])), rec.get("keywords", "")])
+                hits = matcher.match(rec.get("description", ""), strong=strong)
+                if hits:
+                    k = (rec.get("doi") or "").lower() or rec.get("url") or fold(rec.get("title", ""))
+                    if k in candidates:
+                        for g, terms in hits.items():
+                            candidates[k]["hits"].setdefault(g, []).extend(terms)
+                    else:
+                        candidates[k] = {"record": rec, "hits": hits}
+
+        # 1) DergiPark: alan dergileri baştan sona ya da bütün DergiPark yıl yıl
+        chunks = []
+        if retro.get("dergipark", True):
+            info["sources"].append("DergiPark")
+            try:
+                if retro.get("scope") == "tum":
+                    first = since.year if since else 2005
+                    chunks = [("yil", str(y), str(y)) for y in range(now.year, first - 1, -1)]
+                else:
+                    self.status("DergiPark dergi listesi alınıyor…")
+                    sets = relevant_journal_sets(dergipark_sets(session), retro.get("scope") == "sosyal")
+                    chunks = [("dergi", spec, name) for spec, name in sets]
+                reached.append("DergiPark")
+            except Exception as exc:
+                info["errors"].append(f"DergiPark dergi listesi alınamadı: {describe_error(exc)}")
+                self.log("warn", f"DergiPark'a ulaşılamadı: {describe_error(exc)}")
+        queries = matcher.search_terms(with_context=True) if retro.get("crossref", True) else []
+        steps = len(chunks) + len(queries)
+        done_steps = 0
+        for kind, key, name in chunks:
+            if self.cancel.is_set():
+                break
+            done_steps += 1
+            chunk_id = f"{kind}:{key}"
+            if chunk_id in state["done"]:
+                continue
+            self.events.put(("scan_progress", done_steps / max(steps, 1)))
+            label = f"DergiPark {key}" if kind == "yil" else name
+            candidates = {}
+            try:
+                def progress(done, total, label=label):
+                    self.status(f"{label}: {done}{' / ' + str(total) if total else ''} kayıt "
+                                f"({done_steps}/{steps})")
+                if kind == "yil":
+                    records = harvest_dergipark(session, datetime(int(key), 1, 1, tzinfo=timezone.utc),
+                                                progress=progress, cancel=self.cancel, until_date=f"{key}-12-31")
+                else:
+                    records = harvest_dergipark(session, None, progress=progress, cancel=self.cancel,
+                                                set_spec=key)
+                collect(records, candidates, "dergipark")
+            except Exception as exc:
+                info["errors"].append(f"{label}: {describe_error(exc)}")
+                continue
+            self._process(session, candidates, found, info, max_downloads, "geçmiş tarama", label)
+            if not self.cancel.is_set():
+                state["done"].append(chunk_id)
+                save_retro_state(state)
+
+        # 2) Crossref: her terim için tüm zamanlarda en ilgili yayınlar
+        if queries and not self.cancel.is_set():
+            info["sources"].append("Crossref")
+            limit = RETRO_CROSSREF_LIMIT.get(years, RETRO_CROSSREF_LIMIT[0])
+            failures_in_row = 0
+            for group, query in queries:
+                if self.cancel.is_set():
+                    break
+                done_steps += 1
+                if "crossref:" + query in state["done"]:
+                    continue
+                self.events.put(("scan_progress", done_steps / max(steps, 1)))
+                self.status(f"Crossref: “{query}” ({done_steps}/{steps})")
+                candidates = {}
+                try:
+                    collect(search_crossref_deep(session, query, since, limit), candidates, "crossref")
+                    failures_in_row = 0
+                    if "Crossref" not in reached:
+                        reached.append("Crossref")
+                except Exception as exc:
+                    failures_in_row += 1
+                    info["errors"].append(f"Crossref “{query}”: {describe_error(exc)}")
+                    if failures_in_row >= 3:
+                        self.log("warn", "Crossref'e ulaşılamadı; Crossref taraması atlandı.")
+                        break
+                    continue
+                self._process(session, candidates, found, info, max_downloads, "geçmiş tarama", "Crossref")
+                if not self.cancel.is_set():
+                    state["done"].append("crossref:" + query)
+                    save_retro_state(state)
+        session.close()
+
+        new = sum(1 for e in found if e["status"] != "known")
+        pdfs = sum(1 for e in found if e["status"] == "pdf")
+        finished = not self.cancel.is_set() and bool(reached)
+        if finished:
+            save_retro_state(None)
+        folder = Path(self.library_folder or settings_path().parent) / "Tarama Raporları"
+        self.report_path = write_scan_report(folder / f"Gecmis_Tarama_{datetime.now():%Y-%m-%d_%H%M%S}.html",
+                                             info, found, []) if found else None
+        if not reached:
+            self.summary = "Hiçbir kaynağa ulaşılamadı (internet bağlantısını kontrol edin)."
+        elif finished:
+            self.summary = f"Geçmişe dönük tarama bitti ({period}): {new} yeni kaynak, {pdfs} PDF."
+        else:
+            self.summary = (f"Geçmişe dönük tarama durduruldu: şimdiye dek {new} yeni kaynak, {pdfs} PDF. "
+                            "Aynı seçeneklerle yeniden başlatınca kaldığı yerden sürer.")
+        self.events.put(("scan_progress", 1.0 if finished else 0.0))
+        self.events.put(("scan_finished", str(self.report_path) if self.report_path else None, self.summary))
 
 def scan_due(settings: dict) -> bool:
     last = settings.get("last_scan")
@@ -5366,6 +5645,62 @@ def open_file(path: Path):
         subprocess.Popen(["xdg-open", str(path)])
 
 
+def import_dialog(parent, count, known_tags=()):
+    """Kütüphaneye alma seçenekleri. Dönüş: (taşı_mı, etiketler, otomatik_etiket) ya da None."""
+    win = ctk.CTkToplevel(parent)
+    win.title("Kütüphaneye ekle")
+    set_window_icon(win, delay=260)
+    win.resizable(False, False)
+    win.transient(parent)
+    result = [None]
+    pad = {"padx": 20, "sticky": "ew"}
+    win.grid_columnconfigure(0, weight=1)
+    ctk.CTkLabel(win, text=f"{count} PDF kütüphaneye eklenecek", font=ctk.CTkFont(size=15, weight="bold"),
+                 anchor="w").grid(row=0, column=0, pady=(18, 8), **pad)
+    move_var = ctk.StringVar(value="tasi")
+    ctk.CTkRadioButton(win, text="Kütüphane klasörüne taşı (tek klasör, önerilen)", variable=move_var,
+                       value="tasi").grid(row=1, column=0, pady=2, **pad)
+    ctk.CTkRadioButton(win, text="Kopyala, asılları yerinde kalsın", variable=move_var,
+                       value="kopyala").grid(row=2, column=0, pady=2, **pad)
+    ctk.CTkLabel(win, text="Etiketler", font=ctk.CTkFont(size=13, weight="bold"), anchor="w").grid(
+        row=3, column=0, pady=(14, 2), **pad)
+    entry = ctk.CTkEntry(win, height=30, width=460, placeholder_text="Elle etiket (isteğe bağlı, virgülle): "
+                                                                    "ör. tez bölüm 2")
+    entry.grid(row=4, column=0, pady=2, **pad)
+    if known_tags:
+        ctk.CTkLabel(win, text="Var olanlar: " + shorten(", ".join(known_tags), 150), text_color=MUTED,
+                     font=ctk.CTkFont(size=11), wraplength=460, justify="left", anchor="w").grid(
+            row=5, column=0, **pad)
+    auto_var = ctk.BooleanVar(value=load_settings().get("auto_tag", True))
+    ctk.CTkCheckBox(win, text="Otomatik etiketle: konu grubu etiketlerini (anahtar kelime gruplarınıza göre) "
+                              "kendisi eklesin", variable=auto_var).grid(row=6, column=0, pady=(10, 2), **pad)
+    ctk.CTkLabel(win, text="İkisi birlikte de kullanılabilir: elle yazdığınız etiketler her kaynağa, otomatik "
+                           "etiketler yalnızca konusu uyan kaynaklara eklenir.", text_color=MUTED,
+                 font=ctk.CTkFont(size=11), wraplength=460, justify="left", anchor="w").grid(row=7, column=0, **pad)
+    row = ctk.CTkFrame(win, fg_color="transparent")
+    row.grid(row=8, column=0, pady=18, **pad)
+
+    def ok(_=None):
+        result[0] = (move_var.get() == "tasi", clean_tags(entry.get()), bool(auto_var.get()))
+        win.destroy()
+    ctk.CTkButton(row, text="Ekle", command=ok).pack(side="left")
+    ctk.CTkButton(row, text="Vazgeç", fg_color="transparent", border_width=1, text_color=TEXT,
+                  command=win.destroy).pack(side="left", padx=8)
+    entry.bind("<Return>", ok)
+
+    def place():
+        win.update_idletasks()
+        x = parent.winfo_rootx() + max(0, (parent.winfo_width() - win.winfo_width()) // 2)
+        y = parent.winfo_rooty() + max(0, (parent.winfo_height() - win.winfo_height()) // 3)
+        win.geometry(f"+{x}+{y}")
+        win.lift()
+        entry.focus_force()
+        win.grab_set()
+    win.after(50, place)
+    parent.wait_window(win)
+    return result[0]
+
+
 def choice_dialog(parent, title, text, options):
     """Birden çok düğmeli soru penceresi. Dönüş: seçilen düğmenin sırası ya da None (kapatıldı)."""
     win = ctk.CTkToplevel(parent)
@@ -5410,6 +5745,118 @@ def add_italic_tag(textbox):
         inner.tag_configure("i", font=(actual["family"], actual["size"], "italic"))
     except Exception:
         inner.tag_configure("i", font=("TkDefaultFont", 10, "italic"))
+
+
+class RetroScanDialog(ctk.CTkToplevel):
+    """Geçmişe dönük tarama seçenekleri: dönem, gruplar, kaynaklar, PDF indirme."""
+
+    def __init__(self, app, scan_tab):
+        super().__init__(app)
+        self.app, self.scan_tab = app, scan_tab
+        self.title("Geçmişe Dönük Tarama")
+        set_window_icon(self, delay=260)
+        self.resizable(False, True)
+        self.transient(app)
+        pad = {"padx": 20, "sticky": "ew"}
+        self.grid_columnconfigure(0, weight=1)
+        r = 0
+        ctk.CTkLabel(self, text="Geçmişe dönük tarama", font=ctk.CTkFont(size=16, weight="bold"),
+                     anchor="w").grid(row=r, column=0, pady=(18, 2), **pad); r += 1
+        ctk.CTkLabel(self, text="Anahtar kelimelerinizle eşleşen eski yayınları da bulur, kütüphaneye ekler ve "
+                                "açık erişimli olanların PDF'ini indirir. Uzun sürebilir; durdurursanız aynı "
+                                "seçeneklerle yeniden başlatınca kaldığı yerden devam eder.",
+                     text_color=MUTED, wraplength=520, justify="left", anchor="w").grid(row=r, column=0, **pad); r += 1
+        pending = pending_retro()
+        if pending:
+            pr = pending["retro"]
+            ctk.CTkLabel(self, text=f"Yarım kalan tarama: {retro_period_label(pr.get('years', 0))} · "
+                                    f"{len(pending.get('done', []))} adım tamamlandı · başlangıç {pending.get('started', '')}",
+                         text_color=LOG_COLORS["warn"], anchor="w").grid(row=r, column=0, pady=(10, 0), **pad); r += 1
+            ctk.CTkButton(self, text="Kaldığı Yerden Devam Et", command=lambda: self._start(pr)).grid(
+                row=r, column=0, pady=(4, 0), padx=20, sticky="w"); r += 1
+
+        def label(text):
+            nonlocal r
+            ctk.CTkLabel(self, text=text, font=ctk.CTkFont(size=13, weight="bold"), anchor="w").grid(
+                row=r, column=0, pady=(14, 4), **pad)
+            r += 1
+        label("Dönem")
+        self.period = ctk.CTkSegmentedButton(self, values=list(RETRO_PERIODS))
+        self.period.set("Tüm zamanlar")
+        self.period.grid(row=r, column=0, **pad); r += 1
+        label("Kaynaklar")
+        self.use_dp = ctk.BooleanVar(value=True)
+        self.use_cr = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(self, text="Crossref (uluslararası ve DOI'li Türkçe yayınlar, en eskisine kadar)",
+                        variable=self.use_cr).grid(row=r, column=0, pady=2, **pad); r += 1
+        dp = ctk.CTkFrame(self, fg_color="transparent")
+        dp.grid(row=r, column=0, pady=2, **pad); r += 1
+        ctk.CTkCheckBox(dp, text="DergiPark:", variable=self.use_dp).pack(side="left")
+        self.scope = ctk.CTkOptionMenu(dp, values=list(RETRO_SCOPES), width=280)
+        self.scope.set(next(iter(RETRO_SCOPES)))
+        self.scope.pack(side="left", padx=8)
+        label("PDF")
+        self.downloads = ctk.CTkOptionMenu(self, values=list(RETRO_DOWNLOADS), width=280)
+        self.downloads.set(next(iter(RETRO_DOWNLOADS)))
+        self.downloads.grid(row=r, column=0, padx=20, sticky="w"); r += 1
+        label("Konu grupları")
+        box = ctk.CTkScrollableFrame(self, height=170)
+        box.grid(row=r, column=0, **pad); r += 1
+        self.group_vars = {}
+        for g in parse_keyword_groups(load_keywords_text()):
+            var = ctk.BooleanVar(value=True)
+            ctk.CTkCheckBox(box, text=f"{g['name']}  ({len(g['terms'])} terim)", variable=var).pack(anchor="w", pady=2)
+            self.group_vars[g["name"]] = var
+        self.estimate = ctk.CTkLabel(self, text="", text_color=MUTED, wraplength=520, justify="left", anchor="w")
+        self.estimate.grid(row=r, column=0, pady=(10, 0), **pad); r += 1
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.grid(row=r, column=0, pady=18, **pad); r += 1
+        ctk.CTkButton(btns, text="Taramayı Başlat", fg_color="#1F8F4E", hover_color="#18723E",
+                      command=self._start_new).pack(side="left")
+        ctk.CTkButton(btns, text="Vazgeç", fg_color="transparent", border_width=1, text_color=TEXT,
+                      command=self.destroy).pack(side="left", padx=8)
+        for w in (self.period, self.scope, self.downloads):
+            w.configure(command=lambda _=None: self._update_estimate())
+        self._update_estimate()
+
+        def place():
+            self.update_idletasks()
+            x = app.winfo_rootx() + max(0, (app.winfo_width() - self.winfo_width()) // 2)
+            y = app.winfo_rooty() + max(0, (app.winfo_height() - self.winfo_height()) // 4)
+            self.geometry(f"+{x}+{y}")
+            self.lift()
+            self.focus_force()
+        self.after(60, place)
+
+    def _collect_options(self) -> dict:
+        groups = [n for n, v in self.group_vars.items() if v.get()]
+        return {"years": RETRO_PERIODS[self.period.get()], "scope": RETRO_SCOPES[self.scope.get()],
+                "dergipark": self.use_dp.get(), "crossref": self.use_cr.get(),
+                "groups": groups if len(groups) < len(self.group_vars) else [],
+                "max_downloads": RETRO_DOWNLOADS[self.downloads.get()]}
+
+    def _update_estimate(self):
+        o = self._collect_options()
+        text = {"alan": "DergiPark'ta adı folklor, halkbilim, müzik, dans, sanat, kültür, tiyatro, Türk "
+                        "dünyası vb. olan dergiler baştan sona taranır (yaklaşık 1 saat).",
+                "sosyal": "Alan dergilerine ek olarak sosyal bilimler, edebiyat, eğitim ve spor dergileri de "
+                          "taranır (birkaç saat).",
+                "tum": "Bütün DergiPark yıl yıl taranır; tüm zamanlar için bir gece sürebilir."}[o["scope"]]
+        cr = f" Crossref'te her terim için en ilgili {RETRO_CROSSREF_LIMIT.get(o['years'], 2000)} kayıt incelenir."
+        self.estimate.configure(text=(text if o["dergipark"] else "") + (cr if o["crossref"] else "") +
+                                " Program açık kaldığı sürece arka planda çalışır.")
+
+    def _start_new(self):
+        o = self._collect_options()
+        if not o["dergipark"] and not o["crossref"]:
+            messagebox.showwarning(APP_NAME, "En az bir kaynak seçin.", parent=self)
+            return
+        self._start(o)
+
+    def _start(self, options):
+        self.destroy()
+        self.app.tabs.set("Tarama")
+        self.scan_tab.start_scan(retro=options)
 
 
 class BibliographyDialog(ctk.CTkToplevel):
@@ -5843,7 +6290,7 @@ class LibraryTab:
         self.f_type.set(ITEM_TYPES.get(item["type"], "Diğer"))
         info = []
         if item.get("source"):
-            info.append({"tarama": "Haftalık taramadan", "indirme": "İndiriciden", "klasör": "Klasör taramasından",
+            info.append({"tarama": "Haftalık taramadan", "geçmiş tarama": "Geçmişe dönük taramadan", "indirme": "İndiriciden", "klasör": "Klasör taramasından",
                          "elle": "Elle eklendi"}.get(item["source"], item["source"]))
         if item.get("added"):
             info.append(f"eklendi: {item['added']}")
@@ -6118,16 +6565,11 @@ class LibraryTab:
         self._start_import(paths, report_folders=[folder])
 
     def _start_import(self, paths, report_folders=()):
-        move = messagebox.askyesnocancel(
-            APP_NAME, f"{len(paths)} PDF kütüphaneye alınacak.\n\n"
-                      "Dosyalar kütüphane klasörüne TAŞINSIN mı?\n"
-                      "Evet: taşınır (tek klasör) · Hayır: kopyalanır, asılları yerinde kalır", parent=self.parent)
-        if move is None:
+        answer = import_dialog(self.app, len(paths), self.lib.all_tags())
+        if answer is None:
             return
-        dialog = ctk.CTkInputDialog(text="Bu kaynaklara eklenecek etiket (isteğe bağlı, virgülle):",
-                                    title="Etiket")
-        tags = dialog.get_input() or ""
-        self.app.start_import(paths, clean_tags(tags), move, report_folders)
+        move, tags, auto = answer
+        self.app.start_import(paths, tags, move, report_folders, auto_tags=auto)
 
     def _autotag(self):
         items = self.selected_items()
@@ -6253,6 +6695,9 @@ class ScanTab:
         ctk.CTkButton(extra, text="Tanılama Kaydını Aç", height=26, width=150, fg_color="transparent",
                       border_width=1, text_color=MUTED, font=ctk.CTkFont(size=12),
                       command=self.app.open_diagnostics).pack(side="left", padx=8)
+        self.retro_btn = ctk.CTkButton(side, text="Geçmişe Dönük Tarama… (tüm literatür)", height=32,
+                                       fg_color="#1F6F8B", hover_color="#185A71", command=self.open_retro)
+        self.retro_btn.grid(row=r, column=0, sticky="ew", padx=10, pady=(8, 0)); r += 1
 
         section("Kendiliğinden çalışma")
         ctk.CTkLabel(side, text="Uygulama açıkken ya da açıldığında son taramanın üzerinden 7 gün "
@@ -6406,7 +6851,13 @@ class ScanTab:
                                          "yeniden eklenmez.)", parent=self.parent):
             self.start_scan(force_days=7)
 
-    def start_scan(self, automatic=False, force_days=None):
+    def open_retro(self):
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo(APP_NAME, "Şu an bir tarama sürüyor; bitince yeniden deneyin.", parent=self.parent)
+            return
+        RetroScanDialog(self.app, self)
+
+    def start_scan(self, automatic=False, force_days=None, retro=None):
         if self.worker and self.worker.is_alive():
             return
         unsaved = self.kw_box.get("1.0", "end").rstrip() + "\n"
@@ -6423,6 +6874,10 @@ class ScanTab:
         settings = load_settings()
         if force_days:
             settings["force_days"] = force_days
+        if retro:
+            settings["retro"] = retro
+            self.status_label.configure(text=f"Geçmişe dönük tarama başlıyor ({retro_period_label(retro['years'])})…")
+            self.retro_btn.configure(state="disabled")
         self.worker = ScanWorker(self.app.library, settings, self.app.events, self.cancel)
         self.worker.start()
 
@@ -6438,6 +6893,7 @@ class ScanTab:
         self.progress.set(max(0.0, min(1.0, value)))
 
     def on_finished(self, report, summary):
+        self.retro_btn.configure(state="normal")
         self.scan_btn.configure(state="normal", text="Şimdi Tara")
         self.stop_btn.configure(state="disabled")
         self.status_label.configure(text=summary)
@@ -7028,13 +7484,16 @@ class App(ctk.CTk):
         if self.email_var.get():
             self.email_entry.insert(0, self.email_var.get())
         ctk.CTkLabel(email_row, text="Etiket:", font=self.font_small).grid(row=0, column=2, padx=(12, 8))
-        self.tag_entry = ctk.CTkEntry(email_row, height=30, placeholder_text="ör. tez bölüm 2")
+        self.tag_entry = ctk.CTkEntry(email_row, height=30, placeholder_text="elle: ör. tez bölüm 2")
         self.tag_entry.grid(row=0, column=3, sticky="ew")
+        self.auto_tag_dl = ctk.BooleanVar(value=self.settings.get("auto_tag", True))
+        ctk.CTkCheckBox(email_row, text="+ otomatik", variable=self.auto_tag_dl, width=20,
+                        font=self.font_small).grid(row=0, column=4, padx=(8, 0))
         ctk.CTkLabel(
             card, font=ctk.CTkFont(size=11), text_color=MUTED, anchor="w", justify="left",
             wraplength=540,
             text="E-posta isteğe bağlı: girerseniz DOI'lerin yasal açık erişim kopyaları Unpaywall'da aranır "
-                 "(adres yalnızca Unpaywall'a gönderilir). Etiket, bu indirmede inen kaynaklara verilir.",
+                 "(adres yalnızca Unpaywall'a gönderilir). Elle yazılan etiket inen her kaynağa verilir; '+ otomatik' işaretliyse konusu uyanlara grup etiketleri de eklenir.",
         ).grid(row=9, column=0, sticky="ew", padx=18, pady=(4, 16))
 
     def _build_right_panel(self, parent):
@@ -7215,13 +7674,13 @@ class App(ctk.CTk):
         if self.tabs.get() == "Kütüphanem":
             self.library_tab.refresh()
 
-    def start_import(self, paths, tags, move, report_folders=()):
+    def start_import(self, paths, tags, move, report_folders=(), auto_tags=None):
         if self.import_worker and self.import_worker.is_alive():
             messagebox.showinfo(APP_NAME, "Önceki ekleme işlemi sürüyor.", parent=self)
             return
         self.import_worker = LibraryScanWorker(paths, self.library, self.events, threading.Event(),
                                                tags=tags, library_folder=self.library_folder(), move=move,
-                                               report_folders=report_folders)
+                                               report_folders=report_folders, auto_tags=auto_tags)
         self.library_tab.count_label.configure(text=f"{len(paths)} PDF kütüphaneye alınıyor…")
         self.import_worker.start()
 
@@ -7413,7 +7872,7 @@ class App(ctk.CTk):
         options = {"find_pdf": self.opt_find_pdf.get(), "save_html": self.opt_save_html.get(),
                    "skip_existing": self.opt_skip_existing.get(), "email": email,
                    "library": self.library, "library_folder": str(folder),
-                   "tags": clean_tags(self.tag_entry.get())}
+                   "tags": clean_tags(self.tag_entry.get()), "auto_tags": bool(self.auto_tag_dl.get())}
         self._set_running(True)
         self.overall_bar.set(0)
         self.overall_label.configure(text=f"0 / {len(links)}")
