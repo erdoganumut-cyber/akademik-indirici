@@ -20,10 +20,19 @@ jobs:
           pip install -r requirements.txt pyinstaller
 
       - name: Program klasörünü oluştur
-        run: pyinstaller --noconfirm --clean --onedir --windowed --name AkademikIndirici --collect-data customtkinter akademik_indirici.py
+        run: pyinstaller --noconfirm --clean AkademikIndirici.spec
+
+      - name: Claude uzantısını paketle
+        run: .\dist\AkademikIndirici\AkademikKutuphaneMCP.exe --mcpb-pack dist\AkademikIndirici dist\akademik-kutuphane.mcpb
 
       - uses: actions/upload-artifact@v7
         with:
           name: AkademikIndirici
           path: dist/AkademikIndirici/
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Claude-uzantisi
+          path: dist/akademik-kutuphane.mcpb
           if-no-files-found: error

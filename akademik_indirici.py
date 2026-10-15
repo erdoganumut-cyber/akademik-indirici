@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.1.2"
+APP_VERSION = "2.3"
 
 CHUNK_SIZE = 64 * 1024              # parça parça indirme boyutu (64 KB)
 HTML_READ_LIMIT = 5 * 1024 * 1024   # PDF bağlantısı aramak için okunacak en fazla HTML
@@ -530,7 +530,78 @@ _WANTED_META = {
     "citation_lastpage", "citation_publisher", "citation_language", "citation_book_title",
     "citation_inbook_title", "citation_conference_title", "citation_dissertation_institution",
     "citation_technical_report_institution", "citation_isbn", "dc.publisher", "dc.language",
+    "citation_keywords", "keywords", "dc.subject",
 }
+
+
+def split_keywords(text) -> list:
+    """'a; b, c · d' → ['a', 'b', 'c', 'd'] (tekrarsız, makul uzunlukta)"""
+    out, seen = [], set()
+    for part in re.split(r"[;,·•|\n]+", str(text or "")):
+        word = re.sub(r"\s+", " ", html.unescape(part)).strip(" .:-–—\t")
+        key = word.casefold()
+        if 2 <= len(word) <= 70 and not re.search(r"@|https?://|\d{4}-\d{3}", word) and key not in seen:
+            seen.add(key)
+            out.append(word)
+    return out
+
+
+def join_keywords(words) -> str:
+    return "; ".join(split_keywords("; ".join(words)))
+
+
+_KW_LABEL_RE = re.compile(
+    r"(?:Anahtar\s*(?:Kelime|Sözcük|Sozcuk)(?:ler)?|Key\s*-?\s*words?|Palabras\s+clave|"
+    r"Mots[-\s]cl[ée]s|Schlüsselwörter|Ключов[іы]е?\s+слова)\s*[:：\-–—]?\s*", re.I)
+_KW_STOP_RE = re.compile(
+    r"\b(?:abstract|öz|özet|resumo|resumen|introduction|giriş|article\s+info|makale\s+bilgi|received|"
+    r"geliş|jel|atıf|cite|doi|corresponding|correspondence|sorumlu|orcid|research\s+article|"
+    r"araştırma\s+makalesi|copyright|original\s+paper|address|e-?mail|university|üniversitesi|"
+    r"faculty|fakültesi|special\s+issue)\b", re.I)
+_KW_FOOTNOTE_RE = re.compile(r"\s[A-Za-z]?\d{1,3}\b")        # ' 1 Ege Üniv…', ' S95 Konserv…'
+
+
+def _keyword_chunk_to_list(chunk: str) -> list:
+    chunk = re.sub(r"\s+", " ", chunk)
+    stop = _KW_STOP_RE.search(chunk)
+    if stop:
+        chunk = chunk[:stop.start()]
+    chunk = re.split(r"\.\s+(?=[A-ZÇĞİÖŞÜ])|\.$", chunk)[0]          # listeyi bitiren nokta
+    foot = _KW_FOOTNOTE_RE.search(chunk)
+    if foot:
+        chunk = chunk[:foot.start()]
+    if "?" in chunk:
+        return []
+    return [w for w in split_keywords(chunk) if len(w.split()) <= 7]
+
+
+def extract_keywords_from_text(text: str) -> list:
+    """PDF'in ilk sayfalarındaki 'Anahtar Kelimeler / Keywords' satır(lar)ını okur.
+    Virgüllü/noktalı virgüllü listeleri ve alt alta yazılmış listeleri tanır."""
+    words = []
+    for m in _KW_LABEL_RE.finditer(text or ""):
+        raw = text[m.end():m.end() + 400]
+        first_line = raw.split("\n", 1)[0]
+        if "," in first_line or ";" in first_line or "," in raw[:160] or ";" in raw[:160]:
+            words.extend(_keyword_chunk_to_list(raw))
+        else:
+            # alt alta liste: kısa satırları sırayla topla
+            for line in raw.split("\n"):
+                line = line.strip()
+                if not line:
+                    if words:
+                        break
+                    continue
+                if len(line.split()) > 6 or _KW_STOP_RE.search(line) or line.endswith((".", ":")) and len(words) > 1:
+                    break
+                cleaned = _KW_FOOTNOTE_RE.split(line)[0].strip(" .")
+                if cleaned:
+                    words.append(cleaned)
+                if len(words) >= 12:
+                    break
+        if len(words) >= 20:
+            break
+    return split_keywords("; ".join(words))[:20]
 
 
 def parse_attrs(tag: str) -> dict:
@@ -544,7 +615,7 @@ def parse_attrs(tag: str) -> dict:
 def parse_citation_meta(page: str) -> dict:
     """Google Scholar / Dublin Core <meta> etiketlerini okur (ilk değer geçerli).
     Tüm yazarlar ayrıca meta["_authors"] listesinde tutulur."""
-    meta, authors = {}, []
+    meta, authors, keywords = {}, [], []
     for tag in _META_TAG_RE.findall(page):
         attrs = parse_attrs(tag)
         key = (attrs.get("name") or attrs.get("property") or "").lower()
@@ -552,10 +623,14 @@ def parse_citation_meta(page: str) -> dict:
             continue  # yalnızca DOI olan dc.identifier işimize yarar
         if key == "citation_author" and attrs.get("content"):
             authors.append(attrs["content"])
+        if key in ("citation_keywords", "dc.subject") and attrs.get("content"):
+            keywords.extend(split_keywords(attrs["content"]))
         if key in _WANTED_META and attrs.get("content") and key not in meta:
             meta[key] = attrs["content"]
     if authors:
         meta["_authors"] = authors
+    if keywords:
+        meta["_keywords"] = keywords
     return meta
 
 
@@ -582,7 +657,8 @@ _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
 _BOT_RE = re.compile(
     r"just a moment|attention required|access denied|captcha|are you a (?:robot|human)|"
     r"verify(?:ing)? (?:that )?you are (?:a )?human|security check|bot (?:check|protection)|"
-    r"doğrulama|dogrulama|güvenlik kontrol|robot musunuz|one more step|please wait",
+    r"doğrulama|dogrulama|güvenlik kontrol|robot musunuz|one more step|please wait|"
+    r"client challenge|checking your browser|ddos protection|enable javascript and cookies",
     re.I,
 )
 
@@ -594,7 +670,9 @@ def page_title(page: str) -> str:
 
 def looks_like_bot_check(page: str, final_url: str = "") -> bool:
     """Cloudflare vb. 'insan mısınız' doğrulama sayfası mı?"""
-    if "cf-challenge" in page or "challenge-platform" in page or "cf_chl_" in page:
+    markers = ("cf-challenge", "challenge-platform", "cf_chl_", "/_fs-ch-", "captcha-delivery",
+               "px-captcha", "cf-browser-verification", "_incapsula_resource", "awswaf")
+    if any(m in page for m in markers):
         return True
     if re.search(r"/(?:dogrulama|verify|captcha|challenge)\b", final_url, re.I):
         return True
@@ -1378,7 +1456,7 @@ ITEM_TYPES = {
 }
 TYPE_BY_LABEL = {label: key for key, label in ITEM_TYPES.items()}
 RECORD_FIELDS = ("title", "authors", "year", "type", "container", "volume", "issue", "pages",
-                 "publisher", "doi", "url", "editors", "institution", "language")
+                 "publisher", "doi", "url", "editors", "institution", "language", "keywords")
 
 _CROSSREF_TYPES = {
     "journal-article": "article", "book-chapter": "chapter", "book-section": "chapter",
@@ -1607,15 +1685,20 @@ def record_from_crossref(msg: dict) -> dict:
     }
 
 
-def crossref_record(session, doi: str):
-    """DOI'nin künyesini Crossref'ten alır (APA için en güvenilir kaynak)."""
+def crossref_record(session, doi: str, raise_network_errors: bool = False):
+    """DOI'nin künyesini Crossref'ten alır (APA için en güvenilir kaynak).
+    Kayıt yoksa None; raise_network_errors=True ise bağlantı hataları yükseltilir."""
     try:
         r = session.get(CROSSREF_API + quote(doi, safe="/:;()._-"), timeout=API_TIMEOUT,
                         headers={"Accept": "application/json"})
         if r.status_code != 200:
             return None
         return record_from_crossref(r.json().get("message") or {})
-    except (requests.RequestException, ValueError, AttributeError, IndexError, TypeError):
+    except requests.RequestException:
+        if raise_network_errors:
+            raise
+        return None
+    except (ValueError, AttributeError, IndexError, TypeError):
         return None
 
 
@@ -1648,6 +1731,7 @@ def record_from_meta(meta: dict, url: str = "") -> dict:
         "institution": meta.get("citation_dissertation_institution")
                        or meta.get("citation_technical_report_institution") or "",
         "language": meta.get("citation_language") or meta.get("dc.language") or "",
+        "keywords": join_keywords(meta.get("_keywords") or split_keywords(meta.get("keywords", ""))),
     }
 
 
@@ -1920,7 +2004,7 @@ def to_bibtex(records) -> str:
                    ("publisher", rec.get("publisher")),
                    ("school", rec.get("institution") if kind.endswith("thesis") else ""),
                    ("doi", rec.get("doi")), ("url", rec.get("url")), ("language", rec.get("language")),
-                   ("keywords", ", ".join(rec.get("tags") or []))]
+                   ("keywords", ", ".join(split_keywords(rec.get("keywords", "")) + list(rec.get("tags") or [])))]
         body = ",\n".join(f"  {k} = {{{_bib_escape(str(v))}}}" for k, v in fields if v)
         out.append(f"@{kind}{{{bibtex_key(rec, used)},\n{body}\n}}")
     return "\n\n".join(out) + "\n"
@@ -1939,7 +2023,7 @@ def to_ris(records) -> str:
                            ("DO", rec.get("doi")), ("UR", rec.get("url")), ("LA", rec.get("language"))):
             if value:
                 lines.append(f"{tag}  - {value}")
-        lines += [f"KW  - {t}" for t in rec.get("tags") or []]
+        lines += [f"KW  - {t}" for t in split_keywords(rec.get("keywords", "")) + list(rec.get("tags") or [])]
         lines.append("ER  - ")
         out.append("\n".join(lines))
     return "\n\n".join(out) + "\n"
@@ -2026,6 +2110,7 @@ _EXTRA_COLUMNS = {
     "is_new": "INTEGER DEFAULT 0",      # haftalık taramadan gelip henüz incelenmedi
     "source": "TEXT DEFAULT ''",        # indirme / tarama / klasör / elle
     "matched": "TEXT DEFAULT ''",       # taramada eşleşen grup ve kelimeler
+    "keywords": "TEXT DEFAULT ''",      # makalenin kendi anahtar kelimeleri ('; ' ile)
 }
 
 
@@ -2164,12 +2249,13 @@ class Library:
             cur = self.db.execute(
                 "INSERT INTO items (title, authors, year, type, container, volume, issue, pages, "
                 "publisher, doi, url, editors, institution, language, file_path, sha256, added, "
-                "source, is_new, matched) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "source, is_new, matched, keywords) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (rec["title"], json.dumps(rec["authors"], ensure_ascii=False), rec["year"], rec["type"],
                  rec["container"], rec["volume"], rec["issue"], rec["pages"], rec["publisher"],
                  rec["doi"], rec["url"], json.dumps(rec["editors"], ensure_ascii=False),
                  rec["institution"], rec["language"], str(file_path or ""), sha,
-                 datetime.now().strftime("%Y-%m-%d"), source, 1 if is_new else 0, matched))
+                 datetime.now().strftime("%Y-%m-%d"), source, 1 if is_new else 0, matched,
+                 rec["keywords"]))
             item_id = cur.lastrowid
             if fulltext:
                 self.set_fulltext(item_id, fulltext)
@@ -2296,6 +2382,9 @@ def catalog_pdf(library, session, path: Path, sha: str, meta=None, url="", doi=N
         record["doi"] = doi
     if url and not record.get("url") and not is_doi_host(url):
         record["url"] = url
+    if not record.get("keywords"):
+        record["keywords"] = join_keywords(extract_keywords_from_text(head))
+    tags = list(tags) + auto_group_tags(record, head)
     # Aynı dosya ya da DOI dosyasıyla birlikte zaten kütüphanedeyse taşımadan işaretle
     existing = library.find_by_sha(sha) or library.find_by_doi(record.get("doi"))
     if existing:
@@ -2333,12 +2422,52 @@ def report_links_in(folder: Path) -> dict:
     return links
 
 
+class AutoTagWorker(threading.Thread):
+    """Kütüphanedeki kaynaklara anahtar kelime (PDF'ten) ve grup etiketi ekler; elle verilen
+    etiketlere dokunmaz. Mesajlar: ("autotag", sıra, toplam) · ("autotag_done", taranan, etiketlenen, kelime_eklenen)"""
+
+    def __init__(self, library, events, item_ids=None):
+        super().__init__(daemon=True)
+        self.library = library
+        self.events = events
+        self.item_ids = item_ids
+
+    def run(self):
+        items = self.library.all_items()
+        if self.item_ids is not None:
+            items = [i for i in items if i["id"] in set(self.item_ids)]
+        tagged = kw_added = 0
+        for n, item in enumerate(items, start=1):
+            self.events.put(("autotag", n, len(items)))
+            try:
+                head = ""
+                path = Path(item["file_path"]) if item["file_path"] else None
+                if path and path.is_file():
+                    head = pdf_text(path, max_pages=3, max_chars=30_000)
+                if not item.get("keywords") and head:
+                    kws = join_keywords(extract_keywords_from_text(head))
+                    if kws:
+                        self.library.update(item["id"], {"keywords": kws})
+                        item["keywords"] = kws
+                        kw_added += 1
+                groups = auto_group_tags(item, head)
+                before = {fold(t) for t in item["tags"]}
+                if any(fold(g) not in before for g in groups):
+                    self.library.add_tags(item["id"], groups)
+                    tagged += 1
+            except Exception:
+                diag_exception("otomatik etiketleme")
+        self.events.put(("autotag_done", len(items), tagged, kw_added))
+
+
 class LibraryScanWorker(threading.Thread):
     """Seçilen PDF'leri (ya da bir klasördeki tüm PDF'leri) kütüphaneye alır.
     Mesajlar: ("scan", sıra, toplam, ad) · ("log", seviye, metin) · ("scan_done", eklenen, güncellenen, atlanan)"""
 
-    def __init__(self, paths, library, events, cancel_event, tags=(), library_folder=None, move=False):
+    def __init__(self, paths, library, events, cancel_event, tags=(), library_folder=None, move=False,
+                 report_folders=()):
         super().__init__(daemon=True)
+        self.report_folders = [Path(f) for f in report_folders]
         self.library_folder = library_folder
         self.move = move
         self.paths = [Path(p) for p in paths]
@@ -2380,10 +2509,54 @@ class LibraryScanWorker(threading.Thread):
                         updated += 1
                 except Exception as exc:
                     self.events.put(("log", "error", f"{path.name} eklenemedi: {describe_error(exc)}"))
+            pending = self._import_failed_from_reports(session)
         finally:
             session.close()
             self.events.put(("scan", total, total, ""))
-            self.events.put(("scan_done", added, updated, skipped))
+            self.events.put(("scan_done", added, updated, skipped, locals().get("pending", 0)))
+
+    def _import_failed_from_reports(self, session) -> int:
+        """Eski indirme raporlarında inmemiş görünen kaynakları kütüphaneye PDF'siz kayıt olarak
+        ekler; böylece 'PDF'i olmayanlar' listesinden kurum erişimiyle tamamlanabilirler."""
+        failed, succeeded = {}, set()
+        for folder in self.report_folders:
+            for report in sorted(folder.glob(REPORT_GLOB)):
+                try:
+                    with open(report, encoding="utf-8-sig", newline="") as fh:
+                        rows = list(csv.reader(fh, delimiter=";"))[1:]
+                except (OSError, csv.Error, UnicodeDecodeError):
+                    continue
+                for row in rows:
+                    if len(row) < 3 or not row[1].startswith("http"):
+                        continue
+                    key = history_key(row[1])
+                    if row[2] in (STATUS_LABELS["ok"], STATUS_LABELS["dup"]):
+                        succeeded.add(key)
+                    elif row[2] in (STATUS_LABELS["error"], STATUS_LABELS["nopdf"], STATUS_LABELS["html"]):
+                        failed[key] = (row[1], row[3] if len(row) > 3 else "")
+        added = crossref_failures = 0
+        for key, (url, filename) in failed.items():
+            if key in succeeded or self.cancel.is_set():
+                continue
+            doi = doi_from_url(url)
+            if self.library.find_by_doi(doi) or self.library.find_by_url(url):
+                continue
+            record = {}
+            if doi and crossref_failures < 3:          # yalnızca bağlantı hataları sayılır
+                try:
+                    record = crossref_record(session, doi, raise_network_errors=True) or {}
+                    crossref_failures = 0
+                except requests.RequestException:
+                    crossref_failures += 1
+            if not record.get("title") and filename and " - " in filename:
+                record = merge_records(record, record_from_filename(Path(filename).stem))
+            if not record.get("title"):
+                continue                     # künyesi bulunamayan linki boş kayıt olarak ekleme
+            record["doi"] = record.get("doi") or doi or ""
+            record["url"] = url if not doi else record.get("url", "")
+            _, created = self.library.add(record, tags=self.tags, source="klasör")
+            added += created
+        return added
 
 
 def attach_pdf(library, item_id: int, path, library_folder=None, move=True):
@@ -2418,43 +2591,44 @@ DEFAULT_KEYWORDS = """\
 # ('halk oyun' → halk oyunları, halk oyunlarının...).
 # 'bağlam:' satırı gruptaki her terim için; 'terim ; bağlam: a, b' yalnızca o terim için:
 # terimle birlikte bu kelimelerden biri de geçmelidir (çok anlamlı kısa terimler için).
+# 'kök → tam hâli': eşleştirmede kök, Crossref aramasında tam hâli kullanılır.
 # '#' ile başlayan satırlar açıklamadır.
 
 [Halk dansları ve sahneleme]
 bağlam: halk, oyun, dans, dance, folklor, folklore, folk
-halk oyun
-halk dans
+halk oyun → halk oyunları
+halk dans → halk dansları
 folk dance
 folklore on stage
 spectacularization of folklore
 staging folk
 sahneleme
 koreografi
-choreograph
+choreograph → choreography
 kültürel performans
 cultural performance
 
 [Etnokoreoloji ve notasyon]
 etnokoreoloji
-ethnochoreolog
+ethnochoreolog → ethnochoreology
 koreoloji
-choreolog
-dans notasyon
+choreolog → choreology
+dans notasyon → dans notasyonu
 dance notation
-hareket notasyon
+hareket notasyon → hareket notasyonu
 movement notation
 labanotation
-laban notasyon
+laban notasyon → laban notasyonu
 kinetografi
 kinetography
 benesh
-laban hareket analiz
+laban hareket analiz → laban hareket analizi
 laban movement analysis
 
 [Dijital dönüşüm, MR ve hareket yakalama]
 bağlam: dans, dance, oyun, folklor, folklore, miras, heritage, kültür, cultur, gelenek, tradition
-hareket yakalama
-motion capture
+hareket yakala → hareket yakalama
+motion captur → motion capture
 karma gerçeklik
 mixed reality
 sanal gerçeklik
@@ -2466,14 +2640,14 @@ digital archive
 digitization
 dijitalleştirme
 pose estimation
-poz tahmin
+poz tahmin → poz tahmini
 markerless
 
 [Somut olmayan kültürel miras]
 bağlam: miras, heritage, dans, dance, gelenek, tradition, kültür, cultur
 somut olmayan kültürel miras
 intangible cultural heritage
-yaşayan insan hazine
+yaşayan insan hazine → yaşayan insan hazineleri
 living human treasure
 miras statüsü
 heritage status
@@ -2482,16 +2656,16 @@ dance documentation
 safeguarding
 
 [Geleneksel sohbet toplantıları ve kültürel bellek]
-geleneksel sohbet toplantı
-sohbet toplantı
+geleneksel sohbet toplantı → geleneksel sohbet toplantıları
+sohbet toplantı → sohbet toplantıları
 traditional sohbet
 sohbet meeting
 kültürel bellek
 cultural memory
 toplumsal bellek
 collective memory
-birikme gece
-ateş gezme
+birikme gece → birikme geceleri
+ateş gezme → ateş gezmesi
 sıra gecesi
 ritual gathering
 yaren ; bağlam: sohbet, toplantı, gelenek, folklor, halk, tradition
@@ -2502,13 +2676,13 @@ oturak ; bağlam: sohbet, toplantı, gelenek, folklor, abdal, kırşehir, eğlen
 [Dijital kültür]
 dijital kültür
 digital culture
-e-kültürle
+e-kültürle → e-kültürleme
 dijital kültürlenme
 kültürel aktarım
 cultural transmission
 algoritmik kültür
 algorithmic culture
-platform kültür
+platform kültür → platform kültürü
 platform culture
 
 [Gelenek, icra ve yorum]
@@ -2525,14 +2699,14 @@ invention of tradition
 geleneksel icra
 
 [Halk oyunları ve ritim eğitimi]
-dans eğitim
+dans eğitim → dans eğitimi
 dance education
-dans pedagoji
+dans pedagoji → dans pedagojisi
 dance pedagogy
-halk oyunları öğretim
-halk oyunları eğitim
+halk oyunları öğretim → halk oyunları öğretimi
+halk oyunları eğitim → halk oyunları eğitimi
 folk dance teaching
-ritim eğitim
+ritim eğitim → ritim eğitimi
 rhythm education
 ritim dikte
 rhythmic dictation
@@ -2544,10 +2718,10 @@ asma davul
 bağlam: dans, dance, oyun, folklor, folklore, müzik, music, halk, folk
 kimlik
 identity
-ulus inşa
+ulus inşa → ulus inşası
 nation-building
 nation building
-kültür politika
+kültür politika → kültür politikası
 cultural policy
 kültürel diplomasi
 cultural diplomacy
@@ -2565,7 +2739,7 @@ halay
 bar
 teke
 kılıç kalkan
-kaşık oyun
+kaşık oyun → kaşık oyunları
 karşılama
 
 [Dans ve bedenlenmiş biliş]
@@ -2574,7 +2748,7 @@ embodied cognition
 embodiment ; bağlam: dance, dans
 interpersonal coordination ; bağlam: dance, dans, movement
 interactional synchrony
-topluluk dans
+topluluk dans → topluluk dansı
 community dance
 community-based dance
 dance improvisation
@@ -2629,8 +2803,10 @@ def parse_keyword_groups(text: str) -> list:
         m = re.match(r"^\s*ba[gğ]lam\s*:\s*(.*)$", rest, re.I)
         if m:
             ctx = _split_words(m.group(1))
+        parts = re.split(r"→|->", term, maxsplit=1)
+        term, query = (parts[0], parts[1]) if len(parts) == 2 else (term, "")
         if term.strip():
-            current["terms"].append({"term": term.strip(), "context": ctx})
+            current["terms"].append({"term": term.strip(), "context": ctx, "query": query.strip() or None})
     return [g for g in groups if g["terms"]]
 
 
@@ -2648,7 +2824,7 @@ class KeywordMatcher:
             terms = []
             for t in g["terms"]:
                 ctx = [_word_start(w) for w in t["context"]] if t.get("context") is not None else group_ctx
-                terms.append((t["term"], _word_start(t["term"]), ctx))
+                terms.append((t["term"], _word_start(t["term"]), ctx, t.get("query") or t["term"]))
             self.groups.append((g["name"], terms))
 
     def match(self, text: str) -> dict:
@@ -2656,7 +2832,7 @@ class KeywordMatcher:
         body = fold(text)
         hits = {}
         for name, terms in self.groups:
-            for term, rx, ctx in terms:
+            for term, rx, ctx, _ in terms:
                 if rx.search(body) and (not ctx or any(c.search(body) for c in ctx)):
                     hits.setdefault(name, []).append(term)
         return hits
@@ -2665,12 +2841,36 @@ class KeywordMatcher:
         """Crossref'te aranacak sorgular (kısa/çok anlamlı terimlere bağlam eklenir)."""
         out = []
         for name, terms in self.groups:
-            for term, _, ctx in terms:
-                query = term
+            for term, _, ctx, query in terms:
                 if ctx and len(term) < 9:
                     continue          # 'bar', 'teke' gibi terimler Crossref'te anlamsız sonuç verir
                 out.append((name, query))
         return out
+
+
+_MATCHER_CACHE = {"key": None, "matcher": None}
+
+
+def get_matcher():
+    """Anahtar kelime gruplarından eşleştirici (dosya değişince yeniden kurulur)."""
+    try:
+        key = keywords_path().stat().st_mtime
+    except OSError:
+        key = "varsayılan"
+    if _MATCHER_CACHE["key"] != key:
+        _MATCHER_CACHE.update(key=key, matcher=KeywordMatcher(parse_keyword_groups(load_keywords_text())))
+    return _MATCHER_CACHE["matcher"]
+
+
+def auto_group_tags(rec: dict, head: str = "") -> list:
+    """Kaynağın başlığı ve anahtar kelimeleri (yoksa PDF'in ilk sayfası) hangi gruplara uyuyor?"""
+    if not load_settings().get("auto_tag", True):
+        return []
+    matcher = get_matcher()
+    hits = matcher.match(" ".join([rec.get("title") or "", rec.get("keywords") or ""]))
+    if not hits and not rec.get("keywords") and head:
+        hits = matcher.match(head[:2500])
+    return list(hits)
 
 
 def describe_hits(hits: dict) -> str:
@@ -2729,6 +2929,7 @@ def parse_oai_page(xml_bytes: bytes):
             "publisher": (values("publisher") or [""])[0],
             "language": languages[0] if languages else "",
             "url": url, "doi": doi or "", "type": "article", "source": "DergiPark",
+            "keywords": join_keywords(k for subj in values("subject") for k in split_keywords(subj)),
         })
     token_el = root.find(".//oai:resumptionToken", _NS)
     token = token_el.text.strip() if token_el is not None and token_el.text and token_el.text.strip() else None
@@ -3188,11 +3389,454 @@ def run_headless_scan():
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  6b) CLAUDE BAĞLANTISI (MCP sunucusu): Claude masaüstü uygulaması kütüphaneyi
+#      bu araçlarla okur ve düzenler. Çalıştırma: AkademikKutuphaneMCP.exe --mcp
+# ════════════════════════════════════════════════════════════════════════════
+
+MCP_SERVER_NAME = "akademik-kutuphane"
+MCP_INSTRUCTIONS = (
+    "Bu araçlar kullanıcının kişisel akademik kütüphanesine (Akademik Kaynak İndirici) erişir. "
+    "Kaynakları bulmak için önce kutuphane_ara'yı kullan; kimlikleri (id) diğer araçlara ver. "
+    "Kaynak silmeden önce kullanıcıdan açık onay al. Kaynakça APA 7'dir; Türkçe için dil='tr'. "
+    "PDF içeriğini okumak için pdf_metni_oku'yu kullan; alıntı yaparken sayfa numarasını belirt."
+)
+
+STATUS_FILTER_VALUES = ["hepsi", "pdf_var", "pdf_yok", "yeni", "karti_olan"]
+
+
+def search_items(library, query="", tag="", status="hepsi", fulltext=False, year_min=None,
+                 year_max=None) -> list:
+    """Arayüzdeki arama/filtre mantığının aynısı (Claude araçları için)."""
+    items = library.all_items()
+    cards = library.card_counts()
+    words = [w for w in fold(query or "").split() if w]
+    extra = set()
+    if words:
+        extra |= library.card_text_ids(words)
+        if fulltext:
+            extra |= library.fulltext_ids(words)
+    out = []
+    for item in items:
+        item["has_pdf"] = bool(item["file_path"]) and Path(item["file_path"]).is_file()
+        item["cards"] = cards.get(item["id"], 0)
+        blob = fold(" ".join([item["title"], people_to_text(item["authors"]), item["container"], item["year"],
+                              item["notes"] or "", " ".join(item["tags"]), item["doi"], item.get("keywords", ""),
+                              item.get("matched", "")]))
+        if words and not (all(w in blob for w in words) or item["id"] in extra):
+            continue
+        if tag and fold(tag) not in {fold(t) for t in item["tags"]}:
+            continue
+        ok = {"hepsi": True, "pdf_var": item["has_pdf"], "pdf_yok": not item["has_pdf"],
+              "yeni": bool(item["is_new"]), "karti_olan": item["cards"] > 0}.get(status or "hepsi", True)
+        if not ok:
+            continue
+        try:
+            year = int(item["year"]) if item["year"] else None
+        except ValueError:
+            year = None
+        if year_min and (year is None or year < int(year_min)):
+            continue
+        if year_max and (year is None or year > int(year_max)):
+            continue
+        out.append(item)
+    out.sort(key=lambda i: (tr_sort_key(first_author_label(i)), i["year"]))
+    return out
+
+
+def _brief(item) -> dict:
+    return {"id": item["id"], "yazar": first_author_label(item), "yil": item["year"], "baslik": item["title"],
+            "dergi_kitap": item["container"], "tur": ITEM_TYPES.get(item["type"], "Diğer"),
+            "etiketler": item["tags"], "anahtar_kelimeler": split_keywords(item.get("keywords", "")),
+            "pdf_var": bool(item["file_path"]) and Path(item["file_path"]).is_file(),
+            "yeni": bool(item["is_new"]), "doi": item["doi"]}
+
+
+def _ids(value) -> list:
+    if isinstance(value, (int, str)):
+        value = [value]
+    return [int(v) for v in value or []]
+
+
+class McpTools:
+    """Claude'a açılan araçlar. Her araç: (açıklama, giriş şeması, işlev)."""
+
+    def __init__(self, library: Library):
+        self.lib = library
+
+    def definitions(self) -> list:
+        s = lambda d: {"type": "string", "description": d}          # noqa: E731
+        ids = {"type": "array", "items": {"type": "integer"}, "description": "Kaynak kimlikleri (kutuphane_ara'dan)"}
+        return [
+            ("kutuphane_ara", "Kütüphanede kaynak arar. Başlık, yazar, dergi, etiket, anahtar kelime ve alıntı "
+                              "kartlarında arar; istenirse PDF tam metninde de. Sonuçta id'ler döner.",
+             {"type": "object", "properties": {
+                 "sorgu": s("Aranacak kelimeler (boş: hepsi)"),
+                 "etiket": s("Yalnızca bu etiketi taşıyanlar"),
+                 "durum": {"type": "string", "enum": STATUS_FILTER_VALUES, "description": "Durum filtresi"},
+                 "pdf_icinde_ara": {"type": "boolean", "description": "PDF tam metninde de ara"},
+                 "yil_min": {"type": "integer"}, "yil_max": {"type": "integer"},
+                 "limit": {"type": "integer", "description": "En fazla sonuç (varsayılan 50)"}}}),
+            ("kaynak_detay", "Bir kaynağın tüm künyesini, etiketlerini, anahtar kelimelerini, alıntı kartlarını, "
+                             "PDF yolunu ve APA kaynakça satırını verir.",
+             {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]}),
+            ("pdf_metni_oku", "Kaynağın PDF'inden metin okur (sayfa sayfa). Özet çıkarmak ya da alıntı bulmak için.",
+             {"type": "object", "properties": {
+                 "id": {"type": "integer"},
+                 "baslangic_sayfa": {"type": "integer", "description": "1'den başlar (varsayılan 1)"},
+                 "sayfa_sayisi": {"type": "integer", "description": "En fazla 15 (varsayılan 5)"}},
+              "required": ["id"]}),
+            ("etiket_ekle", "Kaynaklara etiket ekler.",
+             {"type": "object", "properties": {"idler": ids, "etiketler": {"type": "array", "items": {"type": "string"}}},
+              "required": ["idler", "etiketler"]}),
+            ("etiket_kaldir", "Kaynaklardan etiket kaldırır.",
+             {"type": "object", "properties": {"idler": ids, "etiketler": {"type": "array", "items": {"type": "string"}}},
+              "required": ["idler", "etiketler"]}),
+            ("kunye_guncelle", "Kaynağın künye alanlarını günceller. Yazarlar 'Soyad, Ad; Soyad, Ad' biçiminde.",
+             {"type": "object", "properties": {
+                 "id": {"type": "integer"},
+                 "alanlar": {"type": "object", "description": "title, authors, year, type (article/chapter/book/phd/"
+                                                              "masters/conference/other), container, volume, issue, "
+                                                              "pages, publisher, doi, url, editors, institution, "
+                                                              "keywords ('a; b')"}},
+              "required": ["id", "alanlar"]}),
+            ("alinti_karti_ekle", "Kaynağa alıntı kartı ekler (sayfa, alıntı, kullanıcının yorumu).",
+             {"type": "object", "properties": {"id": {"type": "integer"}, "sayfa": s("Sayfa ya da aralık"),
+                                               "alinti": s("Alıntı metni"), "yorum": s("Yorum/not")},
+              "required": ["id"]}),
+            ("kaynakca_olustur", "Seçilen kaynakların (id'ler ya da etiket) APA 7 kaynakçasını üretir; istenirse "
+                                 "Word dosyası olarak kütüphane klasörüne kaydeder.",
+             {"type": "object", "properties": {"idler": ids, "etiket": s("Bu etiketteki tüm kaynaklar"),
+                                               "dil": {"type": "string", "enum": ["tr", "en"]},
+                                               "word_dosyasi": {"type": "boolean"}}}),
+            ("incelendi_isaretle", "Taramadan gelen 'yeni' işaretini kaldırır.",
+             {"type": "object", "properties": {"idler": ids}, "required": ["idler"]}),
+            ("kutuphaneden_cikar", "Kaynakları kütüphaneden çıkarır. ÖNCE kullanıcıdan açık onay al. "
+                                   "pdf_sil=true ise PDF dosyaları da silinir.",
+             {"type": "object", "properties": {"idler": ids, "pdf_sil": {"type": "boolean"}}, "required": ["idler"]}),
+            ("linkleri_indir", "Metindeki linkleri/DOI'leri (en fazla 15) indirir ve kütüphaneye ekler.",
+             {"type": "object", "properties": {"metin": s("Link, DOI ya da kaynakça içeren metin"),
+                                               "etiketler": {"type": "array", "items": {"type": "string"}}},
+              "required": ["metin"]}),
+            ("kutuphane_ozeti", "Kütüphane istatistikleri: toplam, PDF'siz, yeni, etiket dağılımı, son tarama.",
+             {"type": "object", "properties": {}}),
+        ]
+
+    # ── araç işlevleri ──────────────────────────────────────────────────────
+    def call(self, name: str, args: dict):
+        fn = getattr(self, "t_" + name, None)
+        if fn is None:
+            raise ValueError(f"Bilinmeyen araç: {name}")
+        return fn(**(args or {}))
+
+    def t_kutuphane_ara(self, sorgu="", etiket="", durum="hepsi", pdf_icinde_ara=False, yil_min=None,
+                        yil_max=None, limit=50):
+        items = search_items(self.lib, sorgu, etiket, durum, pdf_icinde_ara, yil_min, yil_max)
+        limit = max(1, min(int(limit or 50), 300))
+        return {"toplam": len(items), "gosterilen": min(len(items), limit),
+                "kaynaklar": [_brief(i) for i in items[:limit]]}
+
+    def t_kaynak_detay(self, id):
+        item = self.lib.get(int(id))
+        if not item:
+            raise ValueError(f"{id} numaralı kaynak yok")
+        detail = _brief(item)
+        detail.update({
+            "yazarlar": people_to_text(item["authors"]), "editorler": people_to_text(item["editors"]),
+            "cilt": item["volume"], "sayi": item["issue"], "sayfalar": item["pages"], "yayinevi": item["publisher"],
+            "kurum": item["institution"], "url": item["url"], "pdf_yolu": item["file_path"],
+            "eklenme": item["added"], "kaynagi": item.get("source", ""), "tarama_eslesmesi": item.get("matched", ""),
+            "kurum_erisimi_veritabani": database_for_doi(item["doi"]),
+            "apa": apa_text(item, "tr"), "metin_ici_atif": intext_citation(item),
+            "alinti_kartlari": [{"id": c["id"], "sayfa": c["page"], "alinti": c["quote"], "yorum": c["comment"],
+                                 "atifla": card_citation_text(c, item)} for c in self.lib.cards(item["id"])],
+        })
+        return detail
+
+    def t_pdf_metni_oku(self, id, baslangic_sayfa=1, sayfa_sayisi=5):
+        item = self.lib.get(int(id))
+        if not item or not item["file_path"] or not Path(item["file_path"]).is_file():
+            raise ValueError("Bu kaynağın PDF'i yok")
+        from pypdf import PdfReader
+        reader = PdfReader(item["file_path"])
+        start = max(1, int(baslangic_sayfa or 1))
+        count = max(1, min(int(sayfa_sayisi or 5), 15))
+        pages = []
+        for n in range(start, min(start + count, len(reader.pages) + 1)):
+            try:
+                text = reader.pages[n - 1].extract_text() or ""
+            except Exception:
+                text = ""
+            pages.append(f"--- sayfa {n} ---\n{text}")
+        body = "\n".join(pages)[:60_000]
+        return {"baslik": item["title"], "toplam_sayfa": len(reader.pages), "metin": body}
+
+    def t_etiket_ekle(self, idler, etiketler):
+        for i in _ids(idler):
+            self.lib.add_tags(i, etiketler)
+        return {"tamam": True, "etiketlenen": len(_ids(idler))}
+
+    def t_etiket_kaldir(self, idler, etiketler):
+        drop = {fold(t) for t in clean_tags(etiketler)}
+        for i in _ids(idler):
+            item = self.lib.get(i)
+            if item:
+                self.lib.set_tags(i, [t for t in item["tags"] if fold(t) not in drop])
+        return {"tamam": True}
+
+    def t_kunye_guncelle(self, id, alanlar):
+        item = self.lib.get(int(id))
+        if not item:
+            raise ValueError(f"{id} numaralı kaynak yok")
+        fields = dict(alanlar or {})
+        for key in ("authors", "editors"):
+            if isinstance(fields.get(key), str):
+                fields[key] = text_to_people(fields[key])
+        if isinstance(fields.get("keywords"), list):
+            fields["keywords"] = join_keywords(fields["keywords"])
+        merged = finalize_record(merge_records(fields, item))
+        if "title" in fields:
+            merged["title"] = str(fields["title"]).strip().rstrip(".")
+        self.lib.update(int(id), {k: merged[k] for k in RECORD_FIELDS})
+        return {"tamam": True, "apa": apa_text(self.lib.get(int(id)))}
+
+    def t_alinti_karti_ekle(self, id, sayfa="", alinti="", yorum=""):
+        item = self.lib.get(int(id))
+        if not item:
+            raise ValueError(f"{id} numaralı kaynak yok")
+        card_id = self.lib.add_card(int(id), str(sayfa or ""), alinti or "", yorum or "")
+        card = next(c for c in self.lib.cards(int(id)) if c["id"] == card_id)
+        return {"kart_id": card_id, "atifla": card_citation_text(card, item)}
+
+    def t_kaynakca_olustur(self, idler=None, etiket="", dil="tr", word_dosyasi=False):
+        if idler:
+            records = [self.lib.get(i) for i in _ids(idler)]
+        elif etiket:
+            records = search_items(self.lib, tag=etiket)
+        else:
+            raise ValueError("idler ya da etiket verin")
+        records = [r for r in records if r]
+        refs = bibliography(records, dil if dil in ("tr", "en") else "tr")
+        out = {"kaynak_sayisi": len(refs), "kaynakca": "\n".join(t for t, _ in refs)}
+        if word_dosyasi:
+            folder = Path(load_settings().get("library_folder") or Path.home()) / "Kaynakçalar"
+            folder.mkdir(parents=True, exist_ok=True)
+            path = unique_path(folder, f"Kaynakça {datetime.now():%Y-%m-%d %H%M}.docx")
+            write_bibliography_docx(path, refs, "Kaynakça" if dil != "en" else "References")
+            out["word_dosyasi"] = str(path)
+        return out
+
+    def t_incelendi_isaretle(self, idler):
+        for i in _ids(idler):
+            self.lib.update(i, {"is_new": 0})
+        return {"tamam": True}
+
+    def t_kutuphaneden_cikar(self, idler, pdf_sil=False):
+        removed = []
+        for i in _ids(idler):
+            item = self.lib.get(i)
+            if not item:
+                continue
+            if pdf_sil and item["file_path"] and Path(item["file_path"]).is_file():
+                try:
+                    Path(item["file_path"]).unlink()
+                except OSError:
+                    pass
+            self.lib.delete(i)
+            removed.append(item["title"])
+        return {"cikarilan": removed}
+
+    def t_linkleri_indir(self, metin, etiketler=None):
+        links = extract_links(metin)[:15]
+        if not links:
+            return {"mesaj": "Metinde link ya da DOI bulunamadı."}
+        settings = load_settings()
+        folder = settings.get("library_folder") or str(default_library_dir())
+        Path(folder).mkdir(parents=True, exist_ok=True)
+        events = queue.Queue()
+        DownloadWorker(links, folder, {
+            "find_pdf": True, "save_html": False, "skip_existing": True, "email": settings.get("email", ""),
+            "library": self.lib, "library_folder": folder, "tags": etiketler or []}, events, threading.Event()).run()
+        lines, summary = [], None
+        while not events.empty():
+            m = events.get()
+            if m[0] == "log" and m[1] in ("success", "error", "warn") or (m[0] == "log" and "Tekrar indirilmedi" in m[2]):
+                lines.append(m[2].strip())
+            if m[0] == "done":
+                summary = m[1]
+        return {"sonuc": summary, "ayrinti": lines[-40:]}
+
+    def t_kutuphane_ozeti(self):
+        items = search_items(self.lib)
+        tags = {}
+        for i in items:
+            for t in i["tags"]:
+                tags[t] = tags.get(t, 0) + 1
+        settings = load_settings()
+        return {"toplam": len(items), "pdf_yok": sum(1 for i in items if not i["has_pdf"]),
+                "yeni": sum(1 for i in items if i["is_new"]), "alinti_karti_olan": sum(1 for i in items if i["cards"]),
+                "etiketler": dict(sorted(tags.items(), key=lambda kv: -kv[1])),
+                "son_tarama": settings.get("last_scan"), "son_rapor": settings.get("last_report"),
+                "kutuphane_klasoru": settings.get("library_folder")}
+
+
+def run_mcp_server():
+    """Claude masaüstü uygulaması için stdio MCP sunucusu (satır satır JSON-RPC 2.0)."""
+    stdin = sys.stdin.buffer
+    stdout = sys.stdout.buffer
+    sys.stdout = sys.stderr                       # başka hiçbir çıktı protokolü bozmasın
+    library = Library()
+    tools = McpTools(library)
+    definitions = tools.definitions()
+    diag("Claude bağlantısı (MCP) başladı")
+
+    def send(message):
+        stdout.write((json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8"))
+        stdout.flush()
+
+    for raw in stdin:
+        line = raw.decode("utf-8", errors="replace").strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
+            continue
+        method, mid = msg.get("method"), msg.get("id")
+        if mid is None:                           # bildirim (ör. notifications/initialized)
+            continue
+        try:
+            if method == "initialize":
+                version = (msg.get("params") or {}).get("protocolVersion") or "2025-06-18"
+                result = {"protocolVersion": version, "capabilities": {"tools": {"listChanged": False}},
+                          "serverInfo": {"name": MCP_SERVER_NAME, "version": APP_VERSION},
+                          "instructions": MCP_INSTRUCTIONS}
+            elif method == "ping":
+                result = {}
+            elif method == "tools/list":
+                result = {"tools": [{"name": n, "description": d, "inputSchema": schema}
+                                    for n, d, schema in definitions]}
+            elif method == "tools/call":
+                params = msg.get("params") or {}
+                try:
+                    data = tools.call(params.get("name", ""), params.get("arguments") or {})
+                    result = {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False, indent=1)}],
+                              "isError": False}
+                except Exception as exc:
+                    diag_exception(f"MCP aracı {params.get('name')}")
+                    result = {"content": [{"type": "text", "text": f"Hata: {exc}"}], "isError": True}
+            elif method in ("resources/list", "prompts/list"):
+                result = {method.split("/")[0]: []}
+            else:
+                send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"Yöntem yok: {method}"}})
+                continue
+            send({"jsonrpc": "2.0", "id": mid, "result": result})
+        except Exception as exc:
+            diag_exception("MCP")
+            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": str(exc)}})
+    library.close()
+
+
+MCP_EXE_NAME = "AkademikKutuphaneMCP"
+
+
+def mcpb_manifest() -> dict:
+    tools = McpTools.__new__(McpTools).definitions()
+    exe = f"{MCP_EXE_NAME}.exe"
+    return {
+        "manifest_version": "0.3",
+        "name": MCP_SERVER_NAME,
+        "display_name": "Akademik Kütüphanem",
+        "version": re.sub(r"^(\d+)\.(\d+)$", r"\1.\2.0", APP_VERSION),
+        "description": "Akademik Kaynak İndirici kütüphanesini Claude'a açar: arama, etiket, alıntı kartı, "
+                       "APA kaynakça, PDF okuma, link indirme.",
+        "author": {"name": "Akademik Kaynak İndirici"},
+        "server": {"type": "binary", "entry_point": f"server/{exe}",
+                   "mcp_config": {"command": "${__dirname}/server/" + exe, "args": ["--mcp"], "env": {}}},
+        "tools": [{"name": n, "description": d} for n, d, _ in tools],
+        "compatibility": {"platforms": ["win32"]},
+    }
+
+
+def pack_mcpb(server_dir, out_path):
+    """PyInstaller klasörünü (server/) ve manifest'i tek .mcpb (zip) dosyasında toplar."""
+    server_dir, out_path = Path(server_dir), Path(out_path)
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("manifest.json", json.dumps(mcpb_manifest(), ensure_ascii=False, indent=2))
+        for f in sorted(server_dir.rglob("*")):
+            if f.parent == server_dir and f.stem == "AkademikIndirici":
+                continue                          # arayüz programı uzantıda gerekmez
+            if f.is_file():
+                zf.write(f, "server/" + f.relative_to(server_dir).as_posix())
+    return out_path
+
+
+def mcp_exe_path() -> Path:
+    """Programla aynı klasördeki Claude bağlantı programı (yalnızca .exe sürümünde vardır)."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).with_name(f"{MCP_EXE_NAME}.exe")
+    return Path(__file__).resolve().with_name(f"{MCP_EXE_NAME}.exe")
+
+
+def mcp_server_entry() -> dict:
+    return {"command": str(mcp_exe_path()), "args": ["--mcp"]}
+
+
+def claude_config_snippet() -> str:
+    """Uzantı kurulamazsa elle eklenecek claude_desktop_config.json girdisi."""
+    return json.dumps({"mcpServers": {MCP_SERVER_NAME: mcp_server_entry()}}, ensure_ascii=False, indent=2)
+
+
+def claude_config_paths() -> list:
+    """Claude masaüstü uygulamasının ayar dosyası (normal kurulum ve Microsoft Store kurulumu)."""
+    paths = []
+    if os.environ.get("APPDATA"):
+        paths.append(Path(os.environ["APPDATA"]) / "Claude" / "claude_desktop_config.json")
+    if os.environ.get("LOCALAPPDATA"):
+        for pkg in sorted(Path(os.environ["LOCALAPPDATA"], "Packages").glob("Claude_*")):
+            paths.append(pkg / "LocalCache" / "Roaming" / "Claude" / "claude_desktop_config.json")
+    return paths
+
+
+def connect_claude_desktop() -> list:
+    """Bağlantıyı Claude'un ayar dosyasına ekler; diğer ayarlara dokunmaz, önce yedek alır.
+    Yazılan dosyaların listesini döndürür. Claude kurulu değilse boş liste."""
+    written = []
+    for path in claude_config_paths():
+        if not path.parent.is_dir():
+            continue
+        data = {}
+        if path.is_file():
+            raw = path.read_text(encoding="utf-8-sig").strip()
+            if raw:
+                try:
+                    data = json.loads(raw)
+                except ValueError:
+                    raise ValueError(f"Claude'un ayar dosyası okunamadı (bozuk JSON):\n{path}")
+                if not isinstance(data, dict):
+                    raise ValueError(f"Claude'un ayar dosyası beklenmedik biçimde:\n{path}")
+                backup = path.with_name(path.name + ".yedek")
+                if not backup.exists():
+                    shutil.copy2(path, backup)
+        servers = data.get("mcpServers")
+        if not isinstance(servers, dict):
+            servers = {}
+        servers[MCP_SERVER_NAME] = mcp_server_entry()
+        data["mcpServers"] = servers
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+        written.append(path)
+    return written
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  7) AYARLAR (klasör, e-posta ve seçenekler bir sonraki açılışta hatırlanır)
 # ════════════════════════════════════════════════════════════════════════════
 
 def settings_path() -> Path:
-    base = os.environ.get("APPDATA") or str(Path.home())
+    base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming" if sys.platform == "win32"
+                                             else Path.home())
     return Path(base) / "AkademikIndirici" / "ayarlar.json"
 
 
@@ -3450,6 +4094,9 @@ class LibraryTab:
         ctk.CTkButton(bar, text="PDF Ekle…", width=96, command=self._add_pdfs).grid(row=0, column=4, padx=(0, 8))
         ctk.CTkButton(bar, text="Klasör Tara…", width=110, fg_color="transparent", border_width=1,
                       text_color=TEXT, command=self._scan_folder).grid(row=0, column=5)
+        self.autotag_btn = ctk.CTkButton(bar, text="Otomatik Etiketle", width=130, fg_color="transparent",
+                                         border_width=1, text_color=TEXT, command=self._autotag)
+        self.autotag_btn.grid(row=0, column=6, padx=(8, 0))
 
     def _build_table(self):
         from tkinter import ttk
@@ -3505,15 +4152,16 @@ class LibraryTab:
                 ("volume", "Cilt", ""), ("issue", "Sayı", ""), ("pages", "Sayfa", "45–67"),
                 ("publisher", "Yayınevi", ""), ("editors", "Editörler", "Soyad, Ad; Soyad, Ad"),
                 ("institution", "Kurum (tez)", ""), ("doi", "DOI", "10.xxxx/…"), ("url", "Link", ""),
+                ("keywords", "Anahtar kelimeler", "makalenin kendi anahtar kelimeleri"),
                 ("tags", "Etiketler", "virgülle ayırın")], start=1):
             entry = ctk.CTkEntry(form, placeholder_text=hint, height=30)
             self._field(form, row, label, entry)
             self.f[key] = entry
         self.f_type = ctk.CTkOptionMenu(form, values=list(ITEM_TYPES.values()), height=30)
-        self._field(form, 13, "Tür", self.f_type)
+        self._field(form, 14, "Tür", self.f_type)
         self.matched_label = ctk.CTkLabel(form, text="", text_color=MUTED, font=ctk.CTkFont(size=11),
                                           anchor="w", justify="left", wraplength=360)
-        self.matched_label.grid(row=14, column=0, columnspan=2, sticky="ew", padx=4, pady=(6, 0))
+        self.matched_label.grid(row=15, column=0, columnspan=2, sticky="ew", padx=4, pady=(6, 0))
 
         btns = ctk.CTkFrame(tab, fg_color="transparent")
         btns.grid(row=2, column=0, sticky="ew", pady=(6, 0))
@@ -3638,7 +4286,7 @@ class LibraryTab:
             item["cards"] = card_counts.get(item["id"], 0)
             item["_blob"] = fold(" ".join([item["title"], people_to_text(item["authors"]), item["container"],
                                            item["year"], item["notes"], " ".join(item["tags"]), item["doi"],
-                                           item.get("matched", "")]))
+                                           item.get("matched", ""), item.get("keywords", "")]))
         tags = self.lib.all_tags()
         current_tag = self.tag_menu.get()
         self.tag_menu.configure(values=["Tüm etiketler"] + tags)
@@ -4020,9 +4668,9 @@ class LibraryTab:
         if not paths:
             messagebox.showinfo(APP_NAME, "Bu klasörde (kütüphane klasörü dışında) PDF bulunamadı.", parent=self.parent)
             return
-        self._start_import(paths)
+        self._start_import(paths, report_folders=[folder])
 
-    def _start_import(self, paths):
+    def _start_import(self, paths, report_folders=()):
         move = messagebox.askyesnocancel(
             APP_NAME, f"{len(paths)} PDF kütüphaneye alınacak.\n\n"
                       "Dosyalar kütüphane klasörüne TAŞINSIN mı?\n"
@@ -4032,7 +4680,23 @@ class LibraryTab:
         dialog = ctk.CTkInputDialog(text="Bu kaynaklara eklenecek etiket (isteğe bağlı, virgülle):",
                                     title="Etiket")
         tags = dialog.get_input() or ""
-        self.app.start_import(paths, clean_tags(tags), move)
+        self.app.start_import(paths, clean_tags(tags), move, report_folders)
+
+    def _autotag(self):
+        items = self.selected_items()
+        scope = f"seçili {len(items)} kaynağa" if items else "kütüphanedeki tüm kaynaklara"
+        if not messagebox.askyesno(
+                APP_NAME, f"Anahtar kelimeler (PDF'lerden) ve grup etiketleri {scope} eklensin mi?\n\n"
+                          "Elle verdiğiniz etiketler silinmez; yalnızca eşleşen grup adları eklenir.",
+                parent=self.parent):
+            return
+        self.autotag_btn.configure(state="disabled", text="Etiketleniyor…")
+        AutoTagWorker(self.lib, self.app.events, [i["id"] for i in items] if items else None).start()
+
+    def autotag_finished(self, total, tagged, kw_added):
+        self.autotag_btn.configure(state="normal", text="Otomatik Etiketle")
+        self.refresh()
+        self.app.toast(f"{total} kaynak incelendi: {tagged} tanesine grup etiketi, {kw_added} tanesine anahtar kelime eklendi.")
 
     def _bibliography(self, selected=True):
         items = self.selected_items() if selected else [self.by_id[int(i)] for i in self.tree.get_children()]
@@ -4184,12 +4848,29 @@ class ScanTab:
                      font=ctk.CTkFont(size=12), wraplength=330, justify="left",
                      anchor="w").grid(row=r, column=0, sticky="ew", padx=10, pady=(2, 0)); r += 1
 
+        section("Claude bağlantısı")
+        ctk.CTkLabel(side, text="Claude masaüstü uygulaması kütüphanenizde arama, etiketleme, alıntı kartı, "
+                                "kaynakça ve PDF okuma yapabilir. Bağladıktan sonra Claude'u tamamen kapatıp "
+                                "(sistem tepsisi → Quit) yeniden açın.", text_color=MUTED,
+                     font=ctk.CTkFont(size=12), wraplength=330, justify="left",
+                     anchor="w").grid(row=r, column=0, sticky="ew", padx=10); r += 1
+        cl = ctk.CTkFrame(side, fg_color="transparent")
+        cl.grid(row=r, column=0, sticky="w", padx=10, pady=6); r += 1
+        ctk.CTkButton(cl, text="Claude'a Bağla", width=130, fg_color="#C15F3C", hover_color="#A34E30",
+                      command=self.connect_claude).pack(side="left")
+        ctk.CTkButton(cl, text="Ayarı Kopyala", width=110, fg_color="transparent", border_width=1,
+                      text_color=TEXT, command=self.copy_claude_config).pack(side="left", padx=8)
+
         section("Kütüphane ayarları")
         lf = ctk.CTkFrame(side, fg_color="transparent")
         lf.grid(row=r, column=0, sticky="ew", padx=10); r += 1
         lf.grid_columnconfigure(0, weight=1)
         ctk.CTkEntry(lf, textvariable=self.app.folder_var, height=30).grid(row=0, column=0, sticky="ew")
         ctk.CTkButton(lf, text="Seç…", width=60, command=self.app.choose_library_folder).grid(row=0, column=1, padx=(6, 0))
+        self.autotag_var = ctk.BooleanVar(value=s.get("auto_tag", True))
+        ctk.CTkCheckBox(side, text="Yeni gelen kaynaklara anahtar kelime ve grup etiketini otomatik ekle",
+                        variable=self.autotag_var, command=self.app.save_all_settings).grid(
+            row=r, column=0, sticky="w", padx=10, pady=(8, 3)); r += 1
         self.watch_var = ctk.BooleanVar(value=s.get("watch_downloads", True))
         ctk.CTkCheckBox(side, text="İndirilenler klasörünü izle (indirdiğim PDF'i doğru kaynağa bağla)",
                         variable=self.watch_var, command=self.app.save_all_settings).grid(
@@ -4294,6 +4975,50 @@ class ScanTab:
         folder = Path(self.app.library_folder() or settings_path().parent) / "Tarama Raporları"
         folder.mkdir(parents=True, exist_ok=True)
         open_in_file_manager(folder)
+
+    # ── Claude bağlantısı ───────────────────────────────────────────────────
+    def _mcp_ready(self) -> bool:
+        if mcp_exe_path().is_file():
+            return True
+        messagebox.showwarning(APP_NAME, f"{MCP_EXE_NAME}.exe bu programın klasöründe bulunamadı.\n\n"
+                                         "GitHub'dan indirdiğiniz klasörün tamamını (içindeki _internal "
+                                         "klasörüyle birlikte) aynı yerde tutun.", parent=self.parent)
+        return False
+
+    def connect_claude(self):
+        if not self._mcp_ready():
+            return
+        try:
+            written = connect_claude_desktop()
+        except (OSError, ValueError) as exc:
+            diag_exception("Claude bağlantısı")
+            messagebox.showerror(APP_NAME, f"Bağlantı eklenemedi:\n{exc}\n\n"
+                                           "'Ayarı Kopyala' ile elle ekleyebilirsiniz.", parent=self.parent)
+            return
+        if not written:
+            messagebox.showinfo(APP_NAME, "Bu bilgisayarda Claude masaüstü uygulaması bulunamadı.\n\n"
+                                          "claude.ai/download adresinden kurup bir kez açın, sonra bu düğmeye "
+                                          "yeniden basın.", parent=self.parent)
+            return
+        diag(f"Claude bağlantısı eklendi: {', '.join(map(str, written))}")
+        messagebox.showinfo(APP_NAME, "Bağlantı Claude'un ayarlarına eklendi.\n\n"
+                                      "1. Claude'u tamamen kapatın: saatin yanındaki simgeye sağ tıklayıp Quit.\n"
+                                      "2. Claude'u yeniden açın.\n"
+                                      "3. Yazı kutusunun altındaki araçlar (+ ya da ayar simgesi) menüsünde "
+                                      "\"akademik-kutuphane\" görünür.\n\n"
+                                      "Deneyin: \"Kütüphanemde PDF'i olmayan kaynakları listele.\"\n\n"
+                                      f"Ayar dosyası:\n{written[0]}", parent=self.parent)
+
+    def copy_claude_config(self):
+        if not self._mcp_ready():
+            return
+        snippet = claude_config_snippet()
+        self.parent.clipboard_clear()
+        self.parent.clipboard_append(snippet)
+        messagebox.showinfo(APP_NAME, "Ayar panoya kopyalandı.\n\nClaude → Settings → Developer → Edit Config ile "
+                                      "açılan dosya boşsa bunu yapıştırın; doluysa \"mcpServers\" içine "
+                                      "yalnızca \"akademik-kutuphane\" bölümünü ekleyin.\n\n" + snippet,
+                            parent=self.parent)
 
     # ── zamanlama ───────────────────────────────────────────────────────────
     def _copy_command(self, command, title, steps):
@@ -4445,7 +5170,26 @@ class App(ctk.CTk):
         self.after(80, self._poll_events)
         self.after(600, self._first_run)
         self.after(15_000, self._watch_downloads)
+        self._db_stamp = self._library_stamp()
+        self.bind("<FocusIn>", self._on_focus, add="+")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _library_stamp(self):
+        try:
+            st = self.library.path.stat()
+            return st.st_mtime_ns, st.st_size
+        except OSError:
+            return None
+
+    def _on_focus(self, event):
+        """Claude (ya da tarama görevi) kütüphaneyi değiştirdiyse pencereye dönünce listeyi tazele."""
+        stamp = self._library_stamp()
+        if stamp != self._db_stamp:
+            self._db_stamp = stamp
+            try:
+                self.library_tab.refresh()
+            except Exception:
+                diag_exception("odak yenileme")
 
     # ── yerleşim ────────────────────────────────────────────────────────────────
     def _section(self, parent, text, row, pady=(16, 2)):
@@ -4669,6 +5413,7 @@ class App(ctk.CTk):
                 "auto_scan": scan.auto_var.get(), "open_report": scan.open_report_var.get(),
                 "scan_dergipark": scan.src_dp.get(), "scan_crossref": scan.src_cr.get(),
                 "watch_downloads": scan.watch_var.get(), "scan_day": scan.day_menu.get(),
+                "auto_tag": scan.autotag_var.get(),
                 "scan_hour": scan.hour_menu.get(),
                 "institution_url": scan.inst_entry.get().strip() or DEFAULT_INSTITUTION_URL,
             })
@@ -4718,12 +5463,13 @@ class App(ctk.CTk):
         if self.tabs.get() == "Kütüphanem":
             self.library_tab.refresh()
 
-    def start_import(self, paths, tags, move):
+    def start_import(self, paths, tags, move, report_folders=()):
         if self.import_worker and self.import_worker.is_alive():
             messagebox.showinfo(APP_NAME, "Önceki ekleme işlemi sürüyor.", parent=self)
             return
         self.import_worker = LibraryScanWorker(paths, self.library, self.events, threading.Event(),
-                                               tags=tags, library_folder=self.library_folder(), move=move)
+                                               tags=tags, library_folder=self.library_folder(), move=move,
+                                               report_folders=report_folders)
         self.library_tab.count_label.configure(text=f"{len(paths)} PDF kütüphaneye alınıyor…")
         self.import_worker.start()
 
@@ -4982,9 +5728,10 @@ class App(ctk.CTk):
             if name:
                 self.library_tab.count_label.configure(text=f"Kütüphaneye alınıyor {done + 1}/{total}: {shorten(name, 50)}")
         elif kind == "scan_done":
-            added, updated, skipped = message[1:]
+            added, updated, skipped, pending = (list(message[1:]) + [0])[:4]
             self.library_tab.refresh()
-            self.toast(f"{added} kaynak eklendi, {updated} güncellendi, {skipped} zaten vardı.")
+            extra = f" İnmemiş {pending} kaynak da PDF'siz olarak eklendi." if pending else ""
+            self.toast(f"{added} kaynak eklendi, {updated} güncellendi, {skipped} zaten vardı.{extra}")
         elif kind == "watch_attached":
             item_id, name = message[1:]
             self.library_tab.refresh()
@@ -4996,6 +5743,11 @@ class App(ctk.CTk):
                 current["watch_since"] = newest
                 save_settings(current)
                 self.settings["watch_since"] = newest
+        elif kind == "autotag":
+            n, total = message[1:]
+            self.library_tab.count_label.configure(text=f"Otomatik etiketleniyor {n}/{total}…")
+        elif kind == "autotag_done":
+            self.library_tab.autotag_finished(*message[1:])
         elif kind == "crossref_done":
             self.library_tab.crossref_done(message[1], message[2])
 
@@ -5038,7 +5790,14 @@ class App(ctk.CTk):
 
 
 def main():
+    if "--mcpb-pack" in sys.argv:            # derleme sırasında: .mcpb uzantı paketini üret
+        i = sys.argv.index("--mcpb-pack")
+        print(pack_mcpb(sys.argv[i + 1], sys.argv[i + 2]))
+        return
     install_crash_logging()
+    if "--mcp" in sys.argv:                  # Claude masaüstü uygulaması bağlantısı
+        run_mcp_server()
+        return
     if "--tara" in sys.argv:              # Windows görev zamanlayıcısından: arayüzsüz tarama
         try:
             run_headless_scan()
