@@ -1,0 +1,29 @@
+name: Windows EXE Derle
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  derle:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Kütüphaneleri kur
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Program klasörünü oluştur
+        run: pyinstaller --noconfirm --clean --onedir --windowed --name AkademikIndirici --collect-data customtkinter akademik_indirici.py
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: AkademikIndirici
+          path: dist/AkademikIndirici/
+          if-no-files-found: error

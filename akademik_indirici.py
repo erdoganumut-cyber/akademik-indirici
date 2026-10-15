@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.0"
+APP_VERSION = "2.1"
 
 CHUNK_SIZE = 64 * 1024              # parça parça indirme boyutu (64 KB)
 HTML_READ_LIMIT = 5 * 1024 * 1024   # PDF bağlantısı aramak için okunacak en fazla HTML
@@ -2887,12 +2887,41 @@ def scan_lock_path() -> Path:
     return settings_path().parent / "tarama.lock"
 
 
+def pid_alive(pid: int) -> bool:
+    """Süreç hâlâ çalışıyor mu? (Windows'ta os.kill süreci öldürdüğü için kullanılmaz.)"""
+    if pid <= 0:
+        return False
+    if sys.platform.startswith("win"):
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)      # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+            return code.value == 259                            # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 def acquire_scan_lock() -> bool:
-    """Aynı anda iki tarama (uygulama + zamanlanmış görev) çalışmasın."""
+    """Aynı anda iki tarama (uygulama + zamanlanmış görev) çalışmasın. Yarıda kapanmış bir
+    taramanın bıraktığı kilit (süreci artık yaşamıyorsa) yok sayılır."""
     path = scan_lock_path()
     try:
         if path.exists() and time.time() - path.stat().st_mtime < 3 * 3600:
-            return False
+            try:
+                owner = int(path.read_text(encoding="utf-8").strip() or 0)
+            except (OSError, ValueError):
+                owner = 0
+            if owner != os.getpid() and pid_alive(owner):
+                return False
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(str(os.getpid()), encoding="utf-8")
         return True
@@ -2922,22 +2951,27 @@ class ScanWorker(threading.Thread):
 
     def status(self, text):
         self.events.put(("scan_status", text))
+        diag(f"tarama: {text}", throttle=True)
 
     def log(self, level, text):
         self.events.put(("log", level, text))
 
     def run(self):
+        diag("tarama başladı")
         if not acquire_scan_lock():
+            diag("tarama: kilit dolu, başka tarama sürüyor")
             self.summary = "Başka bir tarama zaten çalışıyor."
             self.events.put(("scan_finished", None, self.summary))
             return
         try:
             self._run()
         except Exception as exc:
+            diag_exception("tarama hatası")
             self.summary = f"Tarama yarıda kaldı: {describe_error(exc)}"
             self.log("error", self.summary)
             self.events.put(("scan_finished", None, self.summary))
         finally:
+            diag(f"tarama bitti: {self.summary}")
             release_scan_lock()
 
     def _run(self):
@@ -3111,39 +3145,16 @@ WEEKDAYS = {"Pazartesi": "MON", "Salı": "TUE", "Çarşamba": "WED", "Perşembe"
             "Cuma": "FRI", "Cumartesi": "SAT", "Pazar": "SUN"}
 
 
-def _run_quiet(args):
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    return subprocess.run(args, capture_output=True, text=True, creationflags=flags)
-
-
-def schedule_weekly_scan(day: str, hour: str):
-    """Haftalık taramayı Windows görev zamanlayıcısına ekler. Dönüş: (başarılı_mı, mesaj)"""
-    if not sys.platform.startswith("win"):
-        return False, "Zamanlanmış görev yalnızca Windows'ta kurulabilir."
-    if not getattr(sys, "frozen", False):
-        return False, "Zamanlanmış görev yalnızca .exe sürümünden kurulabilir."
-    command = f'"{sys.executable}" --tara'
-    result = _run_quiet(["schtasks", "/Create", "/F", "/SC", "WEEKLY", "/D", WEEKDAYS.get(day, "MON"),
-                         "/ST", hour, "/TN", TASK_NAME, "/TR", command])
-    if result.returncode == 0:
-        return True, f"Her {day} {hour}'da tarama yapılacak."
-    return False, (result.stderr or result.stdout or "schtasks hata verdi").strip()
-
-
-def unschedule_weekly_scan():
-    if not sys.platform.startswith("win"):
-        return False, "Yalnızca Windows'ta."
-    result = _run_quiet(["schtasks", "/Delete", "/F", "/TN", TASK_NAME])
-    return result.returncode == 0, (result.stderr or result.stdout).strip()
-
-
-def weekly_scan_scheduled() -> bool:
-    if not sys.platform.startswith("win"):
-        return False
-    try:
-        return _run_quiet(["schtasks", "/Query", "/TN", TASK_NAME]).returncode == 0
-    except OSError:
-        return False
+def task_commands(day: str, hour: str):
+    """Haftalık görevi kurma/kaldırma komutları. Uygulama bunları KENDİSİ çalıştırmaz:
+    imzasız bir programın gizlice görev zamanlayıcısına dokunması Windows Defender'ın
+    davranış tespitini tetikliyor (Behavior:Win32/Execution). Komutu kullanıcı bir kez
+    Komut İstemi'ne yapıştırır."""
+    exe = sys.executable if getattr(sys, "frozen", False) else "AkademikIndirici.exe"
+    create = (f'schtasks /Create /F /SC WEEKLY /D {WEEKDAYS.get(day, "MON")} /ST {hour} '
+              f'/TN "{TASK_NAME}" /TR "\\"{exe}\\" --tara"')
+    delete = f'schtasks /Delete /F /TN "{TASK_NAME}"'
+    return create, delete
 
 
 def run_headless_scan():
@@ -3186,6 +3197,66 @@ def save_settings(data: dict):
         pass
 
 
+# ── Tanılama kaydı: uygulama beklenmedik biçimde kapanırsa nedenini görmek için ─────
+
+_DIAG_LOCK = threading.Lock()
+_DIAG_LAST = [0.0]
+_FAULT_FILE = None
+
+
+def diag_path() -> Path:
+    return settings_path().parent / "tanilama_kaydi.txt"
+
+
+def diag(text: str, throttle: bool = False):
+    """Kısa olay kaydı. throttle=True olanlar en fazla 2 saniyede bir yazılır."""
+    now = time.time()
+    if throttle and now - _DIAG_LAST[0] < 2:
+        return
+    _DIAG_LAST[0] = now
+    try:
+        with _DIAG_LOCK:
+            path = diag_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists() and path.stat().st_size > 2_000_000:      # 2 MB'ı geçmesin
+                path.replace(path.with_suffix(".eski.txt"))
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} [{os.getpid()}] {text}\n")
+    except OSError:
+        pass
+
+
+def diag_exception(context: str):
+    import traceback
+    diag(f"HATA ({context}):\n" + traceback.format_exc())
+
+
+def install_crash_logging():
+    """Yakalanmayan hataları ve Python'un kendisinin çökmesini kayda geçirir."""
+    global _FAULT_FILE
+    import faulthandler
+    import traceback
+
+    def excepthook(exc_type, exc, tb):
+        diag("YAKALANMAYAN HATA:\n" + "".join(traceback.format_exception(exc_type, exc, tb)))
+
+    def thread_hook(args):
+        diag(f"İŞ PARÇACIĞI HATASI ({getattr(args.thread, 'name', '?')}):\n"
+             + "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)))
+
+    sys.excepthook = excepthook
+    threading.excepthook = thread_hook
+    try:
+        path = settings_path().parent / "cokme_kaydi.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _FAULT_FILE = open(path, "a", encoding="utf-8")
+        faulthandler.enable(file=_FAULT_FILE, all_threads=True)
+    except OSError:
+        pass
+    diag(f"uygulama açıldı: v{APP_VERSION} · {' '.join(sys.argv[1:]) or 'arayüz'} · "
+         f"{'exe' if getattr(sys, 'frozen', False) else 'python'} · {sys.platform}")
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  8) ARAYÜZ (CustomTkinter)
 # ════════════════════════════════════════════════════════════════════════════
@@ -3224,10 +3295,7 @@ def default_library_dir() -> Path:
 
 def show_in_file_manager(path: Path):
     path = Path(path)
-    if sys.platform.startswith("win"):
-        subprocess.Popen(["explorer", "/select,", str(path)])
-    else:
-        open_in_file_manager(path.parent)
+    open_in_file_manager(path.parent)
 
 
 def open_file(path: Path):
@@ -4048,11 +4116,15 @@ class ScanTab:
         ctk.CTkButton(rep, text="Son Raporu Aç", width=130, command=self.open_last_report).pack(side="left")
         ctk.CTkButton(rep, text="Rapor Klasörü", width=110, fg_color="transparent", border_width=1,
                       text_color=TEXT, command=self.open_report_folder).pack(side="left", padx=8)
+        ctk.CTkButton(side, text="Tanılama Kaydını Aç", height=26, width=150, fg_color="transparent",
+                      border_width=1, text_color=MUTED, font=ctk.CTkFont(size=12),
+                      command=self.app.open_diagnostics).grid(row=r, column=0, sticky="w", padx=10); r += 1
 
         section("Kendiliğinden çalışma")
-        ctk.CTkLabel(side, text="Uygulama kapalıyken de taraması için Windows görev zamanlayıcısına "
-                                "bir kez kurun. Bilgisayar o gün kapalıysa, uygulamayı açtığınızda "
-                                "7 gün geçmişse tarama kendiliğinden başlar.", text_color=MUTED,
+        ctk.CTkLabel(side, text="Uygulama açıkken ya da açıldığında son taramanın üzerinden 7 gün "
+                                "geçmişse tarama kendiliğinden başlar. Uygulama kapalıyken de taraması "
+                                "için gün ve saati seçip kurulum komutunu bir kez Komut İstemi'nde "
+                                "çalıştırın (isteğe bağlı).", text_color=MUTED,
                      font=ctk.CTkFont(size=12), wraplength=330, justify="left",
                      anchor="w").grid(row=r, column=0, sticky="ew", padx=10); r += 1
         when = ctk.CTkFrame(side, fg_color="transparent")
@@ -4063,10 +4135,10 @@ class ScanTab:
         self.hour_menu = ctk.CTkOptionMenu(when, values=self.HOURS, width=84)
         self.hour_menu.set(s.get("scan_hour", "09:00"))
         self.hour_menu.grid(row=0, column=1, padx=6)
-        ctk.CTkButton(when, text="Windows'a Kur", width=118, command=self.schedule).grid(
-            row=1, column=0, pady=(6, 0), sticky="w")
-        ctk.CTkButton(when, text="Kaldır", width=84, fg_color="transparent", border_width=1, text_color=TEXT,
-                      command=self.unschedule).grid(row=1, column=1, padx=6, pady=(6, 0), sticky="w")
+        ctk.CTkButton(when, text="Kurulum Komutunu Kopyala", width=208, command=self.schedule).grid(
+            row=1, column=0, columnspan=2, pady=(6, 0), sticky="w")
+        ctk.CTkButton(when, text="Kaldırma Komutu", width=118, fg_color="transparent", border_width=1,
+                      text_color=TEXT, command=self.unschedule).grid(row=2, column=0, pady=(6, 0), sticky="w")
         self.sched_label = ctk.CTkLabel(side, text="", text_color=MUTED, font=ctk.CTkFont(size=12),
                                         anchor="w", justify="left", wraplength=330)
         self.sched_label.grid(row=r, column=0, sticky="ew", padx=10); r += 1
@@ -4193,24 +4265,43 @@ class ScanTab:
         open_in_file_manager(folder)
 
     # ── zamanlama ───────────────────────────────────────────────────────────
+    def _copy_command(self, command, title, steps):
+        self.parent.clipboard_clear()
+        self.parent.clipboard_append(command)
+        messagebox.showinfo(APP_NAME, f"{title} komutu panoya kopyalandı.\n\n{steps}\n\n{command}",
+                            parent=self.parent)
+
     def schedule(self):
-        ok, msg = schedule_weekly_scan(self.day_menu.get(), self.hour_menu.get())
+        if not getattr(sys, "frozen", False):
+            messagebox.showinfo(APP_NAME, "Bu komut yalnızca .exe sürümünde hazırlanabilir.", parent=self.parent)
+            return
+        create, _ = task_commands(self.day_menu.get(), self.hour_menu.get())
+        self._copy_command(create, "Kurulum",
+                           "1. Başlat menüsüne cmd yazıp Komut İstemi'ni açın.\n"
+                           "2. Pencereye sağ tıklayıp yapıştırın ve Enter'a basın.\n"
+                           "3. \"BAŞARILI\" yazısını görünce kapatabilirsiniz.\n\n"
+                           "Not: exe'nin yerini değiştirirseniz komutu yeniden çalıştırın.")
+        current = load_settings()
+        current["scan_task"] = f"{self.day_menu.get()} {self.hour_menu.get()}"
+        save_settings(current)
         self.app.save_all_settings()
-        (messagebox.showinfo if ok else messagebox.showwarning)(APP_NAME, msg, parent=self.parent)
         self.refresh_schedule_label()
 
     def unschedule(self):
-        ok, msg = unschedule_weekly_scan()
-        if not ok and msg:
-            messagebox.showwarning(APP_NAME, msg, parent=self.parent)
+        _, delete = task_commands(self.day_menu.get(), self.hour_menu.get())
+        self._copy_command(delete, "Kaldırma", "Başlat → cmd → yapıştırın ve Enter'a basın.")
+        current = load_settings()
+        current.pop("scan_task", None)
+        save_settings(current)
         self.refresh_schedule_label()
 
     def refresh_schedule_label(self):
-        if weekly_scan_scheduled():
-            self.sched_label.configure(text=f"✓ Kurulu: her {self.day_menu.get()} {self.hour_menu.get()}",
+        task = load_settings().get("scan_task")
+        if task:
+            self.sched_label.configure(text=f"Kurulum komutu hazırlandı: her {task}",
                                        text_color=LOG_COLORS["success"])
         else:
-            self.sched_label.configure(text="Windows görevi kurulu değil.", text_color=MUTED)
+            self.sched_label.configure(text="Windows görevi kurulmadı (isteğe bağlı).", text_color=MUTED)
 
 
 class DownloadsWatcher(threading.Thread):
@@ -4785,6 +4876,7 @@ class App(ctk.CTk):
         self._log("info", f"İndirme başladı: {len(links)} link → {folder}")
         if self.opt_find_pdf.get() and not email:
             self._log("muted", "İpucu: Seçeneklere e-posta girerseniz açık erişim kopyaları da aranır.")
+        diag(f"indirme başladı: {len(links)} link")
         self.worker = DownloadWorker(links, folder, options, self.events, self.cancel_event)
         self.worker.start()
 
@@ -4895,12 +4987,32 @@ class App(ctk.CTk):
             self.library.close()
         except Exception:
             pass
+        diag("uygulama kullanıcı tarafından kapatıldı")
         self.destroy()
+
+    def report_callback_exception(self, exc_type, exc, tb):
+        import traceback
+        diag("ARAYÜZ HATASI:\n" + "".join(traceback.format_exception(exc_type, exc, tb)))
+        try:
+            self._log("error", f"Beklenmeyen hata: {exc_type.__name__}: {exc} (ayrıntı tanılama kaydında)")
+        except Exception:
+            pass
+
+    def open_diagnostics(self):
+        path = diag_path()
+        if path.exists():
+            open_file(path)
+        else:
+            messagebox.showinfo(APP_NAME, "Henüz tanılama kaydı yok.", parent=self)
 
 
 def main():
+    install_crash_logging()
     if "--tara" in sys.argv:              # Windows görev zamanlayıcısından: arayüzsüz tarama
-        run_headless_scan()
+        try:
+            run_headless_scan()
+        except Exception:
+            diag_exception("arayüzsüz tarama")
         return
     ctk.set_appearance_mode("system")
     ctk.set_default_color_theme("blue")
