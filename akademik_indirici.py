@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.8"
+APP_VERSION = "2.9"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -1903,7 +1903,13 @@ def apa_segments(rec: dict, lang: str = "tr") -> list:
         if not title_done:
             add(title, True)
         inst = rec.get("institution") or publisher
+        m = re.search(r"YÖK Tez No:\s*(\d+)", rec.get("notes") or "")
+        if m:                                    # APA 7: veri tabanından alınan tez
+            add(f" ({'Tez No.' if lang == 'tr' else 'Thesis No.'} {m.group(1)})")
         add(f" [{w[kind]}{', ' + inst if inst else ''}]. ")
+        if m and not rec.get("url"):
+            add("Yükseköğretim Kurulu Ulusal Tez Merkezi. " if lang == "tr"
+                else "Council of Higher Education National Thesis Center. ")
     else:  # kitap ve diğer
         if not title_done:
             add(title, True)
@@ -2366,6 +2372,11 @@ class Library:
             if re.sub(r"\W+", " ", fold(other or "")).strip() == key:
                 return item_id
         return None
+
+    def find_by_tez_no(self, tez_no: str):
+        with self.lock:
+            row = self.db.execute("SELECT id FROM items WHERE notes LIKE ?", (f"%YÖK Tez No: {tez_no}%",)).fetchone()
+        return row[0] if row else None
 
     def find_by_path(self, path):
         with self.lock:
@@ -3229,6 +3240,131 @@ def relevant_journal_sets(sets, include_social=False) -> list:
     return [(spec, name) for spec, name in sets if rx.search(fold(name)) or rx.search(fold(spec))]
 
 
+# ── YÖK Ulusal Tez Merkezi: sitenin kendi arama kutusunun kullandığı adresler ──────────
+YOK_BASE = "https://tez.yok.gov.tr/UlusalTezMerkezi/"
+YOK_PAUSE = 1.5                       # siteyi yormamak için istekler arası bekleme
+YOK_TYPES = {"doktora": "phd", "sanatta yeterlik": "phd", "yuksek lisans": "masters"}
+_YOK_CARD_RE = re.compile(r'data-index="(\d+)"\s+data-kayitno="([^"]+)"\s+data-tezno="([^"]+)"')
+
+
+def _strip_tags(text) -> str:
+    return clean_text(html.unescape(re.sub(r"<[^>]+>", " ", str(text or ""))))
+
+
+def _yok_name(name: str) -> str:
+    name = clean_text(name)
+    return " ".join(title_case_word(w) for w in name.split(" ")) if name.isupper() else name
+
+
+def yok_open_session(session):
+    """Ana sayfayı açarak arama oturumu alır (site oturumsuz aramaya sonuç vermiyor)."""
+    session.get(YOK_BASE, timeout=(15, 60))
+
+
+def parse_yok_results(page: str) -> list:
+    m = re.search(r"const referenceData = (\{.*?\n\s*\});", page, re.S)
+    ref = {}
+    if m:
+        try:
+            ref = json.loads(re.sub(r",(\s*\})", r"\1", m.group(1)))
+        except ValueError:
+            ref = {}
+    out = []
+    for chunk in page.split('class="result-card"')[1:]:
+        cm = _YOK_CARD_RE.search(chunk[:400])
+        if not cm:
+            continue
+        index, kayit, tez = cm.groups()
+        meta = (ref.get(index) or {}).get("meta") or {}
+        tr_title = _strip_tags(meta.get("title")) or _strip_tags(
+            (re.search(r'class="card-title">(.*?)</div>', chunk, re.S) or [None, ""])[1])
+        en = re.search(r'class="card-info" style="font-style: italic">(.*?)</div>', chunk, re.S)
+        en_title = _strip_tags(en.group(1)) if en else ""
+        no = re.search(r"Tez No:</strong>\s*(\d+)", chunk)
+        kind = fold(meta.get("type", ""))
+        out.append({
+            "title": tr_title, "all_titles": [t for t in (tr_title, en_title) if t],
+            "authors": [p for p in [parse_person(_yok_name(meta.get("author", "")))] if p],
+            "year": str(meta.get("year") or ""), "type": next((v for k, v in YOK_TYPES.items() if k in kind), "other"),
+            "institution": _yok_name(str(meta.get("yer") or "").split("/")[0].strip()),
+            "language": "tr" if fold(meta.get("lang", "")).startswith("turk") else "",
+            "subjects": [x.strip() for x in str(meta.get("subject") or "").split(";") if x.strip()],
+            "description": "", "keywords": "", "source": "YÖK Tez", "url": "",
+            "tez_no": no.group(1) if no else "", "yok_keys": (kayit, tez), "thesis_kind": meta.get("type", ""),
+        })
+    return out
+
+
+def search_yok(session, query: str) -> list:
+    """Tez Merkezi'nin hızlı aramasıyla (tüm alanlarda) arar; en fazla 2000 tez döner."""
+    if len(query.strip()) < 3:
+        return []
+    r = session.post(YOK_BASE + "SearchTez", timeout=(15, 120),
+                     data={"izin": "0", "tur": "0", "neden": query, "islem": "1", "nevi": "7"})
+    r.raise_for_status()
+    if "Hata" in r.url:
+        raise DownloadError("YÖK Tez Merkezi aramayı kabul etmedi")
+    return parse_yok_results(r.text)
+
+
+def yok_detail(session, keys) -> dict:
+    """Özet, anahtar kelimeler, danışman ve tam kurum bilgisi."""
+    r = session.get(YOK_BASE + "tezBilgiDetay.jsp", params={"kayitNo": keys[0], "tezNo": keys[1]},
+                    timeout=(15, 60))
+    r.raise_for_status()
+    try:
+        return json.loads(r.text.strip())
+    except ValueError:
+        return {}
+
+
+def yok_pdf_url(session, keys):
+    """Yazarı izin verdiyse PDF adresi, vermediyse None."""
+    r = session.get(YOK_BASE + "getTezPdf.jsp", params={"kayitNo": keys[0], "tezNo": keys[1]},
+                    timeout=(15, 60))
+    r.raise_for_status()
+    m = re.search(r"TezGoster\?key=([^'\"\s>]+)", r.text)
+    return YOK_BASE + "TezGoster?key=" + m.group(1) if m else None
+
+
+def yok_open_html(tez_no: str) -> Path:
+    """Tezi Tez Merkezi'nde açan küçük sayfa (site tez numarasıyla doğrudan bağlantı vermiyor)."""
+    path = settings_path().parent / "yok_tez_ac.html"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"""<!doctype html><meta charset="utf-8"><title>YÖK Tez {html.escape(tez_no)}</title>
+<body onload="document.forms[0].submit()"><form method="post" action="{YOK_BASE}SearchTez">
+<input type="hidden" name="izin" value="0"><input type="hidden" name="tur" value="0">
+<input type="hidden" name="neden" value="{html.escape(tez_no)}"><input type="hidden" name="islem" value="1">
+<input type="hidden" name="nevi" value="8"><noscript><button>Tez Merkezi'nde aç</button></noscript></form></body>""",
+                    encoding="utf-8")
+    return path
+
+
+def yok_keywords(text) -> list:
+    """'Anahtar Kelime: Bar halk oyunları = Bar folk games ; Etnokoreoloji = ...' → Türkçe hâlleri"""
+    text = re.sub(r"^(Anahtar Kelime(ler)?|Keywords?)\s*:\s*", "", _strip_tags(text), flags=re.I)
+    return [part.split("=")[0].strip() for part in text.split(";") if part.split("=")[0].strip()]
+
+
+def yok_tez_no(item) -> str:
+    m = re.search(r"YÖK Tez No:\s*(\d+)", item.get("notes") or "")
+    return m.group(1) if m else ""
+
+
+def yok_queries(matcher, include_context: bool = True) -> list:
+    """Tez Merkezi'nde aranacak terimler: tam hâli; tek başına çok anlamlı kısa terimler hariç.
+    include_context=False: bağlam isteyen genel terimler ('virtual reality' gibi binlerce tez
+    döndürenler) atlanır; haftalık taramada siteyi gereksiz yormamak için."""
+    out = []
+    for _, terms in matcher.groups:
+        for term, _, ctx, query in terms:
+            if ctx and (len(term) < 9 or not include_context):
+                continue
+            if query not in out and len(query) >= 3:
+                out.append(query)
+    return out
+
+
 def search_crossref_deep(session, query: str, since=None, limit: int = 1000):
     """Crossref'te tüm zamanlarda (ya da 'since' yayın tarihinden beri) ilgililik sırasıyla arar."""
     params = {"query.bibliographic": query, "rows": min(1000, limit), "cursor": "*", "select": CROSSREF_SELECT}
@@ -3294,7 +3430,8 @@ def write_scan_report(path: Path, info: dict, found: list, added_items: list) ->
             groups.setdefault(group, []).append(entry)
     scopus = load_scopus()
     status_label = {"pdf": ("PDF indirildi", "ok"), "nopdf": ("PDF yok", "warn"),
-                    "institution": ("Kurum erişimi gerekebilir", "inst"), "known": ("Zaten kütüphanede", "muted")}
+                    "institution": ("Kurum erişimi gerekebilir", "inst"), "known": ("Zaten kütüphanede", "muted"),
+                    "thesis_closed": ("Tez · yazar PDF izni vermemiş", "warn")}
 
     def card(entry, group):
         rec = dict(entry["record"])
@@ -3366,6 +3503,7 @@ li{{background:var(--card);border:1px solid var(--line);border-radius:10px;paddi
 <div class="stat"><b>{pdf_count}</b><span>PDF indirildi</span></div>
 <div class="stat"><b>{info.get('dergipark', 0)}</b><span>DergiPark kaydı tarandı</span></div>
 <div class="stat"><b>{info.get('crossref', 0)}</b><span>Crossref kaydı tarandı</span></div>
+{f'<div class="stat"><b>{info.get("yok", 0)}</b><span>YÖK tezi tarandı</span></div>' if "YÖK Tez" in info.get("sources", []) else ''}
 {f'<div class="stat"><b>{len(added_items)}</b><span>kütüphaneye eklendi (tümü)</span></div>' if added_items else ''}
 </div>
 {''.join(sections)}
@@ -3451,7 +3589,8 @@ def retro_period_label(years: int) -> str:
 
 def _retro_key(retro: dict) -> str:
     parts = [str(retro.get("years")), retro.get("scope", ""), str(retro.get("dergipark", True)),
-             str(retro.get("crossref", True)), ",".join(sorted(retro.get("groups") or []))]
+             str(retro.get("crossref", True)), ",".join(sorted(retro.get("groups") or [])),
+             str(retro.get("yok", True))]
     return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
@@ -3598,7 +3737,33 @@ class ScanWorker(threading.Thread):
                         break
                 time.sleep(0.3)
 
-        # 3) Kütüphaneye ekleme + açık erişim PDF
+        # 3) YÖK Ulusal Tez Merkezi: yeni tezler (bu yıl ve geçen yıl)
+        if self.settings.get("scan_yok", True) and not self.cancel.is_set():
+            info["sources"].append("YÖK Tez")
+            this_year = now.year
+
+            def recent(rec):
+                y = re.search(r"\d{4}", rec.get("year") or "")
+                return bool(y) and int(y.group(0)) >= this_year - 1
+            queries = yok_queries(matcher, include_context=False)
+            failures = 0
+            for n, query in enumerate(queries, start=1):
+                if self.cancel.is_set():
+                    break
+                self.status(f"YÖK Tez: “{query}” aranıyor ({n}/{len(queries)})")
+                try:
+                    self._collect_yok(query, candidates, matcher, info, recent)
+                    failures = 0
+                    if "YÖK Tez" not in reached:
+                        reached.append("YÖK Tez")
+                except Exception as exc:
+                    failures += 1
+                    info["errors"].append(f"YÖK Tez “{query}”: {describe_error(exc)}")
+                    if failures >= 3:
+                        self.log("warn", "YÖK Tez Merkezi'ne ulaşılamadı; tez taraması atlandı.")
+                        break
+
+        # 4) Kütüphaneye ekleme + açık erişim PDF
         found = []
         self._prepare_downloads(info)
         self._process(session, candidates, found, info, SCAN_MAX_DOWNLOADS, "tarama")
@@ -3653,9 +3818,14 @@ class ScanWorker(threading.Thread):
                 self.events.put(("scan_progress", 0.85 + 0.15 * n / max(total, 1)))
             self.status(f"{label} kütüphaneye ekleniyor ({n}/{total})")
             known = (self.library.find_by_doi(rec.get("doi")) or self.library.find_by_url(rec.get("url"))
-                     or self.library.find_by_title(rec.get("title")))
+                     or self.library.find_by_title(rec.get("title"))
+                     or (rec.get("tez_no") and self.library.find_by_tez_no(rec["tez_no"])))
             if known:
                 found.append({"record": rec, "hits": hits, "status": "known", "item_id": known})
+                continue
+            if rec.get("source") == "YÖK Tez":
+                status, item_id = self._add_thesis(rec, hits, source, max_downloads, info)
+                found.append({"record": rec, "hits": hits, "status": status, "item_id": item_id})
                 continue
             if rec.get("source") == "Crossref" and rec.get("doi"):
                 full = crossref_record(session, rec["doi"])         # cilt, sayı, sayfa, yayınevi
@@ -3691,6 +3861,75 @@ class ScanWorker(threading.Thread):
             else:
                 self.library.update(item_id, {"is_new": 1, "matched": matched})
             found.append({"record": rec, "hits": hits, "status": status, "item_id": item_id})
+
+    def _yok(self):
+        if getattr(self, "yok_session", None) is None:
+            self.yok_session = make_session()
+            yok_open_session(self.yok_session)
+        return self.yok_session
+
+    def _add_thesis(self, rec, hits, source, max_downloads, info):
+        """YÖK tezini kütüphaneye ekler; yazar izin verdiyse PDF'ini indirir."""
+        session = self._yok()
+        try:
+            detail = yok_detail(session, rec["yok_keys"])
+            time.sleep(YOK_PAUSE)
+        except Exception:
+            detail = {}
+        if detail.get("yer"):
+            rec["institution"] = _yok_name(str(detail["yer"]).split("/")[0].strip()) or rec["institution"]
+        record = {k: rec.get(k) for k in RECORD_FIELDS if rec.get(k)}
+        record["keywords"] = join_keywords(yok_keywords(detail.get("anahtarKelimeTr") or detail.get("anahtarKelimeEn")))
+        tags = list(hits)
+        matched = describe_hits(hits)
+        item_id, _ = self.library.add(record, tags=tags, source=source, is_new=True, matched=matched)
+        notes = f"YÖK Tez No: {rec.get('tez_no')}" + (f" · {rec.get('thesis_kind')}" if rec.get("thesis_kind") else "")
+        danisman = _strip_tags(detail.get("danisman") or "")
+        if danisman:
+            notes += f" · {danisman}"
+        self.library.update(item_id, {"notes": notes})
+        abstract = _strip_tags(detail.get("trOzet") or detail.get("enOzet") or "")
+        if abstract:
+            self.library.set_fulltext(item_id, abstract)
+        status = "thesis_closed"
+        if self.library_folder and (max_downloads is None or self.attempts < max_downloads):
+            self.attempts += 1
+            try:
+                url = yok_pdf_url(session, rec["yok_keys"])
+                time.sleep(YOK_PAUSE)
+                if url:
+                    status = "nopdf"
+                    tmp = Path(self.library_folder) / f".yok_{rec.get('tez_no') or item_id}.part"
+                    with session.get(url, stream=True, timeout=(15, 180)) as r:
+                        r.raise_for_status()
+                        with open(tmp, "wb") as fh:
+                            for block in r.iter_content(1 << 16):
+                                fh.write(block)
+                    if tmp.read_bytes()[:1024].find(b"%PDF-") >= 0:
+                        attach_pdf(self.library, item_id, tmp, self.library_folder, move=True)
+                        status = "pdf"
+                    else:
+                        tmp.unlink(missing_ok=True)
+                    time.sleep(YOK_PAUSE)
+            except Exception as exc:
+                info["errors"].append(f"YÖK Tez {rec.get('tez_no')}: {describe_error(exc)}")
+        return status, item_id
+
+    def _collect_yok(self, query, candidates, matcher, info, year_ok=None):
+        for rec in search_yok(self._yok(), query):
+            info["yok"] = info.get("yok", 0) + 1
+            if year_ok and not year_ok(rec):
+                continue
+            strong = " ".join([rec["title"], " ".join(rec["all_titles"]), " ".join(rec["subjects"])])
+            hits = matcher.match("", strong=strong)
+            if hits:
+                k = "yok:" + (rec.get("tez_no") or fold(rec["title"]))
+                if k in candidates:
+                    for g, terms in hits.items():
+                        candidates[k]["hits"].setdefault(g, []).extend(terms)
+                else:
+                    candidates[k] = {"record": rec, "hits": hits}
+        time.sleep(YOK_PAUSE)
 
     # ── geçmişe dönük tarama: 'tüm zamanlar' dahil, kaldığı yerden sürdürülebilir ─────────────
     def _run_retro(self):
@@ -3782,6 +4021,35 @@ class ScanWorker(threading.Thread):
             if not self.cancel.is_set():
                 state["done"].append(chunk_id)
                 save_retro_state(state)
+
+        # 1b) YÖK Ulusal Tez Merkezi: her terimde bulunan bütün tezler (en eskisine kadar)
+        if retro.get("yok", True) and not self.cancel.is_set():
+            info["sources"].append("YÖK Tez")
+            yq = yok_queries(matcher)
+            failures = 0
+            for n, query in enumerate(yq, start=1):
+                if self.cancel.is_set():
+                    break
+                if "yok:" + query in state["done"]:
+                    continue
+                self.status(f"YÖK Tez: “{query}” ({n}/{len(yq)})")
+                candidates = {}
+                try:
+                    self._collect_yok(query, candidates, matcher, info, year_ok)
+                    failures = 0
+                    if "YÖK Tez" not in reached:
+                        reached.append("YÖK Tez")
+                except Exception as exc:
+                    failures += 1
+                    info["errors"].append(f"YÖK Tez “{query}”: {describe_error(exc)}")
+                    if failures >= 3:
+                        self.log("warn", "YÖK Tez Merkezi'ne ulaşılamadı; tez taraması atlandı.")
+                        break
+                    continue
+                self._process(None, candidates, found, info, max_downloads, "geçmiş tarama", "Tezler")
+                if not self.cancel.is_set():
+                    state["done"].append("yok:" + query)
+                    save_retro_state(state)
 
         # 2) Crossref: her terim için tüm zamanlarda en ilgili yayınlar
         if queries and not self.cancel.is_set():
@@ -5787,6 +6055,9 @@ class RetroScanDialog(ctk.CTkToplevel):
         label("Kaynaklar")
         self.use_dp = ctk.BooleanVar(value=True)
         self.use_cr = ctk.BooleanVar(value=True)
+        self.use_yok = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(self, text="YÖK Ulusal Tez Merkezi (bütün yüksek lisans ve doktora tezleri; izinlilerin PDF'i)",
+                        variable=self.use_yok).grid(row=r, column=0, pady=2, **pad); r += 1
         ctk.CTkCheckBox(self, text="Crossref (uluslararası ve DOI'li Türkçe yayınlar, en eskisine kadar)",
                         variable=self.use_cr).grid(row=r, column=0, pady=2, **pad); r += 1
         dp = ctk.CTkFrame(self, fg_color="transparent")
@@ -5831,7 +6102,7 @@ class RetroScanDialog(ctk.CTkToplevel):
     def _collect_options(self) -> dict:
         groups = [n for n, v in self.group_vars.items() if v.get()]
         return {"years": RETRO_PERIODS[self.period.get()], "scope": RETRO_SCOPES[self.scope.get()],
-                "dergipark": self.use_dp.get(), "crossref": self.use_cr.get(),
+                "dergipark": self.use_dp.get(), "crossref": self.use_cr.get(), "yok": self.use_yok.get(),
                 "groups": groups if len(groups) < len(self.group_vars) else [],
                 "max_downloads": RETRO_DOWNLOADS[self.downloads.get()]}
 
@@ -5843,12 +6114,14 @@ class RetroScanDialog(ctk.CTkToplevel):
                           "taranır (birkaç saat).",
                 "tum": "Bütün DergiPark yıl yıl taranır; tüm zamanlar için bir gece sürebilir."}[o["scope"]]
         cr = f" Crossref'te her terim için en ilgili {RETRO_CROSSREF_LIMIT.get(o['years'], 2000)} kayıt incelenir."
+        if o["yok"]:
+            cr += " YÖK'te her terim için bulunan bütün tezler incelenir; eşleşen tezlerin PDF'i iner."
         self.estimate.configure(text=(text if o["dergipark"] else "") + (cr if o["crossref"] else "") +
                                 " Program açık kaldığı sürece arka planda çalışır.")
 
     def _start_new(self):
         o = self._collect_options()
-        if not o["dergipark"] and not o["crossref"]:
+        if not o["dergipark"] and not o["crossref"] and not o["yok"]:
             messagebox.showwarning(APP_NAME, "En az bir kaynak seçin.", parent=self)
             return
         self._start(o)
@@ -6458,6 +6731,13 @@ class LibraryTab:
         item = self.current
         if not item:
             return
+        tez_no = yok_tez_no(item)
+        if tez_no:
+            webbrowser.open_new_tab(yok_open_html(tez_no).as_uri())
+            messagebox.showinfo(APP_NAME, f"Tez, YÖK Tez Merkezi'nde açıldı (Tez No: {tez_no}).\n\nPDF simgesine "
+                                          "tıklayıp indirdiğiniz dosya, İndirilenler klasöründen kendiliğinden bu "
+                                          "kaynağa bağlanır.", parent=self.parent)
+            return
         link = ("https://doi.org/" + item["doi"]) if item["doi"] else item["url"]
         db = database_for_doi(item["doi"])
         if link:
@@ -6735,6 +7015,10 @@ class ScanTab:
                         command=self.app.save_all_settings).grid(row=r, column=0, sticky="w", padx=10, pady=3); r += 1
         ctk.CTkCheckBox(side, text="Crossref (uluslararası, DOI'li yayınlar)", variable=self.src_cr,
                         command=self.app.save_all_settings).grid(row=r, column=0, sticky="w", padx=10, pady=3); r += 1
+        self.src_yok = ctk.BooleanVar(value=s.get("scan_yok", True))
+        ctk.CTkCheckBox(side, text="YÖK Ulusal Tez Merkezi (yeni tezler, izinli olanların PDF'i)",
+                        variable=self.src_yok, command=self.app.save_all_settings).grid(
+            row=r, column=0, sticky="w", padx=10, pady=3); r += 1
         ctk.CTkLabel(side, text="Google Scholar uyarı e-postalarını İndir sekmesine yapıştırırsanız "
                                 "içindeki makaleler de iner ve kütüphaneye girer.", text_color=MUTED,
                      font=ctk.CTkFont(size=12), wraplength=330, justify="left",
@@ -7177,8 +7461,15 @@ class DownloadsWatcher(threading.Thread):
                 sha = file_sha256(path)
                 if self.library.find_by_sha(sha):
                     continue
-                head = pdf_text(path, max_pages=2, max_chars=20_000)
                 target = None
+                if path.stem.isdigit():
+                    target = next((i["id"] for i in missing if yok_tez_no(i) == path.stem), None)
+                    if target:
+                        placed = attach_pdf(self.library, target, path, self.library_folder, move=True)
+                        missing = [i for i in missing if i["id"] != target]
+                        self.events.put(("watch_attached", target, placed.name))
+                        continue
+                head = pdf_text(path, max_pages=2, max_chars=20_000)
                 m = DOI_RE.search(head)
                 if m:
                     found = self.library.find_by_doi(clean_url(m.group(1)))
@@ -7605,6 +7896,7 @@ class App(ctk.CTk):
             current.update({
                 "auto_scan": scan.auto_var.get(), "open_report": scan.open_report_var.get(),
                 "scan_dergipark": scan.src_dp.get(), "scan_crossref": scan.src_cr.get(),
+                "scan_yok": scan.src_yok.get(),
                 "watch_downloads": scan.watch_var.get(), "scan_day": scan.day_menu.get(),
                 "auto_tag": scan.autotag_var.get(), "auto_update": scan.update_var.get(),
                 "scan_hour": scan.hour_menu.get(),
