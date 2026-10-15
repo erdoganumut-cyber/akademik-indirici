@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.1"
+APP_VERSION = "2.1.1"
 
 CHUNK_SIZE = 64 * 1024              # parça parça indirme boyutu (64 KB)
 HTML_READ_LIMIT = 5 * 1024 * 1024   # PDF bağlantısı aramak için okunacak en fazla HTML
@@ -2403,6 +2403,8 @@ def attach_pdf(library, item_id: int, path, library_folder=None, move=True):
 
 DERGIPARK_OAI = "https://dergipark.org.tr/api/public/oai/"
 CROSSREF_SEARCH = "https://api.crossref.org/works"
+CROSSREF_SELECT = ("DOI,title,subtitle,author,editor,container-title,issued,published-print,"
+                   "published-online,type,abstract,subject,URL")
 SCAN_INTERVAL_DAYS = 7
 SCAN_FIRST_WINDOW_DAYS = 7          # ilk taramada geriye dönük bakılacak gün
 SCAN_MAX_OAI_PAGES = 600
@@ -2766,9 +2768,12 @@ def harvest_dergipark(session, since: datetime, until: datetime, progress=None, 
 def search_crossref(session, query: str, since: datetime, rows: int = 100):
     params = {"query.bibliographic": query, "rows": rows,
               "filter": f"from-created-date:{since.strftime('%Y-%m-%d')}",
-              "select": "DOI,title,subtitle,author,editor,container-title,issued,published-print,"
-                        "published-online,type,abstract,subject,language,URL,publisher,volume,issue,page"}
+              # Yalnızca Crossref'in kabul ettiği (denenmiş) alanlar: geçersiz tek bir alan bütün
+              # sorguyu reddettirir. Cilt/sayı/sayfa, eşleşen kayıtlar için ayrıca tam kayıttan alınır.
+              "select": CROSSREF_SELECT}
     r = session.get(CROSSREF_SEARCH, params=params, timeout=(15, 60), headers={"Accept": "application/json"})
+    if r.status_code == 400:
+        raise DownloadError(f"Crossref sorguyu reddetti (HTTP 400): {r.text[:200]}")
     r.raise_for_status()
     out = []
     for msg in (r.json().get("message") or {}).get("items") or []:
@@ -2981,6 +2986,8 @@ class ScanWorker(threading.Thread):
             since = datetime.fromisoformat(last) if last else now - timedelta(days=SCAN_FIRST_WINDOW_DAYS)
         except ValueError:
             since = now - timedelta(days=SCAN_FIRST_WINDOW_DAYS)
+        if self.settings.get("force_days"):                # "Son 7 günü yeniden tara"
+            since = now - timedelta(days=int(self.settings["force_days"]))
         since = max(since, now - timedelta(days=60))       # çok uzun aralar için sınır
         matcher = KeywordMatcher(parse_keyword_groups(load_keywords_text()))
         session = make_session()
@@ -3073,6 +3080,11 @@ class ScanWorker(threading.Thread):
             if known:
                 found.append({"record": rec, "hits": hits, "status": "known", "item_id": known})
                 continue
+            if rec.get("source") == "Crossref" and rec.get("doi"):
+                full = crossref_record(session, rec["doi"])         # cilt, sayı, sayfa, yayınevi
+                if full:
+                    rec = dict(merge_records(full, rec), source="Crossref", url=rec.get("url", ""))
+                    entry["record"] = rec
             tags = list(hits)
             matched = describe_hits(hits)
             status, item_id = "nopdf", None
@@ -4116,9 +4128,14 @@ class ScanTab:
         ctk.CTkButton(rep, text="Son Raporu Aç", width=130, command=self.open_last_report).pack(side="left")
         ctk.CTkButton(rep, text="Rapor Klasörü", width=110, fg_color="transparent", border_width=1,
                       text_color=TEXT, command=self.open_report_folder).pack(side="left", padx=8)
-        ctk.CTkButton(side, text="Tanılama Kaydını Aç", height=26, width=150, fg_color="transparent",
+        extra = ctk.CTkFrame(side, fg_color="transparent")
+        extra.grid(row=r, column=0, sticky="w", padx=10); r += 1
+        ctk.CTkButton(extra, text="Son 7 Günü Yeniden Tara", height=26, width=170, fg_color="transparent",
+                      border_width=1, text_color=TEXT, font=ctk.CTkFont(size=12),
+                      command=self.rescan_week).pack(side="left")
+        ctk.CTkButton(extra, text="Tanılama Kaydını Aç", height=26, width=150, fg_color="transparent",
                       border_width=1, text_color=MUTED, font=ctk.CTkFont(size=12),
-                      command=self.app.open_diagnostics).grid(row=r, column=0, sticky="w", padx=10); r += 1
+                      command=self.app.open_diagnostics).pack(side="left", padx=8)
 
         section("Kendiliğinden çalışma")
         ctk.CTkLabel(side, text="Uygulama açıkken ya da açıldığında son taramanın üzerinden 7 gün "
@@ -4213,7 +4230,12 @@ class ScanTab:
             text = "Henüz tarama yapılmadı. İlk tarama son 7 günü kapsar."
         self.info_label.configure(text=text)
 
-    def start_scan(self, automatic=False):
+    def rescan_week(self):
+        if messagebox.askyesno(APP_NAME, "Son 7 gün baştan taransın mı?\n(Kütüphanede zaten olan yayınlar "
+                                         "yeniden eklenmez.)", parent=self.parent):
+            self.start_scan(force_days=7)
+
+    def start_scan(self, automatic=False, force_days=None):
         if self.worker and self.worker.is_alive():
             return
         unsaved = self.kw_box.get("1.0", "end").rstrip() + "\n"
@@ -4227,7 +4249,10 @@ class ScanTab:
         self.stop_btn.configure(state="normal")
         self.progress.set(0)
         self.status_label.configure(text="Tarama başlıyor…" + (" (açılışta otomatik)" if automatic else ""))
-        self.worker = ScanWorker(self.app.library, load_settings(), self.app.events, self.cancel)
+        settings = load_settings()
+        if force_days:
+            settings["force_days"] = force_days
+        self.worker = ScanWorker(self.app.library, settings, self.app.events, self.cancel)
         self.worker.start()
 
     def stop_scan(self):
