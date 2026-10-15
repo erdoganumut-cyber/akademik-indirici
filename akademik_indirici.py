@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.9"
+APP_VERSION = "2.10"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -2164,6 +2164,7 @@ _EXTRA_COLUMNS = {
     "matched": "TEXT DEFAULT ''",       # taramada eşleşen grup ve kelimeler
     "keywords": "TEXT DEFAULT ''",      # makalenin kendi anahtar kelimeleri ('; ' ile)
     "issn": "TEXT DEFAULT ''",          # derginin ISSN'leri ('1234-5678; 2345-6789'), Scopus eşleştirmesi için
+    "pdf_tried": "TEXT DEFAULT ''",     # PDF'siz kaynak için en son ne zaman PDF arandı (YYYY-AA-GG)
 }
 
 
@@ -2431,7 +2432,7 @@ class Library:
             return item_id, True
 
     def update(self, item_id: int, fields: dict):
-        allowed = set(RECORD_FIELDS) | {"file_path", "sha256", "notes", "is_new", "source", "matched"}
+        allowed = set(RECORD_FIELDS) | {"file_path", "sha256", "notes", "is_new", "source", "matched", "pdf_tried"}
         values = {}
         for key, value in fields.items():
             if key not in allowed:
@@ -3431,7 +3432,8 @@ def write_scan_report(path: Path, info: dict, found: list, added_items: list) ->
     scopus = load_scopus()
     status_label = {"pdf": ("PDF indirildi", "ok"), "nopdf": ("PDF yok", "warn"),
                     "institution": ("Kurum erişimi gerekebilir", "inst"), "known": ("Zaten kütüphanede", "muted"),
-                    "thesis_closed": ("Tez · yazar PDF izni vermemiş", "warn")}
+                    "thesis_closed": ("Tez · yazar PDF izni vermemiş", "warn"),
+                    "pdf_found": ("Kütüphanedeydi · PDF'i şimdi bulundu", "ok")}
 
     def card(entry, group):
         rec = dict(entry["record"])
@@ -3470,8 +3472,8 @@ def write_scan_report(path: Path, info: dict, found: list, added_items: list) ->
         f'{" · PDF var" if i.get("file_path") else " · PDF yok"}</div></li>'
         for i in added_items)
     errors = "".join(f"<li>{_h(e)}</li>" for e in info.get("errors", []))
-    pdf_count = sum(1 for e in found if e["status"] == "pdf")
-    new_count = sum(1 for e in found if e["status"] != "known")
+    pdf_count = sum(1 for e in found if e["status"] in ("pdf", "pdf_found"))
+    new_count = sum(1 for e in found if e["status"] not in ("known", "pdf_found"))
     doc = f"""<!doctype html><html lang="tr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Tarama Raporu {_h(info['until'])}</title>
@@ -3821,7 +3823,10 @@ class ScanWorker(threading.Thread):
                      or self.library.find_by_title(rec.get("title"))
                      or (rec.get("tez_no") and self.library.find_by_tez_no(rec["tez_no"])))
             if known:
-                found.append({"record": rec, "hits": hits, "status": "known", "item_id": known})
+                status = "known"
+                if getattr(self, "retry_missing_pdf", False) and max_downloads != 0:
+                    status = self._retry_pdf(session, rec, known, n, max_downloads, info) or "known"
+                found.append({"record": rec, "hits": hits, "status": status, "item_id": known})
                 continue
             if rec.get("source") == "YÖK Tez":
                 status, item_id = self._add_thesis(rec, hits, source, max_downloads, info)
@@ -3861,6 +3866,55 @@ class ScanWorker(threading.Thread):
             else:
                 self.library.update(item_id, {"is_new": 1, "matched": matched})
             found.append({"record": rec, "hits": hits, "status": status, "item_id": item_id})
+
+    def _retry_pdf(self, session, rec, item_id, n, max_downloads, info):
+        """Kütüphanede PDF'siz duran kaynağın PDF'ini yeniden dener (7 günde en fazla bir kez)."""
+        item = self.library.get(item_id)
+        if not item or (item["file_path"] and os.path.exists(item["file_path"])) or not self.library_folder:
+            return None
+        today = datetime.now().strftime("%Y-%m-%d")
+        if item.get("pdf_tried") and item["pdf_tried"] > (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d"):
+            return None
+        if max_downloads is not None and self.attempts >= max_downloads:
+            return None
+        self.attempts += 1
+        self.library.update(item_id, {"pdf_tried": today})
+        try:
+            if rec.get("source") == "YÖK Tez" and rec.get("yok_keys"):
+                yses = self._yok()
+                url = yok_pdf_url(yses, rec["yok_keys"])
+                time.sleep(YOK_PAUSE)
+                if not url:
+                    return None
+                tmp = Path(self.library_folder) / f".yok_{rec.get('tez_no') or item_id}.part"
+                with yses.get(url, stream=True, timeout=(15, 180)) as r:
+                    r.raise_for_status()
+                    with open(tmp, "wb") as fh:
+                        for block in r.iter_content(1 << 16):
+                            fh.write(block)
+                if tmp.read_bytes()[:1024].find(b"%PDF-") < 0:
+                    tmp.unlink(missing_ok=True)
+                    return None
+                attach_pdf(self.library, item_id, tmp, self.library_folder, move=True)
+                return "pdf_found"
+            doi = rec.get("doi") or item.get("doi")
+            link = ("https://doi.org/" + doi) if doi else (rec.get("url") or item.get("url"))
+            if not link or session is None:
+                return None
+            self.downloader._last_saved = None
+            self.downloader._tried = set()
+            result = self.downloader._download_one(session, link, n)
+            saved = self.downloader._last_saved
+            if result[0] != "ok" or not saved:
+                return None
+            other = self.library.find_by_sha(saved["sha"])
+            if other and other != item_id:                      # bu PDF başka bir kaynağa ait
+                return None
+            attach_pdf(self.library, item_id, saved["path"], self.library_folder, move=True)
+            return "pdf_found"
+        except Exception as exc:
+            info["errors"].append(f"{(item.get('title') or '')[:60]}: {describe_error(exc)}")
+            return None
 
     def _yok(self):
         if getattr(self, "yok_session", None) is None:
@@ -3951,6 +4005,7 @@ class ScanWorker(threading.Thread):
                 "title": f"Geçmişe Dönük Tarama · {period}"}
         found, reached = [], []
         self._prepare_downloads(info)
+        self.retry_missing_pdf = True
 
         def year_ok(rec):
             if not since:
@@ -4083,8 +4138,9 @@ class ScanWorker(threading.Thread):
                     save_retro_state(state)
         session.close()
 
-        new = sum(1 for e in found if e["status"] != "known")
+        new = sum(1 for e in found if e["status"] not in ("known", "pdf_found"))
         pdfs = sum(1 for e in found if e["status"] == "pdf")
+        later = sum(1 for e in found if e["status"] == "pdf_found")
         finished = not self.cancel.is_set() and bool(reached)
         if finished:
             save_retro_state(None)
@@ -4094,7 +4150,8 @@ class ScanWorker(threading.Thread):
         if not reached:
             self.summary = "Hiçbir kaynağa ulaşılamadı (internet bağlantısını kontrol edin)."
         elif finished:
-            self.summary = f"Geçmişe dönük tarama bitti ({period}): {new} yeni kaynak, {pdfs} PDF."
+            self.summary = (f"Geçmişe dönük tarama bitti ({period}): {new} yeni kaynak, {pdfs} PDF"
+                            + (f"; PDF'siz duran {later} kaynağın PDF'i de bulundu." if later else "."))
         else:
             self.summary = (f"Geçmişe dönük tarama durduruldu: şimdiye dek {new} yeni kaynak, {pdfs} PDF. "
                             "Aynı seçeneklerle yeniden başlatınca kaldığı yerden sürer.")
