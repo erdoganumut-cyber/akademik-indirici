@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.10"
+APP_VERSION = "2.11"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -2740,6 +2740,180 @@ def attach_pdf(library, item_id: int, path, library_folder=None, move=True):
     library.update(item_id, {"file_path": str(target), "sha256": sha})
     library.set_fulltext(item_id, pdf_text(target))
     return target
+
+
+# ── Kaynakça içe aktarma: Piri, Google Scholar, Zotero, EndNote... (RIS / BibTeX) ──────
+
+RIS_TYPES = {"JOUR": "article", "JFULL": "article", "MGZN": "article", "NEWS": "article", "EJOUR": "article",
+             "CHAP": "chapter", "ECHAP": "chapter", "BOOK": "book", "EBOOK": "book", "EDBOOK": "book",
+             "THES": "phd", "CONF": "conference", "CPAPER": "conference"}
+BIB_TYPES = {"article": "article", "incollection": "chapter", "inbook": "chapter", "book": "book",
+             "phdthesis": "phd", "mastersthesis": "masters", "inproceedings": "conference",
+             "conference": "conference", "thesis": "phd"}
+
+
+def parse_ris(text: str) -> list:
+    out, cur = [], None
+    for raw in text.splitlines():
+        m = re.match(r"^([A-Z][A-Z0-9])  -\s?(.*)$", raw.rstrip())
+        if not m:
+            continue
+        tag, value = m.group(1), m.group(2).strip()
+        if tag == "TY":
+            cur = {"type": RIS_TYPES.get(value.upper(), "other"), "authors": [], "editors": [], "_kw": [],
+                   "_issn": []}
+            continue
+        if cur is None:
+            continue
+        if tag == "ER":
+            out.append(cur)
+            cur = None
+        elif tag in ("AU", "A1"):
+            p = parse_person(value)
+            if p:
+                cur["authors"].append(p)
+        elif tag in ("A2", "ED", "A3"):
+            p = parse_person(value)
+            if p:
+                cur["editors"].append(p)
+        elif tag in ("TI", "T1") and not cur.get("title"):
+            cur["title"] = value
+        elif tag in ("T2", "JO", "JF", "JA", "BT", "T3") and not cur.get("container"):
+            cur["container"] = value
+        elif tag in ("PY", "Y1", "DA") and not cur.get("year"):
+            cur["year"] = value
+        elif tag == "VL":
+            cur["volume"] = value
+        elif tag == "IS":
+            cur["issue"] = value
+        elif tag == "SP":
+            cur["pages"] = value
+        elif tag == "EP" and cur.get("pages") and value:
+            cur["pages"] = f"{cur['pages']}–{value}"
+        elif tag == "DO":
+            cur["doi"] = value
+        elif tag in ("UR", "L2") and not cur.get("url"):
+            cur["url"] = value
+        elif tag == "PB":
+            cur["publisher"] = value
+        elif tag == "KW":
+            cur["_kw"].extend(split_keywords(value))
+        elif tag == "SN":
+            cur["_issn"].append(value)
+        elif tag in ("AB", "N2") and not cur.get("_abstract"):
+            cur["_abstract"] = value
+        elif tag == "LA":
+            cur["language"] = value
+        elif tag == "M3" and "master" in value.lower() and cur["type"] == "phd":
+            cur["type"] = "masters"
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _bib_value(text: str, i: int):
+    """BibTeX alan değerini okur ({...}, "..." ya da sayı). Dönüş: (değer, yeni konum)"""
+    while i < len(text) and text[i] in " \t\r\n":
+        i += 1
+    if i >= len(text):
+        return "", i
+    if text[i] == "{":
+        depth, j = 0, i
+        while j < len(text):
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[i + 1:j], j + 1
+            j += 1
+        return text[i + 1:], len(text)
+    if text[i] == '"':
+        j = i + 1
+        while j < len(text) and not (text[j] == '"' and text[j - 1] != "\\"):
+            j += 1
+        return text[i + 1:j], j + 1
+    m = re.match(r"[^,}\s]+", text[i:])
+    return (m.group(0), i + m.end()) if m else ("", i)
+
+
+_BIB_ACCENTS = {r"\c{c}": "ç", r"\c{C}": "Ç", r"\c{s}": "ş", r"\c{S}": "Ş", r"\u{g}": "ğ", r"\u{G}": "Ğ",
+                r'\"{o}': "ö", r'\"{O}': "Ö", r'\"{u}': "ü", r'\"{U}': "Ü", r"\i": "ı", r"\.{I}": "İ",
+                r'\"o': "ö", r'\"u': "ü", r"\&": "&"}
+
+
+def _bib_clean(value: str) -> str:
+    for k, v in _BIB_ACCENTS.items():
+        value = value.replace(k, v).replace("{" + k + "}", v)
+    return clean_text(re.sub(r"[{}]", "", value))
+
+
+def parse_bibtex(text: str) -> list:
+    out = []
+    for m in re.finditer(r"@(\w+)\s*\{\s*[^,]*,", text):
+        kind = m.group(1).lower()
+        if kind in ("comment", "string", "preamble"):
+            continue
+        i, fields = m.end(), {}
+        while i < len(text):
+            fm = re.match(r"\s*([A-Za-z][\w-]*)\s*=", text[i:])
+            if not fm:
+                break
+            value, i = _bib_value(text, i + fm.end())
+            fields[fm.group(1).lower()] = _bib_clean(value)
+            while i < len(text) and text[i] in " \t\r\n,":
+                i += 1
+            if i < len(text) and text[i] == "}":
+                break
+        rec = {"type": BIB_TYPES.get(kind, "other"),
+               "authors": [p for p in (parse_person(a) for a in re.split(r"\s+and\s+", fields.get("author", ""))) if p],
+               "editors": [p for p in (parse_person(a) for a in re.split(r"\s+and\s+", fields.get("editor", ""))) if p],
+               "title": fields.get("title", ""),
+               "container": fields.get("journal") or fields.get("booktitle") or fields.get("journaltitle", ""),
+               "year": fields.get("year") or fields.get("date", ""), "volume": fields.get("volume", ""),
+               "issue": fields.get("number") or fields.get("issue", ""), "pages": fields.get("pages", ""),
+               "doi": fields.get("doi", ""), "url": fields.get("url", ""),
+               "publisher": fields.get("publisher", ""), "institution": fields.get("school") or fields.get("institution", ""),
+               "language": fields.get("language", ""), "_kw": split_keywords(fields.get("keywords", "")),
+               "_issn": [fields.get("issn", "")], "_abstract": fields.get("abstract", "")}
+        out.append(rec)
+    return out
+
+
+def read_references(path) -> list:
+    raw = Path(path).read_bytes()
+    text = raw.decode("utf-8-sig", errors="replace")
+    if re.search(r"^TY  -", text, re.M):
+        return parse_ris(text)
+    if re.search(r"@\w+\s*\{", text):
+        return parse_bibtex(text)
+    raise ValueError("Dosya RIS ya da BibTeX biçiminde görünmüyor.")
+
+
+def import_references(library, path, tags=(), auto_tags=None) -> tuple:
+    """Kaynakça dosyasındaki kayıtları kütüphaneye ekler. Dönüş: (eklenen, zaten_olan, toplam)"""
+    records = read_references(path)
+    added = existing = 0
+    for rec in records:
+        if not (rec.get("title") or "").strip():
+            continue
+        abstract = rec.pop("_abstract", "")
+        rec["keywords"] = join_keywords(rec.pop("_kw", []))
+        rec["issn"] = join_issns(rec.pop("_issn", []))
+        known = library.find_by_doi(rec.get("doi")) or library.find_by_title(rec.get("title"))
+        if known:
+            library.add_tags(known, tags)
+            existing += 1
+            continue
+        group_tags = auto_group_tags(rec, abstract[:2500], auto_tags)
+        item_id, created = library.add(rec, tags=list(tags) + group_tags, source="içe aktarma")
+        if created:
+            added += 1
+            if abstract:
+                library.set_fulltext(item_id, abstract)
+        else:
+            existing += 1
+    return added, existing, len(records)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -5970,7 +6144,7 @@ def open_file(path: Path):
         subprocess.Popen(["xdg-open", str(path)])
 
 
-def import_dialog(parent, count, known_tags=()):
+def import_dialog(parent, count, known_tags=(), title=None, show_move=True, unit="PDF"):
     """Kütüphaneye alma seçenekleri. Dönüş: (taşı_mı, etiketler, otomatik_etiket) ya da None."""
     win = ctk.CTkToplevel(parent)
     win.title("Kütüphaneye ekle")
@@ -5980,13 +6154,14 @@ def import_dialog(parent, count, known_tags=()):
     result = [None]
     pad = {"padx": 20, "sticky": "ew"}
     win.grid_columnconfigure(0, weight=1)
-    ctk.CTkLabel(win, text=f"{count} PDF kütüphaneye eklenecek", font=ctk.CTkFont(size=15, weight="bold"),
-                 anchor="w").grid(row=0, column=0, pady=(18, 8), **pad)
+    ctk.CTkLabel(win, text=title or f"{count} {unit} kütüphaneye eklenecek",
+                 font=ctk.CTkFont(size=15, weight="bold"), anchor="w").grid(row=0, column=0, pady=(18, 8), **pad)
     move_var = ctk.StringVar(value="tasi")
-    ctk.CTkRadioButton(win, text="Kütüphane klasörüne taşı (tek klasör, önerilen)", variable=move_var,
-                       value="tasi").grid(row=1, column=0, pady=2, **pad)
-    ctk.CTkRadioButton(win, text="Kopyala, asılları yerinde kalsın", variable=move_var,
-                       value="kopyala").grid(row=2, column=0, pady=2, **pad)
+    if show_move:
+        ctk.CTkRadioButton(win, text="Kütüphane klasörüne taşı (tek klasör, önerilen)", variable=move_var,
+                           value="tasi").grid(row=1, column=0, pady=2, **pad)
+        ctk.CTkRadioButton(win, text="Kopyala, asılları yerinde kalsın", variable=move_var,
+                           value="kopyala").grid(row=2, column=0, pady=2, **pad)
     ctk.CTkLabel(win, text="Etiketler", font=ctk.CTkFont(size=13, weight="bold"), anchor="w").grid(
         row=3, column=0, pady=(14, 2), **pad)
     entry = ctk.CTkEntry(win, height=30, width=460, placeholder_text="Elle etiket (isteğe bağlı, virgülle): "
@@ -6458,6 +6633,8 @@ class LibraryTab:
                       command=lambda: self._bibliography(selected=False)).grid(row=0, column=2, padx=4)
         ctk.CTkButton(bar, text="Dışa Aktar (Jenni / Zotero)…", width=190, fg_color="transparent",
                       border_width=1, text_color=TEXT, command=self._export).grid(row=0, column=3, padx=4)
+        ctk.CTkButton(bar, text="İçe Aktar (Piri / RIS / BibTeX)…", width=210, fg_color="transparent",
+                      border_width=1, text_color=TEXT, command=self._import_refs).grid(row=0, column=4, padx=4)
 
     # ── görünüm ─────────────────────────────────────────────────────────────
     def apply_style(self):
@@ -6620,7 +6797,7 @@ class LibraryTab:
         self.f_type.set(ITEM_TYPES.get(item["type"], "Diğer"))
         info = []
         if item.get("source"):
-            info.append({"tarama": "Haftalık taramadan", "geçmiş tarama": "Geçmişe dönük taramadan", "indirme": "İndiriciden", "klasör": "Klasör taramasından",
+            info.append({"tarama": "Haftalık taramadan", "geçmiş tarama": "Geçmişe dönük taramadan", "içe aktarma": "Kaynakça dosyasından", "indirme": "İndiriciden", "klasör": "Klasör taramasından",
                          "elle": "Elle eklendi"}.get(item["source"], item["source"]))
         if item.get("added"):
             info.append(f"eklendi: {item['added']}")
@@ -6887,6 +7064,37 @@ class LibraryTab:
                                             filetypes=[("PDF", "*.pdf")])
         if paths:
             self._start_import(paths)
+
+    def _import_refs(self):
+        paths = filedialog.askopenfilenames(
+            parent=self.parent, title="Kaynakça dosyası seçin (Piri, Google Akademik, Zotero, EndNote…)",
+            filetypes=[("Kaynakça (RIS, BibTeX)", "*.ris *.bib *.txt *.nbib *.enw"), ("Tüm dosyalar", "*.*")])
+        if not paths:
+            return
+        answer = import_dialog(self.app, len(paths), self.lib.all_tags(), title="Kaynakça içe aktarılacak",
+                               show_move=False, unit="dosya")
+        if answer is None:
+            return
+        _, tags, auto = answer
+        total_added = total_existing = 0
+        errors = []
+        for path in paths:
+            try:
+                added, existing, _ = import_references(self.lib, path, tags, auto)
+                total_added += added
+                total_existing += existing
+            except Exception as exc:
+                diag_exception(f"içe aktarma: {path}")
+                errors.append(f"{Path(path).name}: {exc}")
+        self.refresh()
+        msg = f"{total_added} kaynak eklendi, {total_existing} tanesi zaten kütüphanedeydi."
+        if total_added:
+            msg += ("\n\nEklenenler PDF'siz durur. PDF'i için kaynağı seçip 'Kurum Erişimiyle Aç'a basın; "
+                    "indirdiğiniz PDF İndirilenler'den kendiliğinden bağlanır. Açık erişimli olanların PDF'ini "
+                    "geçmişe dönük tarama da yeniden dener.")
+        if errors:
+            msg += "\n\nOkunamayanlar:\n" + "\n".join(errors)
+        messagebox.showinfo(APP_NAME, msg, parent=self.parent)
 
     def _scan_folder(self):
         folder = filedialog.askdirectory(parent=self.parent, title="PDF'lerin bulunduğu klasörü seçin")
