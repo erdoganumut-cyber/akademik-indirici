@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.12"
+APP_VERSION = "2.13"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -2740,6 +2740,139 @@ def attach_pdf(library, item_id: int, path, library_folder=None, move=True):
     library.update(item_id, {"file_path": str(target), "sha256": sha})
     library.set_fulltext(item_id, pdf_text(target))
     return target
+
+
+# ── Kaydedilmiş web sayfaları (.html): kaynağa çevir, PDF'ini yeniden ara ───────────────
+
+HTML_ARCHIVE_DIR = "Web Sayfaları (eski)"
+_NAME_RE = re.compile(r"^(?P<author>.+?) \((?P<year>\d{4}|t\.y\.)\) - (?P<title>.+)$")
+
+
+def links_from_reports(folder: Path) -> dict:
+    """Klasördeki indirme raporlarından dosya adı → link eşlemesi."""
+    out = {}
+    for report in sorted(Path(folder).glob(REPORT_GLOB)):
+        try:
+            with open(report, encoding="utf-8-sig", newline="") as fh:
+                for row in list(csv.reader(fh, delimiter=";"))[1:]:
+                    if len(row) >= 4 and row[1].startswith("http") and row[3]:
+                        out[row[3]] = row[1]
+        except (OSError, csv.Error, UnicodeDecodeError):
+            continue
+    return out
+
+
+def record_from_html_file(path: Path, link: str = "") -> tuple:
+    """Kaydedilmiş sayfadan künye. Dönüş: (kayıt, meta, sayfa_adresi)"""
+    page = path.read_text(encoding="utf-8", errors="replace")
+    meta = parse_citation_meta(page)
+    m = re.search(r'<link[^>]+rel=["\']canonical["\'][^>]*href=["\']([^"\']+)', page, re.I) or \
+        re.search(r'<meta[^>]+property=["\']og:url["\'][^>]*content=["\']([^"\']+)', page, re.I)
+    url = link or (html.unescape(m.group(1)) if m else "")
+    if not url:                                    # dergi/kitap sistemlerinde makalenin ya da kitabın sayfası
+        m = re.search(r'href=["\'](https?://[^"\']+/(?:article/view|catalog/book|chapter)/[^"\'#?]+)', page, re.I)
+        url = html.unescape(m.group(1)) if m else ""
+    rec = record_from_meta(meta, url)
+    ab = re.search(r'<meta[^>]+name=["\'](?:citation_abstract|dc\.description|description)["\'][^>]*content=["\']([^"\']{80,})',
+                   page, re.I)
+    rec["_abstract"] = _strip_tags(ab.group(1)) if ab else ""
+    nm = _NAME_RE.match(path.stem)
+    if nm:                                         # programın verdiği ad: 'Soyad (Yıl) - Başlık'
+        if not rec.get("title"):
+            rec["title"] = nm.group("title").replace("_", ":").rstrip("…")
+        if not rec.get("authors") and nm.group("author") not in ("Yazarsız", "Anonim"):
+            rec["authors"] = [{"family": nm.group("author").replace(" vd.", ""), "given": ""}]
+        if not rec.get("year") and nm.group("year").isdigit():
+            rec["year"] = nm.group("year")
+    if not rec.get("title"):
+        t = re.search(r"<title[^>]*>(.*?)</title>", page, re.I | re.S)
+        rec["title"] = _strip_tags(t.group(1)) if t else path.stem
+    return rec, meta, url
+
+
+class HtmlImportWorker(threading.Thread):
+    """Klasördeki .html sayfalarını kütüphane kaynağına çevirir, PDF'lerini yeniden arar;
+    sayfaları kütüphane klasöründeki 'Web Sayfaları (eski)' klasörüne taşır.
+    Mesajlar: ("scan", sıra, toplam, ad) · ("html_done", eklenen, pdf_bulunan, zaten_olan)"""
+
+    def __init__(self, paths, library, events, library_folder, email="", tags=(), auto_tags=None):
+        super().__init__(daemon=True)
+        self.paths = [Path(p) for p in paths]
+        self.library, self.events, self.library_folder = library, events, library_folder
+        self.email, self.tags, self.auto_tags = email, list(tags), auto_tags
+        self.cancel = threading.Event()
+
+    def run(self):
+        added = pdfs = existing = 0
+        try:
+            session = make_session()
+            downloader = DownloadWorker([], self.library_folder, {
+                "find_pdf": True, "save_html": False, "email": self.email, "library": None,
+                "library_folder": self.library_folder}, queue.Queue(), self.cancel)
+            reports = {}
+            parsed = []
+            for path in self.paths:
+                folder = path.parent
+                if folder not in reports:
+                    reports[folder] = links_from_reports(folder)
+                try:
+                    parsed.append((path,) + record_from_html_file(path, reports[folder].get(path.name, "")))
+                except OSError:
+                    continue
+            # aynı DOI birden çok sayfada geçiyorsa (dergi sayısının DOI'si gibi) güvenilmez: kullanma
+            counts = {}
+            for _, rec, _, _ in parsed:
+                d = normalize_doi(rec.get("doi"))
+                if d:
+                    counts[d] = counts.get(d, 0) + 1
+            archive = Path(self.library_folder) / HTML_ARCHIVE_DIR
+            for n, (path, rec, meta, url) in enumerate(parsed):
+                self.events.put(("scan", n, len(parsed), path.name))
+                if normalize_doi(rec.get("doi")) and counts.get(normalize_doi(rec["doi"]), 0) > 1:
+                    rec["doi"] = ""
+                    meta.pop("citation_doi", None)
+                    meta.pop("dc.identifier", None)
+                known = self.library.find_by_doi(rec.get("doi")) or self.library.find_by_title(rec.get("title"))
+                if known:
+                    item_id = known
+                    existing += 1
+                    self.library.add_tags(item_id, self.tags)
+                else:
+                    abstract = rec.pop("_abstract", "")
+                    group_tags = auto_group_tags(rec, abstract[:2500], self.auto_tags)
+                    item_id, _ = self.library.add(rec, tags=self.tags + group_tags, source="web sayfası")
+                    if abstract:
+                        self.library.set_fulltext(item_id, abstract)
+                    added += 1
+                item = self.library.get(item_id)
+                if not (item["file_path"] and os.path.exists(item["file_path"])):
+                    links = [meta.get("citation_pdf_url")] + (["https://doi.org/" + rec["doi"]] if rec.get("doi") else []) + [url]
+                    for link in [l for l in links if l and l.startswith("http")]:
+                        try:
+                            downloader._last_saved = None
+                            downloader._tried = set()
+                            result = downloader._download_one(session, link, n)
+                            saved = downloader._last_saved
+                            if result[0] == "ok" and saved and str(saved["path"]).lower().endswith(".pdf"):
+                                other = self.library.find_by_sha(saved["sha"])
+                                if other and other != item_id:
+                                    break
+                                attach_pdf(self.library, item_id, saved["path"], self.library_folder, move=True)
+                                pdfs += 1
+                                break
+                        except Exception:
+                            continue
+                    self.library.update(item_id, {"pdf_tried": datetime.now().strftime("%Y-%m-%d")})
+                try:
+                    archive.mkdir(parents=True, exist_ok=True)
+                    if path.parent.resolve() != archive.resolve():
+                        shutil.move(str(path), str(unique_path(archive, path.name)))
+                except OSError:
+                    pass
+            session.close()
+        except Exception:
+            diag_exception("html sayfaları")
+        self.events.put(("html_done", added, pdfs, existing))
 
 
 # ── Kaynakça içe aktarma: Piri, Google Scholar, Zotero, EndNote... (RIS / BibTeX) ──────
@@ -6998,7 +7131,7 @@ class LibraryTab:
         self.f_type.set(ITEM_TYPES.get(item["type"], "Diğer"))
         info = []
         if item.get("source"):
-            info.append({"tarama": "Haftalık taramadan", "geçmiş tarama": "Geçmişe dönük taramadan", "içe aktarma": "Kaynakça dosyasından", "indirme": "İndiriciden", "klasör": "Klasör taramasından",
+            info.append({"tarama": "Haftalık taramadan", "geçmiş tarama": "Geçmişe dönük taramadan", "içe aktarma": "Kaynakça dosyasından", "web sayfası": "Kaydedilmiş web sayfasından", "indirme": "İndiriciden", "klasör": "Klasör taramasından",
                          "elle": "Elle eklendi"}.get(item["source"], item["source"]))
         if item.get("added"):
             info.append(f"eklendi: {item['added']}")
@@ -7330,14 +7463,38 @@ class LibraryTab:
         folder = filedialog.askdirectory(parent=self.parent, title="PDF'lerin bulunduğu klasörü seçin")
         if not folder:
             return
+        lib_folder = self.app.library_folder()
+        pages = [p for p in sorted(Path(folder).rglob("*.htm*")) if p.suffix.lower() in (".html", ".htm")
+                 and HTML_ARCHIVE_DIR not in p.parts]
+        if pages and messagebox.askyesno(
+                APP_NAME, f"Bu klasörde {len(pages)} kaydedilmiş web sayfası (.html) var.\n\n"
+                          "Bunlar da kaynak olarak kütüphaneye eklensin ve PDF'leri yeniden aransın mı? "
+                          f"Sayfalar kütüphane klasöründeki '{HTML_ARCHIVE_DIR}' klasörüne taşınır.",
+                parent=self.parent):
+            self._start_html(pages)
         paths = sorted(Path(folder).rglob("*.pdf"))
         lib_folder = self.app.library_folder()
         if lib_folder:
             paths = [p for p in paths if Path(lib_folder) not in p.parents]
         if not paths:
-            messagebox.showinfo(APP_NAME, "Bu klasörde (kütüphane klasörü dışında) PDF bulunamadı.", parent=self.parent)
+            if not pages:
+                messagebox.showinfo(APP_NAME, "Bu klasörde (kütüphane klasörü dışında) PDF bulunamadı.",
+                                    parent=self.parent)
             return
         self._start_import(paths, report_folders=[folder])
+
+    def _start_html(self, pages):
+        if not self.app.library_folder():
+            self.app.choose_library_folder()
+            if not self.app.library_folder():
+                return
+        answer = import_dialog(self.app, len(pages), self.lib.all_tags(), show_move=False, unit="web sayfası")
+        if answer is None:
+            return
+        _, tags, auto = answer
+        self.count_label.configure(text=f"{len(pages)} web sayfası işleniyor…")
+        HtmlImportWorker(pages, self.lib, self.app.events, self.app.library_folder(),
+                         email=self.app.email_entry.get().strip(), tags=tags, auto_tags=auto).start()
 
     def _start_import(self, paths, report_folders=()):
         answer = import_dialog(self.app, len(paths), self.lib.all_tags())
@@ -8733,6 +8890,13 @@ class App(ctk.CTk):
         elif kind == "done":
             self._finish(*message[1:])
             self.library_tab.refresh()
+        elif kind == "html_done":
+            added, pdfs, existing = message[1:]
+            self.library_tab.refresh()
+            self.toast(f"Web sayfaları: {added} kaynak eklendi, {pdfs} tanesinin PDF'i bulundu, "
+                       f"{existing} tanesi zaten vardı.")
+            self._log("success", f"Web sayfaları kütüphaneye işlendi: {added} yeni, {pdfs} PDF, {existing} zaten vardı. "
+                                 "PDF'i bulunamayanlar için Kütüphanem → 'PDF'sizleri Sırayla Aç'.")
         elif kind == "scopus":
             self.scan_tab.on_scopus(message[1], message[2])
             if message[1] in ("done", "error"):
