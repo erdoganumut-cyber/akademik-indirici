@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.11"
+APP_VERSION = "2.12"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -6125,6 +6125,26 @@ def open_in_file_manager(path: Path):
         subprocess.Popen(["xdg-open", str(path)])
 
 
+def downloads_folder() -> Path:
+    """Tarayıcının PDF'leri kaydettiği klasör (ayarlardan değiştirilebilir)."""
+    custom = _load_settings_raw().get("downloads_folder")
+    if custom and os.path.isdir(custom):
+        return Path(custom)
+    return Path.home() / "Downloads"
+
+
+def item_open_link(item) -> str:
+    """Kaynağın PDF'ine ulaşılacak sayfa: DOI, link, YÖK tezi ya da başlıkla Google Akademik araması."""
+    if item.get("doi"):
+        return "https://doi.org/" + item["doi"]
+    if item.get("url"):
+        return item["url"]
+    tez = yok_tez_no(item)
+    if tez:
+        return yok_open_html(tez).as_uri()
+    return "https://scholar.google.com/scholar?q=" + quote(f'"{item.get("title", "")}"')
+
+
 def default_library_dir() -> Path:
     docs = Path.home() / "Documents"
     return (docs if docs.is_dir() else Path.home()) / "Akademik Kütüphanem"
@@ -6245,6 +6265,185 @@ def add_italic_tag(textbox):
         inner.tag_configure("i", font=(actual["family"], actual["size"], "italic"))
     except Exception:
         inner.tag_configure("i", font=("TkDefaultFont", 10, "italic"))
+
+
+class PdfQueuePanel(ctk.CTkToplevel):
+    """PDF'siz kaynakları sırayla tarayıcıda açar; İndirilenler'e düşen PDF'i o kaynağa bağlayıp
+    bir sonrakine geçer. Her indirmeyi kullanıcı kendisi tıklar."""
+
+    POLL_MS = 1500
+
+    def __init__(self, app, items):
+        super().__init__(app)
+        self.app, self.items = app, items
+        self.index, self.attached, self.skipped = -1, 0, 0
+        self.pending = None                        # eşleşmeyen PDF: kullanıcıya soruluyor
+        self.folder = downloads_folder()
+        self.seen = self._snapshot()
+        self.sizes = {}
+        self.title("PDF'sizleri sırayla aç")
+        set_window_icon(self, delay=260)
+        self.attributes("-topmost", True)
+        self.resizable(False, False)
+        self.grid_columnconfigure(0, weight=1)
+        pad = {"padx": 16, "sticky": "ew"}
+        self.counter = ctk.CTkLabel(self, text="", font=ctk.CTkFont(size=13, weight="bold"), anchor="w")
+        self.counter.grid(row=0, column=0, pady=(14, 2), **pad)
+        self.item_label = ctk.CTkLabel(self, text="", anchor="w", justify="left", wraplength=420)
+        self.item_label.grid(row=1, column=0, **pad)
+        self.status = ctk.CTkLabel(self, text="", text_color=MUTED, anchor="w", justify="left", wraplength=420,
+                                   font=ctk.CTkFont(size=12))
+        self.status.grid(row=2, column=0, pady=(6, 0), **pad)
+        self.ask = ctk.CTkFrame(self, fg_color="transparent")
+        self.ask.grid(row=3, column=0, **pad)
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.grid(row=4, column=0, pady=12, **pad)
+        ctk.CTkButton(btns, text="Sayfayı Yeniden Aç", width=140, command=self.open_current).pack(side="left")
+        ctk.CTkButton(btns, text="Atla", width=70, fg_color="transparent", border_width=1, text_color=TEXT,
+                      command=self.skip).pack(side="left", padx=6)
+        ctk.CTkButton(btns, text="Bitir", width=70, fg_color="transparent", border_width=1, text_color=TEXT,
+                      command=self.finish).pack(side="left")
+        self.folder_label = ctk.CTkLabel(self, text="", text_color=MUTED, anchor="w", font=ctk.CTkFont(size=11),
+                                         wraplength=420, justify="left")
+        self.folder_label.grid(row=5, column=0, **pad)
+        ctk.CTkButton(self, text="İzlenen klasörü değiştir…", height=24, width=170, fg_color="transparent",
+                      text_color=MUTED, font=ctk.CTkFont(size=11), command=self.change_folder).grid(
+            row=6, column=0, padx=16, pady=(0, 12), sticky="w")
+        self._show_folder()
+        self.protocol("WM_DELETE_WINDOW", self.finish)
+        self.after(80, self._place)
+        self.next_item()
+        self.after(self.POLL_MS, self.poll)
+
+    def _place(self):
+        self.update_idletasks()
+        x = self.winfo_screenwidth() - self.winfo_width() - 30
+        y = self.winfo_screenheight() - self.winfo_height() - 80
+        self.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+    def _show_folder(self):
+        self.folder_label.configure(text=f"İzlenen klasör: {self.folder}")
+
+    def change_folder(self):
+        path = filedialog.askdirectory(parent=self, title="Tarayıcının PDF kaydettiği klasör")
+        if path:
+            current = _load_settings_raw()
+            current["downloads_folder"] = os.path.normpath(path)
+            save_settings(current)
+            self.folder = Path(path)
+            self.seen = self._snapshot()
+            self._show_folder()
+
+    def _snapshot(self) -> set:
+        try:
+            return {p.name for p in self.folder.glob("*.pdf")}
+        except OSError:
+            return set()
+
+    @property
+    def current(self):
+        return self.items[self.index] if 0 <= self.index < len(self.items) else None
+
+    def next_item(self):
+        self._clear_ask()
+        self.index += 1
+        if self.index >= len(self.items):
+            self.counter.configure(text="Bitti")
+            self.item_label.configure(text=f"{self.attached} kaynağın PDF'i bağlandı, {self.skipped} kaynak atlandı.")
+            self.status.configure(text="Pencereyi kapatabilirsiniz.")
+            return
+        self.open_current()
+
+    def open_current(self):
+        item = self.current
+        if not item:
+            return
+        self.counter.configure(text=f"{self.index + 1} / {len(self.items)} · {self.attached} PDF bağlandı")
+        who = first_author_label(item)
+        self.item_label.configure(text=f"{who + ' ' if who else ''}({item['year'] or 't.y.'}). {shorten(item['title'], 140)}")
+        db = database_for_doi(item.get("doi") or "")
+        self.status.configure(text="Sayfa tarayıcıda açıldı. PDF'i indirin; dosya İndirilenler'e düşünce bu kaynağa "
+                                   "bağlanıp bir sonraki açılacak." + (f"\nKampüs dışındaysanız: VETİS → {db}." if db else ""),
+                              text_color=MUTED)
+        webbrowser.open_new_tab(item_open_link(item))
+
+    def skip(self):
+        item = self.current
+        if item:
+            self.app.library.update(item["id"], {"pdf_tried": datetime.now().strftime("%Y-%m-%d")})
+            self.skipped += 1
+        self.next_item()
+
+    def finish(self):
+        self.app.pdf_queue = None
+        self.app.library_tab.refresh()
+        self.destroy()
+
+    def _clear_ask(self):
+        self.pending = None
+        for w in self.ask.winfo_children():
+            w.destroy()
+
+    def poll(self):
+        if not self.winfo_exists():
+            return
+        try:
+            if self.current and self.pending is None:
+                for path in sorted(self.folder.glob("*.pdf"), key=lambda p: p.stat().st_mtime):
+                    if path.name in self.seen:
+                        continue
+                    size = path.stat().st_size
+                    if self.sizes.get(path.name) != size or size == 0:      # indirme sürüyor olabilir
+                        self.sizes[path.name] = size
+                        continue
+                    self.seen.add(path.name)
+                    self._handle(path)
+                    break
+        except Exception:
+            diag_exception("sırayla açma")
+        self.after(self.POLL_MS, self.poll)
+
+    def _matches(self, item, path) -> bool:
+        if path.stem.isdigit() and yok_tez_no(item) == path.stem:
+            return True
+        head = pdf_text(path, max_pages=2, max_chars=20_000)
+        m = DOI_RE.search(head)
+        if m and item.get("doi") and normalize_doi(clean_url(m.group(1))) == normalize_doi(item["doi"]):
+            return True
+        return title_matches_text(item["title"], head)
+
+    def _handle(self, path):
+        item = self.current
+        if self.app.library.find_by_sha(file_sha256(path)):
+            self.status.configure(text=f"{path.name} zaten kütüphanede; yok sayıldı.", text_color=LOG_COLORS["warn"])
+            return
+        if self._matches(item, path):
+            self._attach(path)
+            return
+        self.pending = path
+        self.status.configure(text=f"İnen dosyanın ({path.name}) başlığı bu kaynakla eşleşmedi.",
+                              text_color=LOG_COLORS["warn"])
+        ctk.CTkButton(self.ask, text="Yine de bu kaynağa bağla", width=180,
+                      command=lambda: self._attach(path)).pack(side="left")
+        ctk.CTkButton(self.ask, text="Bu dosyayı yok say", width=140, fg_color="transparent", border_width=1,
+                      text_color=TEXT, command=self._ignore).pack(side="left", padx=6)
+
+    def _ignore(self):
+        self._clear_ask()
+        self.status.configure(text="Dosya yok sayıldı. Doğru PDF'i indirin ya da 'Atla'ya basın.", text_color=MUTED)
+
+    def _attach(self, path):
+        item = self.current
+        try:
+            placed = attach_pdf(self.app.library, item["id"], path, self.app.library_folder(), move=True)
+        except OSError as exc:
+            self.status.configure(text=f"Dosya taşınamadı: {exc}", text_color=LOG_COLORS["error"])
+            return
+        self.attached += 1
+        self.app.library_tab.refresh()
+        self.status.configure(text=f"✓ Bağlandı: {placed.name}", text_color=LOG_COLORS["success"])
+        self._clear_ask()
+        self.after(1200, self.next_item)
 
 
 class RetroScanDialog(ctk.CTkToplevel):
@@ -6483,6 +6682,8 @@ class LibraryTab:
         self.autotag_btn = ctk.CTkButton(bar, text="Otomatik Etiketle", width=130, fg_color="transparent",
                                          border_width=1, text_color=TEXT, command=self._autotag)
         self.autotag_btn.grid(row=0, column=6, padx=(8, 0))
+        ctk.CTkButton(bar, text="PDF'sizleri Sırayla Aç", width=160, fg_color="#1F6F8B", hover_color="#185A71",
+                      command=self._open_queue).grid(row=0, column=7, padx=(8, 0))
 
     def _build_table(self):
         from tkinter import ttk
@@ -7064,6 +7265,35 @@ class LibraryTab:
                                             filetypes=[("PDF", "*.pdf")])
         if paths:
             self._start_import(paths)
+
+    def _open_queue(self):
+        """Seçili (ya da listede görünen) PDF'siz kaynakları sırayla açar."""
+        if getattr(self.app, "pdf_queue", None) is not None and self.app.pdf_queue.winfo_exists():
+            self.app.pdf_queue.lift()
+            return
+        if not self.app.library_folder():
+            self.app.choose_library_folder()
+            if not self.app.library_folder():
+                return
+        chosen = self.selected_items()
+        pool = chosen if len(chosen) > 1 else [self.by_id[int(i)] for i in self.tree.get_children()
+                                                if int(i) in self.by_id]
+        items = [i for i in pool if not (i["file_path"] and os.path.exists(i["file_path"]))]
+        today = datetime.now().strftime("%Y-%m-%d")
+        items.sort(key=lambda i: (i.get("pdf_tried") or "") == today)      # bugün atlananlar sona
+        if not items:
+            messagebox.showinfo(APP_NAME, "Listede PDF'i olmayan kaynak yok.\n\nİpucu: durum menüsünden "
+                                          "'PDF'i olmayanlar'ı seçip etiketle daraltabilirsiniz.", parent=self.parent)
+            return
+        if not messagebox.askokcancel(
+                APP_NAME, f"{len(items)} PDF'siz kaynak sırayla tarayıcıda açılacak.\n\n"
+                          "Her sayfada PDF'i indirin; program dosyayı İndirilenler klasöründen alıp kaynağa "
+                          "bağlar ve bir sonrakini açar. Kampüs ağında giriş gerekmez; kampüs dışındaysanız "
+                          "tarayıcıda önce VETİS ile giriş yapın.\n\n"
+                          "Listeyi daraltmak için önce durum menüsünden 'PDF'i olmayanlar' ve bir etiket "
+                          "seçebilir ya da tablodan birkaç kaynak seçebilirsiniz.", parent=self.parent):
+            return
+        self.app.pdf_queue = PdfQueuePanel(self.app, items)
 
     def _import_refs(self):
         paths = filedialog.askopenfilenames(
@@ -8243,9 +8473,10 @@ class App(ctk.CTk):
 
     def _watch_downloads(self):
         try:
-            if (self.settings.get("watch_downloads", True) and self.library_folder()
+            queue_open = getattr(self, "pdf_queue", None) is not None and self.pdf_queue.winfo_exists()
+            if (self.settings.get("watch_downloads", True) and self.library_folder() and not queue_open
                     and not (self.watcher and self.watcher.is_alive())):
-                downloads = Path.home() / "Downloads"
+                downloads = downloads_folder()
                 if downloads.is_dir():
                     since = max(self.settings.get("watch_since", 0) or 0, self.started - 3600)
                     self.watcher = DownloadsWatcher(self.library, downloads, since,
