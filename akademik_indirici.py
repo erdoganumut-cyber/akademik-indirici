@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.13"
+APP_VERSION = "2.14"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -6896,7 +6896,7 @@ class LibraryTab:
         self.open_btn.grid(row=0, column=1, sticky="ew", padx=2, pady=2)
         self.show_btn = ctk.CTkButton(btns, text="Klasörde Göster", command=self._show_pdf, **small, **outline)
         self.show_btn.grid(row=0, column=2, sticky="ew", padx=2, pady=2)
-        self.inst_btn = ctk.CTkButton(btns, text="Kurum Erişimiyle Aç", command=self._open_institution,
+        self.inst_btn = ctk.CTkButton(btns, text="Makaleyi Aç", command=self._open_institution,
                                       **small, **outline)
         self.inst_btn.grid(row=1, column=0, sticky="ew", padx=2, pady=2)
         self.attach_btn = ctk.CTkButton(btns, text="PDF Bağla…", command=self._attach_pdf, **small, **outline)
@@ -6910,7 +6910,10 @@ class LibraryTab:
         self.remove_btn = ctk.CTkButton(btns, text="Kütüphaneden Çıkar", command=self._remove,
                                         fg_color="transparent", border_width=1, text_color="#C9353A",
                                         border_color="#C9353A", **small)
-        self.remove_btn.grid(row=2, column=1, columnspan=2, sticky="ew", padx=2, pady=2)
+        self.remove_btn.grid(row=2, column=2, sticky="ew", padx=2, pady=2)
+        self.vetis_btn = ctk.CTkButton(btns, text="VETİS (kampüs dışı)", command=self._open_vetis,
+                                       **small, **outline)
+        self.vetis_btn.grid(row=2, column=1, sticky="ew", padx=2, pady=2)
 
     def _build_cards_tab(self, tab):
         tab.grid_columnconfigure(0, weight=1)
@@ -7094,6 +7097,8 @@ class LibraryTab:
         for btn in (self.save_btn, self.crossref_btn, self.attach_btn, self.inst_btn, self.reviewed_btn,
                     self.remove_btn, self.card_save):
             btn.configure(state=state)
+        db = database_for_doi(item["doi"]) if item else ""
+        self.vetis_btn.configure(text=f"VETİS → {db}" if db else "VETİS (kampüs dışı)")
         if multiple:
             self.remove_btn.configure(state="normal")
             self.reviewed_btn.configure(state="normal")
@@ -7296,29 +7301,26 @@ class LibraryTab:
             show_in_file_manager(Path(item["file_path"]))
 
     def _open_institution(self):
+        """Makalenin (ya da tezin) sayfasını açar; soru sormaz."""
         item = self.current
         if not item:
             return
-        tez_no = yok_tez_no(item)
-        if tez_no:
-            webbrowser.open_new_tab(yok_open_html(tez_no).as_uri())
-            messagebox.showinfo(APP_NAME, f"Tez, YÖK Tez Merkezi'nde açıldı (Tez No: {tez_no}).\n\nPDF simgesine "
-                                          "tıklayıp indirdiğiniz dosya, İndirilenler klasöründen kendiliğinden bu "
-                                          "kaynağa bağlanır.", parent=self.parent)
-            return
-        link = ("https://doi.org/" + item["doi"]) if item["doi"] else item["url"]
-        db = database_for_doi(item["doi"])
-        if link:
-            webbrowser.open_new_tab(link)
+        webbrowser.open_new_tab(item_open_link(item))
+        if yok_tez_no(item):
+            note = "Tez, YÖK Tez Merkezi'nde açıldı. PDF simgesine tıklayın"
+        else:
+            db = database_for_doi(item["doi"])
+            note = "Makale açıldı. PDF'i indirin" + (f" (kampüs dışındaysanız 'VETİS → {db}')" if db else "")
+        self.app.toast(note + "; dosya bu kaynağa kendiliğinden bağlanır.")
+
+    def _open_vetis(self):
+        """Kampüs dışından erişim için kurum erişim sayfasını açar."""
         portal = self.app.settings.get("institution_url") or DEFAULT_INSTITUTION_URL
-        msg = ("Makale tarayıcıda açıldı. Kampüs ağındaysanız doğrudan PDF'i indirebilirsiniz.\n\n"
-               "Kampüs dışındaysanız kurum erişim sayfasında (VETİS) giriş yapıp "
-               + (f"listeden “{db}” veritabanını açın ve makaleyi orada arayın."
-                  if db else "ilgili veritabanını açıp makaleyi orada arayın.")
-               + "\n\nİndirdiğiniz PDF, İndirilenler klasörünüzden kendiliğinden bu kaynağa bağlanır.\n\n"
-               "Kurum erişim sayfası da açılsın mı?")
-        if messagebox.askyesno(APP_NAME, msg, parent=self.parent):
-            webbrowser.open_new_tab(portal)
+        webbrowser.open_new_tab(portal)
+        item = self.current
+        db = database_for_doi(item["doi"]) if item else ""
+        self.app.toast("VETİS açıldı. Giriş yapıp " + (f"“{db}” veritabanında" if db else "ilgili veritabanında")
+                       + " makaleyi arayın; indirdiğiniz PDF bu kaynağa kendiliğinden bağlanır.")
 
     def _attach_pdf(self):
         item = self.current
@@ -7452,7 +7454,7 @@ class LibraryTab:
         self.refresh()
         msg = f"{total_added} kaynak eklendi, {total_existing} tanesi zaten kütüphanedeydi."
         if total_added:
-            msg += ("\n\nEklenenler PDF'siz durur. PDF'i için kaynağı seçip 'Kurum Erişimiyle Aç'a basın; "
+            msg += ("\n\nEklenenler PDF'siz durur. PDF'i için kaynağı seçip 'Makaleyi Aç'a basın (ya da 'PDF'sizleri Sırayla Aç'ı kullanın); "
                     "indirdiğiniz PDF İndirilenler'den kendiliğinden bağlanır. Açık erişimli olanların PDF'ini "
                     "geçmişe dönük tarama da yeniden dener.")
         if errors:
