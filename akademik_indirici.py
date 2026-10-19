@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.14"
+APP_VERSION = "2.15"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -6258,12 +6258,47 @@ def open_in_file_manager(path: Path):
         subprocess.Popen(["xdg-open", str(path)])
 
 
-def downloads_folder() -> Path:
-    """Tarayıcının PDF'leri kaydettiği klasör (ayarlardan değiştirilebilir)."""
+def _windows_downloads():
+    """Windows'un gerçek İndirilenler klasörü (OneDrive'a ya da başka sürücüye taşınmış olabilir)."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        import uuid as _uuid
+
+        class GUID(ctypes.Structure):
+            _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD), ("Data3", wintypes.WORD),
+                        ("Data4", ctypes.c_ubyte * 8)]
+        u = _uuid.UUID("{374DE290-123F-4565-9164-39C4925E467B}")       # FOLDERID_Downloads
+        guid = GUID(u.fields[0], u.fields[1], u.fields[2],
+                    (ctypes.c_ubyte * 8).from_buffer_copy(u.bytes[8:]))
+        out = ctypes.c_wchar_p()
+        if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None, ctypes.byref(out)) != 0:
+            return None
+        path = out.value
+        ctypes.windll.ole32.CoTaskMemFree(out)
+        return Path(path) if path else None
+    except Exception:
+        return None
+
+
+def downloads_folders() -> list:
+    """İzlenecek indirme klasörleri: ayarda seçilen ya da Windows'un İndirilenler klasörü
+    (OneDrive'a taşınmışsa o) ve ev klasöründeki Downloads."""
     custom = _load_settings_raw().get("downloads_folder")
     if custom and os.path.isdir(custom):
-        return Path(custom)
-    return Path.home() / "Downloads"
+        return [Path(custom)]
+    out = []
+    for p in (_windows_downloads(), Path.home() / "Downloads", Path.home() / "OneDrive" / "Downloads",
+              Path.home() / "OneDrive" / "İndirilenler"):
+        if p and p.is_dir() and all(os.path.normcase(str(p)) != os.path.normcase(str(q)) for q in out):
+            out.append(p)
+    return out or [Path.home() / "Downloads"]
+
+
+def downloads_folder() -> Path:
+    return downloads_folders()[0]
 
 
 def item_open_link(item) -> str:
@@ -6411,7 +6446,7 @@ class PdfQueuePanel(ctk.CTkToplevel):
         self.app, self.items = app, items
         self.index, self.attached, self.skipped = -1, 0, 0
         self.pending = None                        # eşleşmeyen PDF: kullanıcıya soruluyor
-        self.folder = downloads_folder()
+        self.folders = downloads_folders()
         self.seen = self._snapshot()
         self.sizes = {}
         self.title("PDF'sizleri sırayla aç")
@@ -6455,7 +6490,7 @@ class PdfQueuePanel(ctk.CTkToplevel):
         self.geometry(f"+{max(0, x)}+{max(0, y)}")
 
     def _show_folder(self):
-        self.folder_label.configure(text=f"İzlenen klasör: {self.folder}")
+        self.folder_label.configure(text="İzlenen klasör: " + " · ".join(str(f) for f in self.folders))
 
     def change_folder(self):
         path = filedialog.askdirectory(parent=self, title="Tarayıcının PDF kaydettiği klasör")
@@ -6463,15 +6498,18 @@ class PdfQueuePanel(ctk.CTkToplevel):
             current = _load_settings_raw()
             current["downloads_folder"] = os.path.normpath(path)
             save_settings(current)
-            self.folder = Path(path)
+            self.folders = [Path(path)]
             self.seen = self._snapshot()
             self._show_folder()
 
     def _snapshot(self) -> set:
-        try:
-            return {p.name for p in self.folder.glob("*.pdf")}
-        except OSError:
-            return set()
+        out = set()
+        for folder in self.folders:
+            try:
+                out |= {str(p) for p in folder.glob("*.pdf")}
+            except OSError:
+                pass
+        return out
 
     @property
     def current(self):
@@ -6522,14 +6560,15 @@ class PdfQueuePanel(ctk.CTkToplevel):
             return
         try:
             if self.current and self.pending is None:
-                for path in sorted(self.folder.glob("*.pdf"), key=lambda p: p.stat().st_mtime):
-                    if path.name in self.seen:
+                found = [p for folder in self.folders if folder.is_dir() for p in folder.glob("*.pdf")]
+                for path in sorted(found, key=lambda p: p.stat().st_mtime):
+                    if str(path) in self.seen:
                         continue
                     size = path.stat().st_size
-                    if self.sizes.get(path.name) != size or size == 0:      # indirme sürüyor olabilir
-                        self.sizes[path.name] = size
+                    if self.sizes.get(str(path)) != size or size == 0:      # indirme sürüyor olabilir
+                        self.sizes[str(path)] = size
                         continue
-                    self.seen.add(path.name)
+                    self.seen.add(str(path))
                     self._handle(path)
                     break
         except Exception:
@@ -7739,6 +7778,16 @@ class ScanTab:
         ctk.CTkCheckBox(side, text="İndirilenler klasörünü izle (indirdiğim PDF'i doğru kaynağa bağla)",
                         variable=self.watch_var, command=self.app.save_all_settings).grid(
             row=r, column=0, sticky="w", padx=10, pady=(8, 3)); r += 1
+        dlf = ctk.CTkFrame(side, fg_color="transparent")
+        dlf.grid(row=r, column=0, sticky="ew", padx=10); r += 1
+        dlf.grid_columnconfigure(0, weight=1)
+        self.dl_label = ctk.CTkLabel(dlf, text="", text_color=MUTED, font=ctk.CTkFont(size=11), anchor="w",
+                                     justify="left", wraplength=260)
+        self.dl_label.grid(row=0, column=0, sticky="ew")
+        ctk.CTkButton(dlf, text="Değiştir…", width=80, height=24, font=ctk.CTkFont(size=11),
+                      fg_color="transparent", border_width=1, text_color=TEXT,
+                      command=self.change_downloads).grid(row=0, column=1, padx=(6, 0))
+        self.refresh_downloads_label()
         ctk.CTkLabel(side, text="Kurum erişim sayfası", font=ctk.CTkFont(size=12), text_color=MUTED,
                      anchor="w").grid(row=r, column=0, sticky="ew", padx=10, pady=(6, 0)); r += 1
         self.inst_entry = ctk.CTkEntry(side, height=30)
@@ -7853,6 +7902,21 @@ class ScanTab:
         folder = Path(self.app.library_folder() or settings_path().parent) / "Tarama Raporları"
         folder.mkdir(parents=True, exist_ok=True)
         open_in_file_manager(folder)
+
+    # ── indirme klasörü ─────────────────────────────────────────────────────
+    def refresh_downloads_label(self):
+        self.dl_label.configure(text="İzlenen: " + " · ".join(str(f) for f in downloads_folders()))
+
+    def change_downloads(self):
+        path = filedialog.askdirectory(parent=self.parent, title="Tarayıcının PDF'leri kaydettiği klasör")
+        if not path:
+            return
+        current = _load_settings_raw()
+        current["downloads_folder"] = os.path.normpath(path)
+        save_settings(current)
+        self.app.settings = load_settings()
+        self.refresh_downloads_label()
+        self.app.toast("İndirme klasörü kaydedildi.")
 
     # ── ortak kütüphane ─────────────────────────────────────────────────────
     def refresh_sync_label(self):
@@ -8093,7 +8157,7 @@ class DownloadsWatcher(threading.Thread):
     def __init__(self, library, folder, since: float, library_folder, events):
         super().__init__(daemon=True)
         self.library = library
-        self.folder = Path(folder)
+        self.folders = [Path(f) for f in (folder if isinstance(folder, (list, tuple)) else [folder])]
         self.since = since
         self.library_folder = library_folder
         self.events = events
@@ -8101,7 +8165,7 @@ class DownloadsWatcher(threading.Thread):
 
     def run(self):
         try:
-            candidates = [p for p in self.folder.glob("*.pdf")
+            candidates = [p for folder in self.folders for p in folder.glob("*.pdf")
                           if p.is_file() and self.since < p.stat().st_mtime < time.time() - 5]
         except OSError:
             candidates = []
@@ -8138,7 +8202,10 @@ class DownloadsWatcher(threading.Thread):
                     placed = attach_pdf(self.library, target, path, self.library_folder, move=True)
                     missing = [i for i in missing if i["id"] != target]
                     self.events.put(("watch_attached", target, placed.name))
+                elif (DOI_RE.search(head) or len(head) > 500) and missing:   # akademik PDF ama eşleşmedi
+                    self.events.put(("watch_unmatched", path.name))
             except Exception:
+                diag_exception(f"indirilenler izleyicisi: {path.name}")
                 continue
         self.events.put(("watch_done", self.newest))
 
@@ -8635,10 +8702,10 @@ class App(ctk.CTk):
             queue_open = getattr(self, "pdf_queue", None) is not None and self.pdf_queue.winfo_exists()
             if (self.settings.get("watch_downloads", True) and self.library_folder() and not queue_open
                     and not (self.watcher and self.watcher.is_alive())):
-                downloads = downloads_folder()
-                if downloads.is_dir():
+                folders = [f for f in downloads_folders() if f.is_dir()]
+                if folders:
                     since = max(self.settings.get("watch_since", 0) or 0, self.started - 3600)
-                    self.watcher = DownloadsWatcher(self.library, downloads, since,
+                    self.watcher = DownloadsWatcher(self.library, folders, since,
                                                     self.library_folder(), self.events)
                     self.watcher.start()
         finally:
@@ -8922,6 +8989,12 @@ class App(ctk.CTk):
             item_id, name = message[1:]
             self.library_tab.refresh()
             self.toast(f"İndirilen PDF kütüphanedeki kaynağına bağlandı: {shorten(name, 60)}")
+        elif kind == "watch_unmatched":
+            name = message[1]
+            self.toast(f"İndirilenler'deki “{shorten(name, 40)}” hiçbir PDF'siz kaynakla eşleşmedi — "
+                       "kaynağı seçip 'PDF Bağla…' ile bağlayın.")
+            self._log("warn", f"İndirilen {name} kütüphanedeki bir kaynakla otomatik eşleşmedi. Kütüphanem'de "
+                              "kaynağı seçip 'PDF Bağla…' düğmesiyle bu dosyayı gösterin.")
         elif kind == "watch_done":
             newest = message[1]
             if newest > (self.settings.get("watch_since") or 0):
