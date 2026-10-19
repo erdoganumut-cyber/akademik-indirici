@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.15"
+APP_VERSION = "2.16"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -2788,6 +2788,82 @@ def record_from_html_file(path: Path, link: str = "") -> tuple:
         t = re.search(r"<title[^>]*>(.*?)</title>", page, re.I | re.S)
         rec["title"] = _strip_tags(t.group(1)) if t else path.stem
     return rec, meta, url
+
+
+class PdfRetryWorker(threading.Thread):
+    """PDF'siz kaynakların PDF'ini yeniden arar: açık erişim (Unpaywall), yayıncı sayfası, YÖK Tez.
+    Mesajlar: ("retry", sıra, toplam, başlık) · ("retry_done", bulunan, denenen, durduruldu_mu)"""
+
+    MAX_PER_RUN = 100
+    PAUSE = 2.0                         # yayıncı sunucularını yormamak için kaynaklar arası bekleme
+
+    def __init__(self, items, library, events, library_folder, email=""):
+        super().__init__(daemon=True)
+        self.items = list(items)[:self.MAX_PER_RUN]
+        self.library, self.events, self.library_folder, self.email = library, events, library_folder, email
+        self.cancel = threading.Event()
+
+    def run(self):
+        found = tried = 0
+        try:
+            session = make_session()
+            downloader = DownloadWorker([], self.library_folder, {
+                "find_pdf": True, "save_html": False, "email": self.email, "library": None,
+                "library_folder": self.library_folder}, queue.Queue(), self.cancel)
+            yses = None
+            today = datetime.now().strftime("%Y-%m-%d")
+            for n, item in enumerate(self.items):
+                if self.cancel.is_set():
+                    break
+                self.events.put(("retry", n, len(self.items), item["title"]))
+                current = self.library.get(item["id"])
+                if not current or (current["file_path"] and os.path.exists(current["file_path"])):
+                    continue
+                tried += 1
+                try:
+                    tez = yok_tez_no(current)
+                    if tez:
+                        if yses is None:
+                            yses = make_session()
+                            yok_open_session(yses)
+                        hits = [r for r in search_yok(yses, tez) if r.get("tez_no") == tez]
+                        url = yok_pdf_url(yses, hits[0]["yok_keys"]) if hits else None
+                        if url:
+                            tmp = Path(self.library_folder) / f".yok_{tez}.part"
+                            with yses.get(url, stream=True, timeout=(15, 180)) as r:
+                                r.raise_for_status()
+                                with open(tmp, "wb") as fh:
+                                    for block in r.iter_content(1 << 16):
+                                        fh.write(block)
+                            if tmp.read_bytes()[:1024].find(b"%PDF-") >= 0:
+                                attach_pdf(self.library, item["id"], tmp, self.library_folder, move=True)
+                                found += 1
+                            else:
+                                tmp.unlink(missing_ok=True)
+                        time.sleep(YOK_PAUSE)
+                    else:
+                        links = (["https://doi.org/" + current["doi"]] if current["doi"] else []) + \
+                                ([current["url"]] if current["url"] else [])
+                        for link in links:
+                            downloader._last_saved = None
+                            downloader._tried = set()
+                            result = downloader._download_one(session, link, n)
+                            saved = downloader._last_saved
+                            if result[0] == "ok" and saved and str(saved["path"]).lower().endswith(".pdf"):
+                                other = self.library.find_by_sha(saved["sha"])
+                                if other and other != item["id"]:
+                                    break
+                                attach_pdf(self.library, item["id"], saved["path"], self.library_folder, move=True)
+                                found += 1
+                                break
+                        time.sleep(self.PAUSE)
+                except Exception as exc:
+                    diag(f"PDF yeniden arama: {item['title'][:60]}: {describe_error(exc)}")
+                self.library.update(item["id"], {"pdf_tried": today})
+            session.close()
+        except Exception:
+            diag_exception("PDF yeniden arama")
+        self.events.put(("retry_done", found, tried, self.cancel.is_set()))
 
 
 class HtmlImportWorker(threading.Thread):
@@ -6848,14 +6924,19 @@ class LibraryTab:
         self.status_menu = ctk.CTkOptionMenu(bar, values=self.STATUS_FILTERS, width=160,
                                              command=lambda _: self.refresh(), dynamic_resizing=False)
         self.status_menu.grid(row=0, column=3, padx=(0, 8))
-        ctk.CTkButton(bar, text="PDF Ekle…", width=96, command=self._add_pdfs).grid(row=0, column=4, padx=(0, 8))
-        ctk.CTkButton(bar, text="Klasör Tara…", width=110, fg_color="transparent", border_width=1,
-                      text_color=TEXT, command=self._scan_folder).grid(row=0, column=5)
-        self.autotag_btn = ctk.CTkButton(bar, text="Otomatik Etiketle", width=130, fg_color="transparent",
-                                         border_width=1, text_color=TEXT, command=self._autotag)
-        self.autotag_btn.grid(row=0, column=6, padx=(8, 0))
-        ctk.CTkButton(bar, text="PDF'sizleri Sırayla Aç", width=160, fg_color="#1F6F8B", hover_color="#185A71",
-                      command=self._open_queue).grid(row=0, column=7, padx=(8, 0))
+        acts = ctk.CTkFrame(bar, fg_color="transparent")          # ikinci satır: işlemler
+        acts.grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        outline = {"fg_color": "transparent", "border_width": 1, "text_color": TEXT}
+        ctk.CTkButton(acts, text="PDF Ekle…", width=96, command=self._add_pdfs).pack(side="left")
+        ctk.CTkButton(acts, text="Klasör Tara…", width=110, command=self._scan_folder, **outline).pack(
+            side="left", padx=(8, 0))
+        self.autotag_btn = ctk.CTkButton(acts, text="Otomatik Etiketle", width=130, command=self._autotag, **outline)
+        self.autotag_btn.pack(side="left", padx=(8, 0))
+        self.retry_btn = ctk.CTkButton(acts, text="PDF'leri Yeniden Ara", width=150, fg_color="#1F8F4E",
+                                       hover_color="#18723E", command=self._retry_pdfs)
+        self.retry_btn.pack(side="left", padx=(16, 0))
+        ctk.CTkButton(acts, text="PDF'sizleri Sırayla Aç", width=160, fg_color="#1F6F8B", hover_color="#185A71",
+                      command=self._open_queue).pack(side="left", padx=(8, 0))
 
     def _build_table(self):
         from tkinter import ttk
@@ -7440,6 +7521,55 @@ class LibraryTab:
         if paths:
             self._start_import(paths)
 
+    def _pdfless_pool(self):
+        chosen = self.selected_items()
+        pool = chosen if len(chosen) > 1 else [self.by_id[int(i)] for i in self.tree.get_children()
+                                                if int(i) in self.by_id]
+        return [i for i in pool if not (i["file_path"] and os.path.exists(i["file_path"]))]
+
+    def _retry_pdfs(self):
+        """PDF'siz kaynakların PDF'ini tek tuşla yeniden arar (açık erişim, yayıncı sayfası, YÖK)."""
+        worker = getattr(self, "retry_worker", None)
+        if worker and worker.is_alive():
+            worker.cancel.set()
+            self.retry_btn.configure(text="Durduruluyor…", state="disabled")
+            return
+        if not self.app.library_folder():
+            self.app.choose_library_folder()
+            if not self.app.library_folder():
+                return
+        items = self._pdfless_pool()
+        if not items:
+            messagebox.showinfo(APP_NAME, "Listede PDF'i olmayan kaynak yok.", parent=self.parent)
+            return
+        today = datetime.now().strftime("%Y-%m-%d")
+        items.sort(key=lambda i: ((i.get("pdf_tried") or "") == today, i.get("pdf_tried") or ""))
+        n = min(len(items), PdfRetryWorker.MAX_PER_RUN)
+        email = self.app.email_entry.get().strip()
+        extra = ("" if email else "\n\nİpucu: İndir sekmesine e-posta yazarsanız açık erişim kopyaları da "
+                                  "(Unpaywall) aranır; bulunan PDF sayısı belirgin artar.")
+        more = f"\n\nBir seferde en fazla {PdfRetryWorker.MAX_PER_RUN} kaynak denenir; kalanlar için düğmeye " \
+               "yeniden basın." if len(items) > n else ""
+        if not messagebox.askokcancel(APP_NAME, f"{n} PDF'siz kaynağın PDF'i yeniden aranacak (açık erişim kopyası, "
+                                                "yayıncı sayfası, YÖK Tez Merkezi). Bulunanlar kendiliğinden "
+                                                "kaynağına bağlanır." + more + extra, parent=self.parent):
+            return
+        self.retry_worker = PdfRetryWorker(items, self.lib, self.app.events, self.app.library_folder(), email)
+        self.retry_btn.configure(text="Durdur", fg_color="#C9353A", hover_color="#A42A2E")
+        self.retry_worker.start()
+
+    def on_retry_done(self, found, tried, stopped):
+        self.retry_btn.configure(text="PDF'leri Yeniden Ara", state="normal", fg_color="#1F8F4E",
+                                 hover_color="#18723E")
+        self.refresh()
+        msg = f"{tried} kaynak denendi, {found} tanesinin PDF'i bulunup bağlandı."
+        if stopped:
+            msg = "Durduruldu. " + msg
+        if tried - found > 0:
+            msg += " Kalanlar için 'PDF'sizleri Sırayla Aç'ı kullanın."
+        self.app.toast(msg)
+        self.app._log("success" if found else "info", "PDF yeniden arama: " + msg)
+
     def _open_queue(self):
         """Seçili (ya da listede görünen) PDF'siz kaynakları sırayla açar."""
         if getattr(self.app, "pdf_queue", None) is not None and self.app.pdf_queue.winfo_exists():
@@ -7449,10 +7579,7 @@ class LibraryTab:
             self.app.choose_library_folder()
             if not self.app.library_folder():
                 return
-        chosen = self.selected_items()
-        pool = chosen if len(chosen) > 1 else [self.by_id[int(i)] for i in self.tree.get_children()
-                                                if int(i) in self.by_id]
-        items = [i for i in pool if not (i["file_path"] and os.path.exists(i["file_path"]))]
+        items = self._pdfless_pool()
         today = datetime.now().strftime("%Y-%m-%d")
         items.sort(key=lambda i: (i.get("pdf_tried") or "") == today)      # bugün atlananlar sona
         if not items:
@@ -8959,6 +9086,11 @@ class App(ctk.CTk):
         elif kind == "done":
             self._finish(*message[1:])
             self.library_tab.refresh()
+        elif kind == "retry":
+            n, total, title = message[1:]
+            self.library_tab.count_label.configure(text=f"PDF aranıyor {n + 1}/{total}: {shorten(title, 50)}")
+        elif kind == "retry_done":
+            self.library_tab.on_retry_done(*message[1:])
         elif kind == "html_done":
             added, pdfs, existing = message[1:]
             self.library_tab.refresh()
