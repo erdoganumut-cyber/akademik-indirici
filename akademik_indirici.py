@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.17"
+APP_VERSION = "2.18"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -2213,6 +2213,31 @@ def clean_tags(text_or_list) -> list:
     return out
 
 
+_EXISTS_CACHE = {}
+
+
+def file_exists_cached(path, ttl_found=300, ttl_missing=20) -> bool:
+    """Dosya var mı? Sonucu kısa süre saklar: bulut klasöründe yüzlerce dosyayı her seferinde yoklamak
+    arayüzü kilitleyebiliyor."""
+    if not path:
+        return False
+    path = str(path)
+    now = time.monotonic()
+    hit = _EXISTS_CACHE.get(path)
+    if hit and now - hit[1] < (ttl_found if hit[0] else ttl_missing):
+        return hit[0]
+    try:
+        ok = os.path.isfile(path)
+    except OSError:
+        ok = False
+    _EXISTS_CACHE[path] = (ok, now)
+    return ok
+
+
+def forget_exists_cache():
+    _EXISTS_CACHE.clear()
+
+
 class Library:
     """Kaynakların künyesi, etiketleri, notları ve PDF tam metni (dosyalar yerinde kalır)."""
 
@@ -2270,9 +2295,9 @@ class Library:
             return stored or ""
         if not os.path.isabs(stored):
             return str(self.root / stored) if self.root else stored
-        if self.root and not os.path.exists(stored):        # başka bilgisayardan kalma mutlak yol
+        if self.root and not file_exists_cached(stored):     # başka bilgisayardan kalma mutlak yol
             alt = self.root / Path(stored.replace("\\", "/")).name
-            if alt.is_file():
+            if file_exists_cached(alt):
                 return str(alt)
         return stored
 
@@ -4756,6 +4781,7 @@ class LibrarySync:
 
     def __init__(self, library):
         self.lib = library
+        self.op_lock = threading.RLock()        # gönder/al/birleştir aynı anda iki kez çalışmasın
 
     # yardımcılar
     def folder(self):
@@ -4765,11 +4791,12 @@ class LibrarySync:
         return _load_settings_raw().get("sync") or {}
 
     def _save_state(self, **kw):
-        s = _load_settings_raw()
-        state = s.get("sync") or {}
-        state.update(kw)
-        s["sync"] = state
-        save_settings(s)
+        with _SETTINGS_LOCK:
+            s = _load_settings_raw()
+            state = s.get("sync") or {}
+            state.update(kw)
+            s["sync"] = state
+            save_settings(s)
 
     def meta(self) -> dict:
         folder = self.folder()
@@ -4801,8 +4828,14 @@ class LibrarySync:
             return "cakisma"
         return "gonder" if local else "al" if shared else "esit"
 
-    def _mark_synced(self, rev):
-        self._save_state(local_hash=_file_hash(self.lib.path), local_stat=_file_stat(self.lib.path),
+    def _local_fingerprint(self):
+        with self.lib.lock:
+            self.lib.db.commit()
+            return _file_hash(self.lib.path), _file_stat(self.lib.path)
+
+    def _mark_synced(self, rev, fingerprint=None):
+        local_hash, local_stat = fingerprint or self._local_fingerprint()
+        self._save_state(local_hash=local_hash, local_stat=local_stat,
                          shared_rev=rev, last_sync=datetime.now().strftime("%d.%m.%Y %H:%M"))
 
     def _backup_local(self):
@@ -4812,12 +4845,28 @@ class LibrarySync:
 
     # işlemler
     def push(self, force=False) -> str:
+        with self.op_lock:
+            return self._push(force)
+
+    def pull(self) -> str:
+        with self.op_lock:
+            return self._pull()
+
+    def merge(self) -> tuple:
+        with self.op_lock:
+            return self._merge()
+
+    def _push(self, force=False) -> str:
         folder = self.folder()
         if folder is None:
             return "kapali"
         if not force and self.shared_changed():
             return "cakisma"
         folder.mkdir(parents=True, exist_ok=True)
+        snapshot = settings_path().parent / f"gonderilecek_{os.getpid()}_{threading.get_ident()}.db"
+        with self.lib.lock:                                   # anlık kopya + parmak izi (kısa sürer)
+            self.lib.backup_to(snapshot)
+            fingerprint = self._local_fingerprint()
         target = folder / SHARED_DB_NAME
         if target.is_file():                                  # önceki ortak kopya yedeklenir
             backups = folder / "Yedekler"
@@ -4830,14 +4879,15 @@ class LibrarySync:
         tmp = folder / (SHARED_DB_NAME + ".tmp")
         if tmp.exists():
             tmp.unlink()
-        self.lib.backup_to(tmp)
+        shutil.copyfile(snapshot, tmp)                        # bulut klasörüne yazmak yavaş olabilir: kilitsiz
         os.replace(tmp, target)
+        snapshot.unlink(missing_ok=True)
         import uuid
         rev = uuid.uuid4().hex
         _write_json(folder / SHARED_META_NAME, {"rev": rev, "machine": machine_name(), "items": self.lib.count(),
                                                 "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                                                 "version": APP_VERSION})
-        self._mark_synced(rev)
+        self._mark_synced(rev, fingerprint)
         diag(f"ortak kütüphaneye gönderildi ({self.lib.count()} kaynak)")
         return "gonderildi"
 
@@ -4847,17 +4897,19 @@ class LibrarySync:
         shutil.copy2(self.folder() / SHARED_DB_NAME, tmp)
         return tmp
 
-    def pull(self) -> str:
+    def _pull(self) -> str:
         meta = self.meta()
         tmp = self._local_copy_of_shared()
         self._backup_local()
-        self.lib.restore_from(tmp)
+        with self.lib.lock:
+            self.lib.restore_from(tmp)
+            fingerprint = self._local_fingerprint()
         tmp.unlink(missing_ok=True)
-        self._mark_synced(meta.get("rev"))
+        self._mark_synced(meta.get("rev"), fingerprint)
         diag(f"ortak kütüphane alındı ({meta.get('machine')}, {meta.get('saved_at')})")
         return "alindi"
 
-    def merge(self) -> tuple:
+    def _merge(self) -> tuple:
         """Ortak kopya esas alınır, bu bilgisayarda olup orada olmayanlar eklenir, sonra gönderilir."""
         meta = self.meta()
         mine_path = settings_path().parent / "yerel_gecici.db"
@@ -5758,7 +5810,23 @@ def load_settings() -> dict:
     return data
 
 
+_SETTINGS_LOCK = threading.RLock()
+
+
+def update_settings(**changes):
+    """Ayar dosyasında yalnızca verilen anahtarları değiştirir (iş parçacıkları arasında güvenli)."""
+    with _SETTINGS_LOCK:
+        current = _load_settings_raw()
+        current.update(changes)
+        save_settings(current)
+
+
 def save_settings(data: dict):
+    with _SETTINGS_LOCK:
+        _save_settings(data)
+
+
+def _save_settings(data: dict):
     try:
         path = settings_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -6594,9 +6662,38 @@ def add_italic_tag(textbox):
 
 
 def remember_setting(key, value):
-    current = _load_settings_raw()
-    current[key] = value
-    save_settings(current)
+    update_settings(**{key: value})
+
+
+class FreezeWatchdog(threading.Thread):
+    """Arayüz ('Yanıt vermiyor') donarsa ana iş parçacığının o an ne yaptığını tanılama kaydına yazar."""
+
+    LIMIT = 5.0
+
+    def __init__(self):
+        super().__init__(name="donma-bekçisi", daemon=True)
+        self.beat = time.monotonic()
+        self.main_id = threading.main_thread().ident
+
+    def run(self):
+        import traceback
+        reported, worst = False, 0.0
+        while True:
+            time.sleep(1.0)
+            lag = time.monotonic() - self.beat
+            if lag > self.LIMIT and not reported:
+                frame = sys._current_frames().get(self.main_id)
+                stack = "".join(traceback.format_stack(frame)[-14:]) if frame else "(yok)"
+                others = ", ".join(t.name for t in threading.enumerate() if t.is_alive() and t is not self
+                                   and t.ident != self.main_id)
+                diag(f"ARAYÜZ DONDU ({lag:.0f} sn). Çalışan iş parçacıkları: {others or '-'}\n"
+                     f"Ana iş parçacığı şurada:\n{stack}")
+                reported, worst = True, lag
+            elif reported:
+                worst = max(worst, lag)
+                if lag < 2:
+                    diag(f"arayüz yeniden yanıt veriyor (donma ~{worst:.0f} sn sürdü)")
+                    reported = False
 
 
 class RangeDialog(ctk.CTkToplevel):
@@ -7387,7 +7484,7 @@ class LibraryTab:
         card_counts = self.lib.card_counts()
         scopus = load_scopus()
         for item in self.items:
-            item["has_pdf"] = bool(item["file_path"]) and Path(item["file_path"]).is_file()
+            item["has_pdf"] = file_exists_cached(item["file_path"])
             item["cards"] = card_counts.get(item["id"], 0)
             info = scopus_info(item, scopus) if scopus else None
             item["_scopus"] = info[0] if info else ""
@@ -7792,8 +7889,7 @@ class LibraryTab:
 
     def _pdfless_lists(self):
         """(tüm PDF'sizler, listede görünen PDF'sizlerin kimlikleri, seçili PDF'sizler) — numara sırasıyla."""
-        nopdf = sorted((i for i in self.items if not (i["file_path"] and os.path.exists(i["file_path"]))),
-                       key=lambda i: i.get("no") or 0)
+        nopdf = sorted((i for i in self.items if not i.get("has_pdf")), key=lambda i: i.get("no") or 0)
         visible = {int(i) for i in self.tree.get_children()}
         chosen = self.selected_items()
         chosen = [i for i in nopdf if i["id"] in {c["id"] for c in chosen}] if len(chosen) > 1 else []
@@ -8330,9 +8426,10 @@ class ScanTab:
         self.sync_label.configure(text=f"Açık · son eşitleme: {last or '—'}{who}", text_color=LOG_COLORS["success"])
 
     def sync_clicked(self):
-        done = self.app.sync_now()
-        self.app.toast({"gonderildi": "Ortak kütüphaneye gönderildi.", "alindi": "Ortak kütüphane alındı.",
-                        "esit": "Ortak kütüphane zaten güncel.", "birlestirildi": "Birleştirildi."}.get(done, "Tamam."))
+        if self.app.sync_in_background(manual=True):
+            self.app.toast("Ortak kütüphane eşitleniyor…")
+        else:
+            self.app.toast("Eşitleme zaten sürüyor.")
 
     def toggle_shared(self):
         app = self.app
@@ -8626,7 +8723,7 @@ class App(ctk.CTk):
         set_window_icon(self)
         self.library = Library()
         self.sync = LibrarySync(self.library)
-        self._last_focus_sync = 0.0
+        self._last_focus_sync = time.time()
         self.folder_var = ctk.StringVar(value=settings.get("library_folder") or settings.get("folder") or "")
         self.email_var = ctk.StringVar(value=settings.get("email", ""))
         self.opt_doi = ctk.BooleanVar(value=settings.get("doi", True))
@@ -8666,12 +8763,19 @@ class App(ctk.CTk):
 
         self._log("info", "Hazır. Metni yapıştırın ya da dosya ekleyin, sonra 'İndirmeyi Başlat'a basın.")
         self.after(80, self._poll_events)
+        self.watchdog = FreezeWatchdog()
+        self._watchdog_beat()
+        self.watchdog.start()
         self.after(600, self._first_run)
         self.after(15_000, self._watch_downloads)
         self._db_stamp = self._library_stamp()
         self.bind("<FocusIn>", self._on_focus, add="+")
         self.after(5 * 60_000, self._sync_tick)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _watchdog_beat(self):
+        self.watchdog.beat = time.monotonic()
+        self.after(500, self._watchdog_beat)
 
     def _library_stamp(self):
         try:
@@ -8684,11 +8788,7 @@ class App(ctk.CTk):
         """Claude (ya da tarama görevi) kütüphaneyi değiştirdiyse pencereye dönünce listeyi tazele."""
         if self.sync.folder() is not None and time.time() - self._last_focus_sync > 60:
             self._last_focus_sync = time.time()
-            try:
-                if self.sync.shared_changed() and not self.sync.local_changed():
-                    self.sync_now()
-            except Exception:
-                diag_exception("odak eşitleme")
+            self.sync_in_background()
         stamp = self._library_stamp()
         if stamp != self._db_stamp:
             self._db_stamp = stamp
@@ -8740,10 +8840,69 @@ class App(ctk.CTk):
         return done or "esit"
 
     def _sync_tick(self):
-        if self.sync.folder() is not None:
-            self.sync.heartbeat()
-            self.sync_now(quiet=True)
-        self.after(5 * 60_000, self._sync_tick)
+        try:
+            self.sync_in_background()
+        finally:
+            self.after(5 * 60_000, self._sync_tick)
+
+    def sync_in_background(self, manual=False, startup=False) -> bool:
+        """Ortak kütüphaneyi arayüzü dondurmadan eşitler (bulut klasörü yavaş olabilir).
+        Çakışma olursa soru ana pencerede sorulur."""
+        if self.sync.folder() is None:
+            return False
+        running = getattr(self, "_sync_thread", None)
+        if running is not None and running.is_alive():
+            return False
+        sync, events = self.sync, self.events
+
+        def work():
+            result, machine, others = "hata", "", []
+            try:
+                if startup:
+                    others = sync.other_sessions()
+                sync.heartbeat()
+                state = sync.status()
+                if state in ("ilk", "gonder"):
+                    result = sync.push()
+                elif state == "al":
+                    result = sync.pull()
+                    machine = sync.meta().get("machine", "")
+                elif state == "cakisma":
+                    result = "cakisma"
+                else:
+                    result = "esit"
+            except Exception:
+                diag_exception("arka plan eşitleme")
+            events.put(("sync_bg", result, machine, manual, others))
+
+        self._sync_thread = threading.Thread(target=work, name="eşitleme", daemon=True)
+        self._sync_thread.start()
+        return True
+
+    def on_sync_bg(self, result, machine, manual, others=()):
+        self._db_stamp = self._library_stamp()
+        if others:
+            messagebox.showwarning(APP_NAME, f"Ortak kütüphane şu anda {', '.join(others)} bilgisayarında da "
+                                             "açık görünüyor.\n\nİkisinde birden değişiklik yaparsanız program "
+                                             "hangisini tutacağınızı sorar. Mümkünse öbür bilgisayardaki "
+                                             "programı kapatın.", parent=self)
+        if result == "cakisma":
+            self.sync_now()                                    # hangisinin tutulacağını sorar
+            return
+        if result == "alindi":
+            self.settings = load_settings()
+            self.library_tab.refresh()
+            self.toast(f"{machine or 'Öbür bilgisayar'} bilgisayarındaki değişiklikler alındı.")
+        if result in ("gonderildi", "alindi", "birlestirildi"):
+            self._write_phone_export()
+        try:
+            self.scan_tab.refresh_sync_label()
+        except Exception:
+            pass
+        if manual and result != "alindi":
+            self.toast({"gonderildi": "Ortak kütüphaneye gönderildi.", "esit": "Ortak kütüphane zaten güncel.",
+                        "birlestirildi": "Birleştirildi.",
+                        "hata": "Ortak kütüphane eşitlenemedi; bulut klasörünü kontrol edin."}.get(result, "Tamam."))
 
     def _write_phone_export(self):
         folder = self.library_folder()
@@ -9031,8 +9190,9 @@ class App(ctk.CTk):
                           "'Akademik Kütüphanem' adlı bir klasör olabilir.", parent=self)
             self.choose_library_folder()
         if self.sync.folder() is not None:          # ortak kütüphane: önce öbür bilgisayarlardakini al
-            self.sync_now(startup=True)
-            self.settings = load_settings()
+            self._last_focus_sync = time.time()
+            self.sync_in_background(startup=True)
+            self.toast("Ortak kütüphane denetleniyor…")
         self._update_notices()
         report = self.settings.get("last_report")
         seen = self.settings.get("seen_report")
@@ -9357,6 +9517,8 @@ class App(ctk.CTk):
             n, total, title, no = message[1:]
             self.library_tab.count_label.configure(
                 text=f"PDF aranıyor · No {no} ({n + 1}/{total}): {shorten(title, 44)}")
+        elif kind == "sync_bg":
+            self.on_sync_bg(*message[1:])
         elif kind == "retry_done":
             self.library_tab.on_retry_done(*message[1:])
         elif kind == "html_done":
@@ -9425,6 +9587,9 @@ class App(ctk.CTk):
             self.scan_tab.cancel.set()
             scan.join(timeout=5)
         self.save_all_settings()
+        running = getattr(self, "_sync_thread", None)
+        if running is not None and running.is_alive():
+            running.join(timeout=120)
         if self.sync.folder() is not None:
             self.sync_now(closing=True, quiet=True)
             self.sync.heartbeat(closing=True)
