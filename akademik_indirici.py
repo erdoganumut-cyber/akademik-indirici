@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.16"
+APP_VERSION = "2.17"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -2155,6 +2155,7 @@ CREATE TABLE IF NOT EXISTS cards (
     quote TEXT DEFAULT '', comment TEXT DEFAULT '', created TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_cards_item ON cards(item_id);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
 # Sonradan eklenen sütunlar (eski veritabanları da açılabilsin diye)
@@ -2165,7 +2166,40 @@ _EXTRA_COLUMNS = {
     "keywords": "TEXT DEFAULT ''",      # makalenin kendi anahtar kelimeleri ('; ' ile)
     "issn": "TEXT DEFAULT ''",          # derginin ISSN'leri ('1234-5678; 2345-6789'), Scopus eşleştirmesi için
     "pdf_tried": "TEXT DEFAULT ''",     # PDF'siz kaynak için en son ne zaman PDF arandı (YYYY-AA-GG)
+    "no": "INTEGER DEFAULT 0",          # kayıt numarası: 1, 2, 3… (eklenme sırası, hiç değişmez)
 }
+
+
+_NO_RANGE_RE = re.compile(r"^\s*(?:#|no\b[:.]?)?\s*(\d{1,6})\s*(?:[-–—]|\.\.)\s*(\d{1,6})\s*$", re.I)
+_NO_ONE_RE = re.compile(r"^\s*(?:#|no\b[:.]?)\s*(\d{1,6})\s*$", re.I)
+
+
+def parse_no_range(text):
+    """'120-220', '#120-220', 'No 120–220' ya da '#57' → (alt, üst); değilse None."""
+    text = text or ""
+    m = _NO_RANGE_RE.match(text)
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        return (min(lo, hi), max(lo, hi))
+    m = _NO_ONE_RE.match(text)
+    if m:
+        return (int(m.group(1)), int(m.group(1)))
+    return None
+
+
+def no_ranges_text(numbers, limit=None) -> str:
+    """[3, 4, 5, 9, 12, 13] → '3–5, 9, 12–13' (çok uzunsa '…' ile kısaltır)."""
+    nums = sorted({int(n) for n in numbers if n})
+    parts, i = [], 0
+    while i < len(nums):
+        j = i
+        while j + 1 < len(nums) and nums[j + 1] == nums[j] + 1:
+            j += 1
+        parts.append(str(nums[i]) if i == j else f"{nums[i]}–{nums[j]}")
+        i = j + 1
+    if limit and len(parts) > limit:
+        return ", ".join(parts[:limit]) + " …"
+    return ", ".join(parts)
 
 
 def clean_tags(text_or_list) -> list:
@@ -2198,6 +2232,31 @@ class Library:
             for column, decl in _EXTRA_COLUMNS.items():
                 if column not in have:
                     self.db.execute(f"ALTER TABLE items ADD COLUMN {column} {decl}")
+            self._number_items()
+
+    def _number_items(self):
+        """Numarasız (ya da başka kayıtla aynı numaralı) kaynaklara sıradaki numarayı verir.
+        Eski kütüphanelerde numaralar eklenme sırasına göre 1'den başlar; verilen numara bir daha değişmez."""
+        seen, fix = set(), []
+        for item_id, no in self.db.execute("SELECT id, no FROM items ORDER BY added, id"):
+            if no and no > 0 and no not in seen:
+                seen.add(no)
+            else:
+                fix.append(item_id)
+        nxt = max(max(seen, default=0), self._last_no())
+        for item_id in fix:
+            nxt += 1
+            self.db.execute("UPDATE items SET no=? WHERE id=?", (nxt, item_id))
+        if fix:
+            self.db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('last_no', ?)", (str(nxt),))
+
+    def _last_no(self) -> int:
+        """Şimdiye kadar verilmiş en büyük numara (silinen kaynakların numarası bir daha verilmez)."""
+        row = self.db.execute("SELECT value FROM meta WHERE key='last_no'").fetchone()
+        try:
+            return int(row[0]) if row else 0
+        except ValueError:
+            return 0
 
     # --- PDF yolları: ortak kütüphanede kütüphane klasörüne göre (göreli) saklanır -----------
     def configure_paths(self, root=None, relative=None):
@@ -2418,14 +2477,17 @@ class Library:
             cur = self.db.execute(
                 "INSERT INTO items (title, authors, year, type, container, volume, issue, pages, "
                 "publisher, doi, url, editors, institution, language, file_path, sha256, added, "
-                "source, is_new, matched, keywords, issn) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "source, is_new, matched, keywords, issn, no) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (rec["title"], json.dumps(rec["authors"], ensure_ascii=False), rec["year"], rec["type"],
                  rec["container"], rec["volume"], rec["issue"], rec["pages"], rec["publisher"],
                  rec["doi"], rec["url"], json.dumps(rec["editors"], ensure_ascii=False),
                  rec["institution"], rec["language"], self._stored(file_path), sha,
                  datetime.now().strftime("%Y-%m-%d"), source, 1 if is_new else 0, matched,
-                 rec["keywords"], rec["issn"]))
+                 rec["keywords"], rec["issn"],
+                 max(self.db.execute("SELECT COALESCE(MAX(no), 0) FROM items").fetchone()[0], self._last_no()) + 1))
             item_id = cur.lastrowid
+            self.db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('last_no', "
+                            "(SELECT MAX(no) FROM items WHERE id=?))", (item_id,))
             if fulltext:
                 self.set_fulltext(item_id, fulltext)
             self.add_tags(item_id, tags)
@@ -2792,19 +2854,21 @@ def record_from_html_file(path: Path, link: str = "") -> tuple:
 
 class PdfRetryWorker(threading.Thread):
     """PDF'siz kaynakların PDF'ini yeniden arar: açık erişim (Unpaywall), yayıncı sayfası, YÖK Tez.
-    Mesajlar: ("retry", sıra, toplam, başlık) · ("retry_done", bulunan, denenen, durduruldu_mu)"""
+    Kaynaklar kayıt numarası sırasıyla denenir.
+    Mesajlar: ("retry", sıra, toplam, başlık, no) ·
+              ("retry_done", bulunan, denenen, durduruldu_mu, bulunan_nolar, denenen_nolar)"""
 
-    MAX_PER_RUN = 100
     PAUSE = 2.0                         # yayıncı sunucularını yormamak için kaynaklar arası bekleme
 
     def __init__(self, items, library, events, library_folder, email=""):
         super().__init__(daemon=True)
-        self.items = list(items)[:self.MAX_PER_RUN]
+        self.items = sorted(items, key=lambda i: i.get("no") or 0)
         self.library, self.events, self.library_folder, self.email = library, events, library_folder, email
         self.cancel = threading.Event()
 
     def run(self):
         found = tried = 0
+        found_nos, tried_nos = [], []
         try:
             session = make_session()
             downloader = DownloadWorker([], self.library_folder, {
@@ -2815,11 +2879,13 @@ class PdfRetryWorker(threading.Thread):
             for n, item in enumerate(self.items):
                 if self.cancel.is_set():
                     break
-                self.events.put(("retry", n, len(self.items), item["title"]))
+                self.events.put(("retry", n, len(self.items), item["title"], item.get("no") or 0))
                 current = self.library.get(item["id"])
                 if not current or (current["file_path"] and os.path.exists(current["file_path"])):
                     continue
                 tried += 1
+                tried_nos.append(item.get("no") or 0)
+                before = found
                 try:
                     tez = yok_tez_no(current)
                     if tez:
@@ -2859,11 +2925,13 @@ class PdfRetryWorker(threading.Thread):
                         time.sleep(self.PAUSE)
                 except Exception as exc:
                     diag(f"PDF yeniden arama: {item['title'][:60]}: {describe_error(exc)}")
+                if found > before:
+                    found_nos.append(item.get("no") or 0)
                 self.library.update(item["id"], {"pdf_tried": today})
             session.close()
         except Exception:
             diag_exception("PDF yeniden arama")
-        self.events.put(("retry_done", found, tried, self.cancel.is_set()))
+        self.events.put(("retry_done", found, tried, self.cancel.is_set(), found_nos, tried_nos))
 
 
 class HtmlImportWorker(threading.Thread):
@@ -5183,9 +5251,12 @@ STATUS_FILTER_VALUES = ["hepsi", "pdf_var", "pdf_yok", "yeni", "karti_olan", "sc
 
 
 def search_items(library, query="", tag="", status="hepsi", fulltext=False, year_min=None,
-                 year_max=None) -> list:
+                 year_max=None, no_min=None, no_max=None) -> list:
     """Arayüzdeki arama/filtre mantığının aynısı (Claude araçları için)."""
     items = library.all_items()
+    rng = parse_no_range(query)
+    if rng:
+        query, no_min, no_max = "", rng[0], rng[1]
     cards = library.card_counts()
     scopus = load_scopus()
     words = [w for w in fold(query or "").split() if w]
@@ -5221,13 +5292,20 @@ def search_items(library, query="", tag="", status="hepsi", fulltext=False, year
             continue
         if year_max and (year is None or year > int(year_max)):
             continue
+        if no_min and (item.get("no") or 0) < int(no_min):
+            continue
+        if no_max and (item.get("no") or 0) > int(no_max):
+            continue
         out.append(item)
-    out.sort(key=lambda i: (tr_sort_key(first_author_label(i)), i["year"]))
+    if no_min or no_max:
+        out.sort(key=lambda i: i.get("no") or 0)
+    else:
+        out.sort(key=lambda i: (tr_sort_key(first_author_label(i)), i["year"]))
     return out
 
 
 def _brief(item) -> dict:
-    return {"id": item["id"], "yazar": first_author_label(item), "yil": item["year"], "baslik": item["title"],
+    return {"id": item["id"], "kayit_no": item.get("no") or 0, "yazar": first_author_label(item), "yil": item["year"], "baslik": item["title"],
             "dergi_kitap": item["container"], "tur": ITEM_TYPES.get(item["type"], "Diğer"),
             "etiketler": item["tags"], "anahtar_kelimeler": split_keywords(item.get("keywords", "")),
             "pdf_var": bool(item["file_path"]) and Path(item["file_path"]).is_file(),
@@ -5252,7 +5330,9 @@ class McpTools:
         ids = {"type": "array", "items": {"type": "integer"}, "description": "Kaynak kimlikleri (kutuphane_ara'dan)"}
         return [
             ("kutuphane_ara", "Kütüphanede kaynak arar. Başlık, yazar, dergi, etiket, anahtar kelime ve alıntı "
-                              "kartlarında arar; istenirse PDF tam metninde de. Sonuçta id'ler döner.",
+                              "kartlarında arar; istenirse PDF tam metninde de. Sonuçta id'ler döner. Kullanıcı "
+                              "'No 120' ya da '120-220 arası' derse kayıt numarasını (kayit_no) kastediyordur: "
+                              "no_min/no_max kullanın; diğer araçlara kayit_no değil id verilir.",
              {"type": "object", "properties": {
                  "sorgu": s("Aranacak kelimeler (boş: hepsi)"),
                  "etiket": s("Yalnızca bu etiketi taşıyanlar"),
@@ -5261,6 +5341,8 @@ class McpTools:
                                           "uygulamada yüklendiyse çalışır)"},
                  "pdf_icinde_ara": {"type": "boolean", "description": "PDF tam metninde de ara"},
                  "yil_min": {"type": "integer"}, "yil_max": {"type": "integer"},
+                 "no_min": {"type": "integer", "description": "Kayıt numarası en az"},
+                 "no_max": {"type": "integer", "description": "Kayıt numarası en çok"},
                  "limit": {"type": "integer", "description": "En fazla sonuç (varsayılan 50)"}}}),
             ("kaynak_detay", "Bir kaynağın tüm künyesini, etiketlerini, anahtar kelimelerini, alıntı kartlarını, "
                              "PDF yolunu ve APA kaynakça satırını verir.",
@@ -5315,8 +5397,8 @@ class McpTools:
         return fn(**(args or {}))
 
     def t_kutuphane_ara(self, sorgu="", etiket="", durum="hepsi", pdf_icinde_ara=False, yil_min=None,
-                        yil_max=None, limit=50):
-        items = search_items(self.lib, sorgu, etiket, durum, pdf_icinde_ara, yil_min, yil_max)
+                        yil_max=None, limit=50, no_min=None, no_max=None):
+        items = search_items(self.lib, sorgu, etiket, durum, pdf_icinde_ara, yil_min, yil_max, no_min, no_max)
         limit = max(1, min(int(limit or 50), 300))
         return {"toplam": len(items), "gosterilen": min(len(items), limit),
                 "kaynaklar": [_brief(i) for i in items[:limit]]}
@@ -6511,15 +6593,184 @@ def add_italic_tag(textbox):
         inner.tag_configure("i", font=("TkDefaultFont", 10, "italic"))
 
 
+def remember_setting(key, value):
+    current = _load_settings_raw()
+    current[key] = value
+    save_settings(current)
+
+
+class RangeDialog(ctk.CTkToplevel):
+    """PDF'siz kaynaklardan hangi kayıt numaralarının işleneceğini seçtirir.
+    on_start(kaynaklar, etiket, (alt, üst) ya da None) ile döner."""
+
+    CHUNK = {"retry": 100, "queue": 25}
+    SECONDS = {"retry": 8, "queue": 45}           # kaynak başına kabaca süre (tahmin için)
+
+    def __init__(self, app, purpose, nopdf, visible_ids, chosen, on_start):
+        super().__init__(app)
+        self.app, self.purpose, self.nopdf, self.visible_ids = app, purpose, nopdf, visible_ids
+        self.chosen, self.on_start = chosen, on_start
+        retry = purpose == "retry"
+        self.title("PDF'leri yeniden ara" if retry else "PDF'sizleri sırayla aç")
+        set_window_icon(self, delay=260)
+        self.transient(app)
+        self.resizable(False, False)
+        self.grid_columnconfigure(0, weight=1)
+        pad = {"padx": 18, "sticky": "ew"}
+        nos = [i.get("no") or 0 for i in nopdf]
+        intro = (f"Kütüphanede PDF'i olmayan {len(nopdf)} kaynak var (No {no_ranges_text(nos, 6)}). "
+                 "Hangi kayıt numaraları arasında çalışılsın?")
+        if retry:
+            intro += ("\n\nAçık erişim kopyası, yayıncı sayfası ve YÖK Tez Merkezi aranır; bulunan PDF kendiliğinden "
+                      "kaynağına bağlanır. İstediğiniz an durdurabilirsiniz.")
+            if not app.email_entry.get().strip():
+                intro += ("\n\nİpucu: İndir sekmesine e-posta yazarsanız açık erişim kopyaları da (Unpaywall) "
+                          "aranır; bulunan PDF sayısı belirgin artar.")
+        else:
+            intro += ("\n\nKaynaklar numara sırasıyla tarayıcıda açılır; her sayfada PDF'i siz indirirsiniz, program "
+                      "İndirilenler'den alıp kaynağa bağlar.")
+        ctk.CTkLabel(self, text=intro, justify="left", anchor="w", wraplength=440).grid(row=0, column=0, pady=(16, 10), **pad)
+
+        self.mode = ctk.StringVar(value="selected" if chosen else "range")
+        box = ctk.CTkFrame(self, fg_color="transparent")
+        box.grid(row=1, column=0, **pad)
+        ctk.CTkRadioButton(box, text="Kayıt no:", variable=self.mode, value="range",
+                           command=self._update).grid(row=0, column=0, sticky="w")
+        self.start_entry = ctk.CTkEntry(box, width=70, justify="center")
+        self.start_entry.grid(row=0, column=1, padx=(6, 4))
+        ctk.CTkLabel(box, text="–").grid(row=0, column=2)
+        self.end_entry = ctk.CTkEntry(box, width=70, justify="center")
+        self.end_entry.grid(row=0, column=3, padx=(4, 8))
+        ctk.CTkButton(box, text="Tümü", width=54, height=26, fg_color="transparent", border_width=1, text_color=TEXT,
+                      command=self._all).grid(row=0, column=4)
+        for entry in (self.start_entry, self.end_entry):
+            entry.bind("<KeyRelease>", lambda _: self._range_typed())
+        if chosen:
+            ctk.CTkRadioButton(box, text=f"Tabloda seçtiğim {len(chosen)} PDF'siz kaynak "
+                                         f"(No {no_ranges_text([i.get('no') for i in chosen], 5)})",
+                               variable=self.mode, value="selected", command=self._update).grid(
+                row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        self.visible_var = ctk.BooleanVar(value=True)
+        self.filtered = filtered = len([i for i in nopdf if i["id"] in visible_ids]) < len(nopdf)
+        self.visible_check = ctk.CTkCheckBox(self, text="Yalnızca tabloda görünenler (arama / etiket filtresine uyanlar)",
+                                             variable=self.visible_var, command=self._update)
+        if filtered:
+            self.visible_check.grid(row=2, column=0, pady=(10, 0), **pad)
+        self.skip_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(self, text="Bugün zaten denenmiş olanları atla", variable=self.skip_var,
+                        command=self._update).grid(row=3, column=0, pady=(8, 0), **pad)
+        self.summary = ctk.CTkLabel(self, text="", justify="left", anchor="w", wraplength=440, text_color=MUTED,
+                                    font=ctk.CTkFont(size=12))
+        self.summary.grid(row=4, column=0, pady=(12, 0), **pad)
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.grid(row=5, column=0, pady=16, padx=18, sticky="e")
+        ctk.CTkButton(btns, text="Vazgeç", width=90, fg_color="transparent", border_width=1, text_color=TEXT,
+                      command=self.destroy).pack(side="left", padx=(0, 8))
+        self.ok_btn = ctk.CTkButton(btns, text="Başlat", width=110, command=self._ok)
+        self.ok_btn.pack(side="left")
+        self._prefill()
+        self._update()
+        self.after(60, self._center)
+
+    def _center(self):
+        try:
+            self.update_idletasks()
+            x = self.app.winfo_rootx() + (self.app.winfo_width() - self.winfo_width()) // 2
+            y = self.app.winfo_rooty() + (self.app.winfo_height() - self.winfo_height()) // 3
+            self.geometry(f"+{max(0, x)}+{max(0, y)}")
+            self.lift()
+            self.focus_force()
+        except Exception:
+            pass
+
+    def _base(self):
+        """Filtrelerden geçen PDF'siz kaynaklar (numara aralığı hariç)."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        out = self.nopdf
+        if self.filtered and self.visible_var.get():
+            out = [i for i in out if i["id"] in self.visible_ids]
+        if self.skip_var.get():
+            out = [i for i in out if (i.get("pdf_tried") or "") != today]
+        return out
+
+    def _prefill(self):
+        base = self._base() or self.nopdf
+        key = "retry_next_no" if self.purpose == "retry" else "queue_next_no"
+        start_no = int(_load_settings_raw().get(key) or 0)
+        rest = [i for i in base if (i.get("no") or 0) >= start_no] or base
+        chunk = rest[:self.CHUNK[self.purpose]]
+        self._set_range(chunk[0].get("no") or 0, chunk[-1].get("no") or 0)
+
+    def _set_range(self, lo, hi):
+        for entry, value in ((self.start_entry, lo), (self.end_entry, hi)):
+            entry.delete(0, "end")
+            entry.insert(0, str(value))
+
+    def _all(self):
+        base = self._base() or self.nopdf
+        self._set_range(base[0].get("no") or 0, base[-1].get("no") or 0)
+        self.mode.set("range")
+        self._update()
+
+    def _range_typed(self):
+        self.mode.set("range")
+        self._update()
+
+    def range(self):
+        try:
+            lo = int(self.start_entry.get().strip())
+            hi = int(self.end_entry.get().strip())
+        except ValueError:
+            return None
+        return (min(lo, hi), max(lo, hi))
+
+    def selection(self):
+        """(kaynaklar, etiket, aralık)"""
+        if self.mode.get() == "selected" and self.chosen:
+            today = datetime.now().strftime("%Y-%m-%d")
+            items = [i for i in self.chosen if not (self.skip_var.get() and (i.get("pdf_tried") or "") == today)]
+            return items, f"seçilen {len(items)} kaynak (No {no_ranges_text([i.get('no') for i in items], 4)})", None
+        rng = self.range()
+        if not rng:
+            return [], "", None
+        items = [i for i in self._base() if rng[0] <= (i.get("no") or 0) <= rng[1]]
+        return items, (f"No {rng[0]}" if rng[0] == rng[1] else f"No {rng[0]}–{rng[1]}"), rng
+
+    def _update(self):
+        items, label, rng = self.selection()
+        if self.mode.get() == "range" and not rng:
+            self.summary.configure(text="Başlangıç ve bitiş numarasını yazın (ör. 120 – 220).")
+            self.ok_btn.configure(state="disabled")
+            return
+        if not items:
+            self.summary.configure(text="Bu seçimde PDF'i olmayan kaynak yok.")
+            self.ok_btn.configure(state="disabled")
+            return
+        minutes = max(1, round(len(items) * self.SECONDS[self.purpose] / 60))
+        verb = "aranacak" if self.purpose == "retry" else "açılacak"
+        listed = no_ranges_text([i.get("no") for i in items], 10)
+        detail = f" — No {listed}" if rng and listed not in (f"{rng[0]}–{rng[1]}", str(rng[0])) else ""
+        self.summary.configure(text=f"{label}: {len(items)} PDF'siz kaynak {verb}{detail}\n"
+                                    f"Tahmini süre: ~{minutes} dk")
+        self.ok_btn.configure(state="normal")
+
+    def _ok(self):
+        items, label, rng = self.selection()
+        if not items:
+            return
+        self.destroy()
+        self.on_start(items, label, rng)
+
+
 class PdfQueuePanel(ctk.CTkToplevel):
     """PDF'siz kaynakları sırayla tarayıcıda açar; İndirilenler'e düşen PDF'i o kaynağa bağlayıp
     bir sonrakine geçer. Her indirmeyi kullanıcı kendisi tıklar."""
 
     POLL_MS = 1500
 
-    def __init__(self, app, items):
+    def __init__(self, app, items, label=""):
         super().__init__(app)
-        self.app, self.items = app, items
+        self.app, self.items, self.label = app, sorted(items, key=lambda i: i.get("no") or 0), label
         self.index, self.attached, self.skipped = -1, 0, 0
         self.pending = None                        # eşleşmeyen PDF: kullanıcıya soruluyor
         self.folders = downloads_folders()
@@ -6595,7 +6846,9 @@ class PdfQueuePanel(ctk.CTkToplevel):
         self._clear_ask()
         self.index += 1
         if self.index >= len(self.items):
-            self.counter.configure(text="Bitti")
+            if self.items:
+                remember_setting("queue_next_no", (self.items[-1].get("no") or 0) + 1)
+            self.counter.configure(text="Bitti" + (f" · {self.label}" if self.label else ""))
             self.item_label.configure(text=f"{self.attached} kaynağın PDF'i bağlandı, {self.skipped} kaynak atlandı.")
             self.status.configure(text="Pencereyi kapatabilirsiniz.")
             return
@@ -6605,7 +6858,8 @@ class PdfQueuePanel(ctk.CTkToplevel):
         item = self.current
         if not item:
             return
-        self.counter.configure(text=f"{self.index + 1} / {len(self.items)} · {self.attached} PDF bağlandı")
+        self.counter.configure(text=f"No {item.get('no') or '?'} · {self.index + 1} / {len(self.items)} · "
+                                    f"{self.attached} PDF bağlandı")
         who = first_author_label(item)
         self.item_label.configure(text=f"{who + ' ' if who else ''}({item['year'] or 't.y.'}). {shorten(item['title'], 140)}")
         db = database_for_doi(item.get("doi") or "")
@@ -6622,6 +6876,8 @@ class PdfQueuePanel(ctk.CTkToplevel):
         self.next_item()
 
     def finish(self):
+        if self.current:                             # yarıda bırakıldı: bir dahakine buradan başla
+            remember_setting("queue_next_no", self.current.get("no") or 0)
         self.app.pdf_queue = None
         self.app.library_tab.refresh()
         self.destroy()
@@ -6912,7 +7168,8 @@ class LibraryTab:
         bar.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 8))
         bar.grid_columnconfigure(0, weight=1)
         self.search = ctk.CTkEntry(bar, height=34,
-                                   placeholder_text="Ara: başlık, yazar, dergi, etiket, alıntı kartı…")
+                                   placeholder_text="Ara: başlık, yazar, dergi, etiket, alıntı kartı…  "
+                                                    "· #120-220 = kayıt numarası aralığı")
         self.search.grid(row=0, column=0, sticky="ew")
         self.search.bind("<KeyRelease>", lambda _: self._schedule_refresh())
         self.fulltext_var = ctk.BooleanVar(value=False)
@@ -6944,15 +7201,16 @@ class LibraryTab:
         frame.grid(row=1, column=0, sticky="nsew", padx=(8, 6))
         frame.grid_columnconfigure(0, weight=1)
         frame.grid_rowconfigure(0, weight=1)
-        cols = ("pdf", "author", "year", "title", "scopus", "tags")
+        cols = ("no", "pdf", "author", "year", "title", "scopus", "tags")
         self.tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="extended",
                                  style="Lib.Treeview")
-        for col, text, width, stretch in (("pdf", "", 34, False), ("author", "Yazar", 150, False),
+        for col, text, width, stretch in (("no", "No", 50, False), ("pdf", "", 34, False),
+                                          ("author", "Yazar", 150, False),
                                           ("year", "Yıl", 52, False), ("title", "Başlık", 360, True),
                                           ("scopus", "Scopus", 74, False), ("tags", "Etiketler", 150, False)):
             self.tree.heading(col, text=text, command=lambda c=col: self._sort(c))
             self.tree.column(col, width=width, minwidth=30, stretch=stretch,
-                             anchor="center" if col in ("pdf", "year", "scopus") else "w")
+                             anchor="center" if col in ("pdf", "year", "scopus") else ("e" if col == "no" else "w"))
         self.tree.grid(row=0, column=0, sticky="nsew", padx=(6, 0), pady=6)
         sb = ctk.CTkScrollbar(frame, command=self.tree.yview)
         sb.grid(row=0, column=1, sticky="ns", pady=6)
@@ -7142,7 +7400,8 @@ class LibraryTab:
         if current_tag not in tags:
             self.tag_menu.set("Tüm etiketler")
 
-        words = [w for w in fold(self.search.get()).split() if w]
+        no_range = parse_no_range(self.search.get())        # '#120-220': kayıt numarası aralığı
+        words = [] if no_range else [w for w in fold(self.search.get()).split() if w]
         extra = set()
         if words:
             extra |= self.lib.card_text_ids(words)
@@ -7152,6 +7411,8 @@ class LibraryTab:
         status = self.status_menu.get()
 
         def visible(item):
+            if no_range and not (no_range[0] <= (item.get("no") or 0) <= no_range[1]):
+                return False
             if words and not (all(w in item["_blob"] for w in words) or item["id"] in extra):
                 return False
             if tag != "Tüm etiketler" and tag not in item["tags"]:
@@ -7163,9 +7424,13 @@ class LibraryTab:
         shown = [i for i in self.items if visible(i)]
         keys = {"author": lambda i: tr_sort_key(first_author_label(i)), "year": lambda i: i["year"] or "0",
                 "title": lambda i: tr_sort_key(i["title"]), "tags": lambda i: tr_sort_key(", ".join(i["tags"])),
-                "pdf": lambda i: i["has_pdf"], "added": lambda i: (i["added"], i["id"]),
+                "pdf": lambda i: i["has_pdf"], "added": lambda i: (i["added"], i.get("no") or 0, i["id"]),
+                "no": lambda i: i.get("no") or 0,
                 "scopus": lambda i: {"aktif": 2, "pasif": 1}.get(i["_scopus"], 0)}
-        shown.sort(key=keys[self.sort_col], reverse=self.sort_rev)
+        if no_range and self.sort_col == "added":
+            shown.sort(key=keys["no"])
+        else:
+            shown.sort(key=keys[self.sort_col], reverse=self.sort_rev)
         self.tree.delete(*self.tree.get_children())
         for item in shown:
             tags_ = []
@@ -7176,7 +7441,7 @@ class LibraryTab:
             mark = "📄" if item["has_pdf"] else "—"
             title = ("● " if item["is_new"] else "") + item["title"]
             self.tree.insert("", "end", iid=str(item["id"]), tags=tags_,
-                             values=(mark, first_author_label(item), item["year"], title,
+                             values=(item.get("no") or "", mark, first_author_label(item), item["year"], title,
                                      {"aktif": "✓", "pasif": "pasif", "cikarildi": "✗"}.get(item["_scopus"], ""),
                                      ", ".join(item["tags"])))
         keep = [s for s in selected if self.tree.exists(s)]
@@ -7194,6 +7459,8 @@ class LibraryTab:
             self.sort_rev = not self.sort_rev
         else:
             self.sort_col, self.sort_rev = col, col in ("year", "pdf", "scopus")
+            if col == "no":
+                self.sort_col, self.sort_rev = "no", False
         self.refresh()
 
     def select(self, item_id):
@@ -7241,12 +7508,14 @@ class LibraryTab:
         self.open_btn.configure(state="normal" if has_pdf else "disabled")
         self.show_btn.configure(state="normal" if has_pdf else "disabled")
         self.attach_btn.configure(text="PDF'i Değiştir…" if has_pdf else "PDF Bağla…")
+        no = f"No {item.get('no')} · " if item.get("no") else ""
         if has_pdf:
-            self.pdf_label.configure(text=f"📄 {Path(item['file_path']).name}", text_color=TEXT)
+            self.pdf_label.configure(text=f"{no}📄 {Path(item['file_path']).name}", text_color=TEXT)
         else:
             db = database_for_doi(item["doi"])
             hint = f" · kurum erişimi: {db}" if db else ""
-            self.pdf_label.configure(text=f"PDF yok{hint}", text_color=LOG_COLORS["warn"])
+            tried = f" · son arama: {item['pdf_tried']}" if item.get("pdf_tried") else ""
+            self.pdf_label.configure(text=f"{no}PDF yok{hint}{tried}", text_color=LOG_COLORS["warn"])
         self.f_title.insert("1.0", item["title"])
         values = dict(item, authors=people_to_text(item["authors"]), editors=people_to_text(item["editors"]),
                       tags=", ".join(item["tags"]))
@@ -7521,11 +7790,25 @@ class LibraryTab:
         if paths:
             self._start_import(paths)
 
-    def _pdfless_pool(self):
+    def _pdfless_lists(self):
+        """(tüm PDF'sizler, listede görünen PDF'sizlerin kimlikleri, seçili PDF'sizler) — numara sırasıyla."""
+        nopdf = sorted((i for i in self.items if not (i["file_path"] and os.path.exists(i["file_path"]))),
+                       key=lambda i: i.get("no") or 0)
+        visible = {int(i) for i in self.tree.get_children()}
         chosen = self.selected_items()
-        pool = chosen if len(chosen) > 1 else [self.by_id[int(i)] for i in self.tree.get_children()
-                                                if int(i) in self.by_id]
-        return [i for i in pool if not (i["file_path"] and os.path.exists(i["file_path"]))]
+        chosen = [i for i in nopdf if i["id"] in {c["id"] for c in chosen}] if len(chosen) > 1 else []
+        return nopdf, visible, chosen
+
+    def _ask_range(self, purpose, on_start):
+        """Hangi kayıt numaralarının işleneceğini soran pencereyi açar."""
+        nopdf, visible, chosen = self._pdfless_lists()
+        if not nopdf:
+            messagebox.showinfo(APP_NAME, "Kütüphanede PDF'i olmayan kaynak yok.", parent=self.parent)
+            return
+        old = getattr(self, "range_dialog", None)
+        if old is not None and old.winfo_exists():
+            old.destroy()
+        self.range_dialog = RangeDialog(self.app, purpose, nopdf, visible, chosen, on_start)
 
     def _retry_pdfs(self):
         """PDF'siz kaynakların PDF'ini tek tuşla yeniden arar (açık erişim, yayıncı sayfası, YÖK)."""
@@ -7538,40 +7821,38 @@ class LibraryTab:
             self.app.choose_library_folder()
             if not self.app.library_folder():
                 return
-        items = self._pdfless_pool()
-        if not items:
-            messagebox.showinfo(APP_NAME, "Listede PDF'i olmayan kaynak yok.", parent=self.parent)
-            return
-        today = datetime.now().strftime("%Y-%m-%d")
-        items.sort(key=lambda i: ((i.get("pdf_tried") or "") == today, i.get("pdf_tried") or ""))
-        n = min(len(items), PdfRetryWorker.MAX_PER_RUN)
+        self._ask_range("retry", self._start_retry)
+
+    def _start_retry(self, items, label, rng):
+        self._retry_run = (label, rng)
         email = self.app.email_entry.get().strip()
-        extra = ("" if email else "\n\nİpucu: İndir sekmesine e-posta yazarsanız açık erişim kopyaları da "
-                                  "(Unpaywall) aranır; bulunan PDF sayısı belirgin artar.")
-        more = f"\n\nBir seferde en fazla {PdfRetryWorker.MAX_PER_RUN} kaynak denenir; kalanlar için düğmeye " \
-               "yeniden basın." if len(items) > n else ""
-        if not messagebox.askokcancel(APP_NAME, f"{n} PDF'siz kaynağın PDF'i yeniden aranacak (açık erişim kopyası, "
-                                                "yayıncı sayfası, YÖK Tez Merkezi). Bulunanlar kendiliğinden "
-                                                "kaynağına bağlanır." + more + extra, parent=self.parent):
-            return
         self.retry_worker = PdfRetryWorker(items, self.lib, self.app.events, self.app.library_folder(), email)
         self.retry_btn.configure(text="Durdur", fg_color="#C9353A", hover_color="#A42A2E")
+        self.app._log("info", f"PDF yeniden arama başladı: {label} ({len(items)} kaynak).")
         self.retry_worker.start()
 
-    def on_retry_done(self, found, tried, stopped):
+    def on_retry_done(self, found, tried, stopped, found_nos=(), tried_nos=()):
         self.retry_btn.configure(text="PDF'leri Yeniden Ara", state="normal", fg_color="#1F8F4E",
                                  hover_color="#18723E")
+        label, rng = getattr(self, "_retry_run", ("", None))
+        last = max(tried_nos, default=0)
+        if rng:                                      # bir sonraki sefer kalınan yerden başlasın
+            remember_setting("retry_next_no", (last + 1) if stopped and last else rng[1] + 1)
         self.refresh()
-        msg = f"{tried} kaynak denendi, {found} tanesinin PDF'i bulunup bağlandı."
+        where = f"{label}: " if label else ""
+        msg = f"{where}{tried} kaynak denendi, {found} tanesinin PDF'i bulunup bağlandı"
+        msg += f" (No {no_ranges_text(found_nos, 8)})." if found_nos else "."
         if stopped:
-            msg = "Durduruldu. " + msg
+            msg = f"Durduruldu — No {last}'e kadar denendi. " + msg if last else "Durduruldu. " + msg
         if tried - found > 0:
-            msg += " Kalanlar için 'PDF'sizleri Sırayla Aç'ı kullanın."
+            msg += " Kalanlar için 'PDF'sizleri Sırayla Aç'ı aynı aralıkla kullanabilirsiniz."
         self.app.toast(msg)
-        self.app._log("success" if found else "info", "PDF yeniden arama: " + msg)
+        missing = sorted(set(tried_nos) - set(found_nos))
+        self.app._log("success" if found else "info", "PDF yeniden arama: " + msg +
+                      (f" Bulunamayanlar: No {no_ranges_text(missing)}." if missing else ""))
 
     def _open_queue(self):
-        """Seçili (ya da listede görünen) PDF'siz kaynakları sırayla açar."""
+        """Seçilen numara aralığındaki PDF'siz kaynakları sırayla açar."""
         if getattr(self.app, "pdf_queue", None) is not None and self.app.pdf_queue.winfo_exists():
             self.app.pdf_queue.lift()
             return
@@ -7579,22 +7860,8 @@ class LibraryTab:
             self.app.choose_library_folder()
             if not self.app.library_folder():
                 return
-        items = self._pdfless_pool()
-        today = datetime.now().strftime("%Y-%m-%d")
-        items.sort(key=lambda i: (i.get("pdf_tried") or "") == today)      # bugün atlananlar sona
-        if not items:
-            messagebox.showinfo(APP_NAME, "Listede PDF'i olmayan kaynak yok.\n\nİpucu: durum menüsünden "
-                                          "'PDF'i olmayanlar'ı seçip etiketle daraltabilirsiniz.", parent=self.parent)
-            return
-        if not messagebox.askokcancel(
-                APP_NAME, f"{len(items)} PDF'siz kaynak sırayla tarayıcıda açılacak.\n\n"
-                          "Her sayfada PDF'i indirin; program dosyayı İndirilenler klasöründen alıp kaynağa "
-                          "bağlar ve bir sonrakini açar. Kampüs ağında giriş gerekmez; kampüs dışındaysanız "
-                          "tarayıcıda önce VETİS ile giriş yapın.\n\n"
-                          "Listeyi daraltmak için önce durum menüsünden 'PDF'i olmayanlar' ve bir etiket "
-                          "seçebilir ya da tablodan birkaç kaynak seçebilirsiniz.", parent=self.parent):
-            return
-        self.app.pdf_queue = PdfQueuePanel(self.app, items)
+        self._ask_range("queue", lambda items, label, rng: setattr(
+            self.app, "pdf_queue", PdfQueuePanel(self.app, items, label)))
 
     def _import_refs(self):
         paths = filedialog.askopenfilenames(
@@ -9087,8 +9354,9 @@ class App(ctk.CTk):
             self._finish(*message[1:])
             self.library_tab.refresh()
         elif kind == "retry":
-            n, total, title = message[1:]
-            self.library_tab.count_label.configure(text=f"PDF aranıyor {n + 1}/{total}: {shorten(title, 50)}")
+            n, total, title, no = message[1:]
+            self.library_tab.count_label.configure(
+                text=f"PDF aranıyor · No {no} ({n + 1}/{total}): {shorten(title, 44)}")
         elif kind == "retry_done":
             self.library_tab.on_retry_done(*message[1:])
         elif kind == "html_done":
