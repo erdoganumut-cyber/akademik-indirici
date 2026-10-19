@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.18"
+APP_VERSION = "2.19"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -2158,6 +2158,14 @@ CREATE INDEX IF NOT EXISTS idx_cards_item ON cards(item_id);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
+# Her yazma işleminde meta.change_no bir artar (Claude bağlantısı gibi başka süreçlerin yazdıkları da sayılır).
+# Ortak kütüphane 'burada değişti mi?' sorusunu dosyanın tamamını okumadan bununla yanıtlar.
+# (Gövdede UPDATE: 'INSERT OR IGNORE' gibi dış komutların çakışma kuralı tetikleyicideki INSERT'i yutabiliyor.)
+_CHANGE_TRIGGERS = "INSERT OR IGNORE INTO meta (key, value) VALUES ('change_no', '0');\n" + "".join(
+    f"CREATE TRIGGER IF NOT EXISTS degisim_{table}_{op.lower()} AFTER {op} ON {table} BEGIN "
+    "UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key='change_no'; END;\n"
+    for table in ("items", "tags", "cards", "fulltext") for op in ("INSERT", "UPDATE", "DELETE"))
+
 # Sonradan eklenen sütunlar (eski veritabanları da açılabilsin diye)
 _EXTRA_COLUMNS = {
     "is_new": "INTEGER DEFAULT 0",      # haftalık taramadan gelip henüz incelenmedi
@@ -2202,6 +2210,26 @@ def no_ranges_text(numbers, limit=None) -> str:
     return ", ".join(parts)
 
 
+def snapshot_db(src_path, dest_path) -> int:
+    dest_path = Path(dest_path)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    if dest_path.exists():
+        dest_path.unlink()
+    src = sqlite3.connect(f"file:{Path(src_path).as_posix()}?mode=ro", uri=True, timeout=60)
+    dest = sqlite3.connect(str(dest_path))
+    try:
+        src.backup(dest)
+        row = dest.execute("SELECT value FROM meta WHERE key='change_no'").fetchone() if dest.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='meta'").fetchone() else None
+    finally:
+        dest.close()
+        src.close()
+    try:
+        return int(row[0]) if row else 0
+    except ValueError:
+        return 0
+
+
 def clean_tags(text_or_list) -> list:
     items = text_or_list if isinstance(text_or_list, (list, tuple)) else re.split(r"[,;\n]", text_or_list or "")
     seen, out = set(), []
@@ -2238,6 +2266,14 @@ def forget_exists_cache():
     _EXISTS_CACHE.clear()
 
 
+def file_exists_known(path, ttl_found=300, ttl_missing=20):
+    """Önbellekteki sonuç (yoklamadan). Dönüş: (var_mı ya da None, eskimiş_mi)"""
+    hit = _EXISTS_CACHE.get(str(path)) if path else None
+    if not hit:
+        return None, True
+    return hit[0], time.monotonic() - hit[1] >= (ttl_found if hit[0] else ttl_missing)
+
+
 class Library:
     """Kaynakların künyesi, etiketleri, notları ve PDF tam metni (dosyalar yerinde kalır)."""
 
@@ -2253,6 +2289,7 @@ class Library:
     def _ensure_schema(self):
         with self.lock, self.db:
             self.db.executescript(_SCHEMA)
+            self.db.executescript(_CHANGE_TRIGGERS)
             have = {r[1] for r in self.db.execute("PRAGMA table_info(items)")}
             for column, decl in _EXTRA_COLUMNS.items():
                 if column not in have:
@@ -2275,6 +2312,15 @@ class Library:
         if fix:
             self.db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('last_no', ?)", (str(nxt),))
 
+    def change_no(self) -> int:
+        """Veritabanına şimdiye kadar yapılan yazma sayısı (eşitleme için)."""
+        with self.lock:
+            row = self.db.execute("SELECT value FROM meta WHERE key='change_no'").fetchone()
+        try:
+            return int(row[0]) if row else 0
+        except ValueError:
+            return 0
+
     def _last_no(self) -> int:
         """Şimdiye kadar verilmiş en büyük numara (silinen kaynakların numarası bir daha verilmez)."""
         row = self.db.execute("SELECT value FROM meta WHERE key='last_no'").fetchone()
@@ -2295,10 +2341,18 @@ class Library:
             return stored or ""
         if not os.path.isabs(stored):
             return str(self.root / stored) if self.root else stored
-        if self.root and not file_exists_cached(stored):     # başka bilgisayardan kalma mutlak yol
-            alt = self.root / Path(stored.replace("\\", "/")).name
-            if file_exists_cached(alt):
-                return str(alt)
+        if not self.root:
+            return stored
+        alt = self.root / Path(stored.replace("\\", "/")).name   # başka bilgisayardan kalma mutlak yol
+        if threading.current_thread() is threading.main_thread():
+            # arayüz bulutu beklemesin: yalnızca bilinen sonuçlar; bilinmeyenleri liste arka planda yoklar
+            ok, _ = file_exists_known(stored)
+            if ok is None or ok:
+                return stored
+            alt_ok, _ = file_exists_known(alt)
+            return str(alt) if alt_ok is None or alt_ok else stored
+        if not file_exists_cached(stored) and file_exists_cached(alt):
+            return str(alt)
         return stored
 
     def _stored(self, path) -> str:
@@ -2334,6 +2388,11 @@ class Library:
                 self.db.backup(dest)
         finally:
             dest.close()
+
+    def snapshot_to(self, path) -> int:
+        """Veritabanının anlık kopyasını AYRI bir bağlantıyla alır (arayüzün kullandığı kilidi tutmaz).
+        Dönüş: kopyadaki değişiklik sayacı."""
+        return snapshot_db(self.path, path)
 
     def restore_from(self, path):
         src = sqlite3.connect(f"file:{Path(path).as_posix()}?mode=ro", uri=True)
@@ -2398,25 +2457,28 @@ class Library:
             item["file_path"] = self._abs(item["file_path"])
         return item
 
+    # Dosya yoklamaları (_to_item → _abs) kilidin DIŞINDA yapılır: bulut klasörü yavaşken arayüz beklemesin.
     def get(self, item_id: int):
         with self.lock:
             row = self.db.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
             if not row:
                 return None
-            item = self._to_item(row)
-            item["tags"] = sorted((r[0] for r in self.db.execute(
-                "SELECT tag FROM tags WHERE item_id=?", (item_id,))), key=tr_sort_key)
-            return item
+            tags = [r[0] for r in self.db.execute("SELECT tag FROM tags WHERE item_id=?", (item_id,))]
+        item = self._to_item(row)
+        item["tags"] = sorted(tags, key=tr_sort_key)
+        return item
 
     def all_items(self) -> list:
         with self.lock:
-            items = {row["id"]: self._to_item(row) for row in self.db.execute("SELECT * FROM items")}
-            for item in items.values():
-                item["tags"] = []
-            for item_id, tag in self.db.execute("SELECT item_id, tag FROM tags ORDER BY tag"):
-                if item_id in items:
-                    items[item_id]["tags"].append(tag)
-            return list(items.values())
+            rows = self.db.execute("SELECT * FROM items").fetchall()
+            tag_rows = self.db.execute("SELECT item_id, tag FROM tags ORDER BY tag").fetchall()
+        items = {row["id"]: self._to_item(row) for row in rows}
+        for item in items.values():
+            item["tags"] = []
+        for item_id, tag in tag_rows:
+            if item_id in items:
+                items[item_id]["tags"].append(tag)
+        return list(items.values())
 
     def all_tags(self) -> list:
         with self.lock:
@@ -4707,11 +4769,26 @@ def machine_name() -> str:
     return os.environ.get("COMPUTERNAME") or platform.node() or "bilgisayar"
 
 
+_DIR_CACHE = {}
+_MADE_DIRS = set()
+
+
+def _isdir_cached(folder) -> bool:
+    """Bulut klasörü (Drive) yoklaması yavaş olabildiği için sonucu kısa süre saklar."""
+    now = time.monotonic()
+    hit = _DIR_CACHE.get(folder)
+    if hit and now - hit[1] < (120 if hit[0] else 10):
+        return hit[0]
+    ok = os.path.isdir(folder)
+    _DIR_CACHE[folder] = (ok, now)
+    return ok
+
+
 def shared_dir(settings=None):
     """Ortak kütüphane açıksa ve klasöre ulaşılabiliyorsa '_Kütüphane Verisi' klasörü, değilse None."""
     s = settings if settings is not None else _load_settings_raw()
     folder = s.get("library_folder")
-    if not s.get("shared_library") or not folder or not os.path.isdir(folder):
+    if not s.get("shared_library") or not folder or not _isdir_cached(folder):
         return None
     return Path(folder) / SHARED_DIR_NAME
 
@@ -4720,12 +4797,31 @@ def data_dir() -> Path:
     """Anahtar kelimeler, Scopus listesi ve indirme geçmişi: ortak kütüphanede bulutta, değilse bu bilgisayarda."""
     shared = shared_dir()
     if shared is not None:
+        if str(shared) in _MADE_DIRS:
+            return shared
         try:
             shared.mkdir(parents=True, exist_ok=True)
+            _MADE_DIRS.add(str(shared))
             return shared
         except OSError:
             pass
     return settings_path().parent
+
+
+_SHARED_STATE = {"path": "", "data": {}, "t": None}
+
+
+def shared_state(shared, max_age=120.0) -> dict:
+    """Buluttaki tarama durumu (son tarama tarihi). Arayüz iş parçacığı bulutu beklemesin diye bellekten
+    okunur; arka plan eşitlemesi max_age=0 ile tazeler."""
+    path = str(Path(shared) / SHARED_STATE_NAME)
+    c = _SHARED_STATE
+    if c["path"] == path and c["t"] is not None and max_age > 0:
+        if time.monotonic() - c["t"] < max_age or threading.current_thread() is threading.main_thread():
+            return dict(c["data"])
+    data = _read_json(path)
+    c.update(path=path, data=data, t=time.monotonic())
+    return dict(data)
 
 
 def _read_json(path):
@@ -4804,6 +4900,8 @@ class LibrarySync:
 
     def local_changed(self) -> bool:
         state = self._state()
+        if "synced_change" in state:
+            return self.lib.change_no() != state["synced_change"]
         if not state.get("local_hash"):
             return self.lib.count() > 0
         if _file_stat(self.lib.path) == state.get("local_stat"):
@@ -4828,19 +4926,13 @@ class LibrarySync:
             return "cakisma"
         return "gonder" if local else "al" if shared else "esit"
 
-    def _local_fingerprint(self):
-        with self.lib.lock:
-            self.lib.db.commit()
-            return _file_hash(self.lib.path), _file_stat(self.lib.path)
-
-    def _mark_synced(self, rev, fingerprint=None):
-        local_hash, local_stat = fingerprint or self._local_fingerprint()
-        self._save_state(local_hash=local_hash, local_stat=local_stat,
+    def _mark_synced(self, rev, change=None):
+        self._save_state(synced_change=self.lib.change_no() if change is None else change,
                          shared_rev=rev, last_sync=datetime.now().strftime("%d.%m.%Y %H:%M"))
 
     def _backup_local(self):
         folder = settings_path().parent / "Yedekler"
-        self.lib.backup_to(folder / f"kutuphane_{datetime.now():%Y%m%d_%H%M%S}.db")
+        self.lib.snapshot_to(folder / f"kutuphane_{datetime.now():%Y%m%d_%H%M%S}.db")
         _rotate_backups(folder, "kutuphane_")
 
     # işlemler
@@ -4864,14 +4956,12 @@ class LibrarySync:
             return "cakisma"
         folder.mkdir(parents=True, exist_ok=True)
         snapshot = settings_path().parent / f"gonderilecek_{os.getpid()}_{threading.get_ident()}.db"
-        with self.lib.lock:                                   # anlık kopya + parmak izi (kısa sürer)
-            self.lib.backup_to(snapshot)
-            fingerprint = self._local_fingerprint()
+        change = self.lib.snapshot_to(snapshot)               # arayüzün kilidini tutmaz
         target = folder / SHARED_DB_NAME
-        if target.is_file():                                  # önceki ortak kopya yedeklenir
-            backups = folder / "Yedekler"
-            backups.mkdir(exist_ok=True)
-            try:
+        backups = folder / "Yedekler"
+        if target.is_file() and not any(backups.glob(f"ortak_{datetime.now():%Y%m%d}_*.db")):
+            try:                                              # önceki ortak kopya: günde bir yedek yeter
+                backups.mkdir(exist_ok=True)
                 shutil.copy2(target, backups / f"ortak_{datetime.now():%Y%m%d_%H%M%S}.db")
                 _rotate_backups(backups, "ortak_")
             except OSError:
@@ -4887,7 +4977,7 @@ class LibrarySync:
         _write_json(folder / SHARED_META_NAME, {"rev": rev, "machine": machine_name(), "items": self.lib.count(),
                                                 "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                                                 "version": APP_VERSION})
-        self._mark_synced(rev, fingerprint)
+        self._mark_synced(rev, change)
         diag(f"ortak kütüphaneye gönderildi ({self.lib.count()} kaynak)")
         return "gonderildi"
 
@@ -4903,9 +4993,9 @@ class LibrarySync:
         self._backup_local()
         with self.lib.lock:
             self.lib.restore_from(tmp)
-            fingerprint = self._local_fingerprint()
+            change = self.lib.change_no()
         tmp.unlink(missing_ok=True)
-        self._mark_synced(meta.get("rev"), fingerprint)
+        self._mark_synced(meta.get("rev"), change)
         diag(f"ortak kütüphane alındı ({meta.get('machine')}, {meta.get('saved_at')})")
         return "alindi"
 
@@ -4913,7 +5003,7 @@ class LibrarySync:
         """Ortak kopya esas alınır, bu bilgisayarda olup orada olmayanlar eklenir, sonra gönderilir."""
         meta = self.meta()
         mine_path = settings_path().parent / "yerel_gecici.db"
-        self.lib.backup_to(mine_path)
+        self.lib.snapshot_to(mine_path)
         self._backup_local()
         tmp = self._local_copy_of_shared()
         self.lib.restore_from(tmp)
@@ -5037,9 +5127,13 @@ def write_phone_export(library, folder) -> Path:
     rows = [["Yazar", "Yıl", "Başlık", "Dergi / Kitap", "Etiketler", "Scopus", "PDF dosyası", "APA 7",
              "Alıntı kartları", "DOI / Link", "Eklenme"]]
     cards_rows = [["Kaynak", "Sayfa", "Alıntı", "Yorum", "Atıf"]]
+    all_cards = {}
+    with library.lock:
+        for row in library.db.execute("SELECT * FROM cards ORDER BY id"):
+            all_cards.setdefault(row["item_id"], []).append(dict(row))
     for item in items:
-        cards = library.cards(item["id"])
-        has_pdf = bool(item["file_path"]) and os.path.exists(item["file_path"])
+        cards = all_cards.get(item["id"], [])
+        has_pdf = file_exists_cached(item["file_path"])
         rows.append([first_author_label(item), item["year"], item["title"], item["container"],
                      ", ".join(item["tags"]), scopus_label(item, scopus) if scopus else "",
                      Path(item["file_path"]).name if has_pdf else "PDF yok", apa_text(item, "tr"),
@@ -5203,9 +5297,14 @@ _SCOPUS_CACHE = {"key": None, "data": None}
 
 def load_scopus():
     path = scopus_path()
+    now = time.monotonic()
+    if _SCOPUS_CACHE.get("path") == str(path) and now - _SCOPUS_CACHE.get("checked", -1e9) < 60:
+        return _SCOPUS_CACHE["data"]                 # bulutta olabilir: dakikada bir yoklamak yeter
+    _SCOPUS_CACHE.update(path=str(path), checked=now)
     try:
         key = path.stat().st_mtime
     except OSError:
+        _SCOPUS_CACHE.update(key=None, data=None)
         return None
     if _SCOPUS_CACHE["key"] != key:
         try:
@@ -5225,7 +5324,7 @@ def import_scopus_list(xlsx_path) -> dict:
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(data, fh, ensure_ascii=False, separators=(",", ":"))
     os.replace(tmp, path)
-    _SCOPUS_CACHE["key"] = None
+    _SCOPUS_CACHE.update(key=None, checked=-1e9)
     return data
 
 
@@ -5801,7 +5900,7 @@ def load_settings() -> dict:
     data = _load_settings_raw()
     shared = shared_dir(data)
     if shared is not None:
-        state = _read_json(shared / SHARED_STATE_NAME)
+        state = shared_state(shared)
         if state.get("last_scan"):
             data["last_scan"] = state["last_scan"]
             name = state.get("last_report_name")
@@ -5839,11 +5938,12 @@ def _save_settings(data: dict):
     shared = shared_dir(data)
     if shared is not None and data.get("last_scan"):
         try:
-            state = _read_json(shared / SHARED_STATE_NAME)
+            state = shared_state(shared)
             if not state.get("last_scan") or data["last_scan"] > state["last_scan"]:
-                _write_json(shared / SHARED_STATE_NAME, {
-                    "last_scan": data["last_scan"], "machine": machine_name(),
-                    "last_report_name": Path(data["last_report"]).name if data.get("last_report") else ""})
+                new = {"last_scan": data["last_scan"], "machine": machine_name(),
+                       "last_report_name": Path(data["last_report"]).name if data.get("last_report") else ""}
+                _write_json(shared / SHARED_STATE_NAME, new)
+                _SHARED_STATE.update(path=str(shared / SHARED_STATE_NAME), data=new, t=time.monotonic())
         except OSError:
             pass
 
@@ -7483,8 +7583,12 @@ class LibraryTab:
         self.by_id = {i["id"]: i for i in self.items}
         card_counts = self.lib.card_counts()
         scopus = load_scopus()
+        to_check = []
         for item in self.items:
-            item["has_pdf"] = file_exists_cached(item["file_path"])
+            known, stale = file_exists_known(item["file_path"])
+            item["has_pdf"] = bool(item["file_path"]) if known is None else known    # bilinmiyorsa: var say
+            if item["file_path"] and stale:
+                to_check.append((item["file_path"], item["has_pdf"]))
             item["cards"] = card_counts.get(item["id"], 0)
             info = scopus_info(item, scopus) if scopus else None
             item["_scopus"] = info[0] if info else ""
@@ -7550,6 +7654,31 @@ class LibraryTab:
         self.count_label.configure(text=f"{len(shown)} / {len(self.items)} kaynak · {new} yeni · {nopdf} PDF'siz")
         if not keep:
             self._show(None)
+        if to_check:
+            self._check_files(to_check)
+
+    def _check_files(self, pairs):
+        """PDF'lerin gerçekten yerinde olup olmadığını arka planda yoklar (Drive yavaşken arayüz donmasın);
+        gösterilenden farklı çıkan olursa listeyi tazeler."""
+        running = getattr(self, "_file_checker", None)
+        if running is not None and running.is_alive():
+            return
+        events = self.app.events
+
+        def work():
+            differs = False
+            for path, shown in pairs:
+                try:
+                    ok = os.path.isfile(path)
+                except OSError:
+                    ok = False
+                _EXISTS_CACHE[str(path)] = (ok, time.monotonic())
+                differs = differs or ok != shown
+            if differs:
+                events.put(("files_checked",))
+
+        self._file_checker = threading.Thread(target=work, name="pdf-yoklama", daemon=True)
+        self._file_checker.start()
 
     def _sort(self, col):
         if self.sort_col == col:
@@ -7601,7 +7730,7 @@ class LibraryTab:
             self.open_btn.configure(state="disabled")
             self.show_btn.configure(state="disabled")
             return
-        has_pdf = bool(item["file_path"]) and Path(item["file_path"]).is_file()
+        has_pdf = item["has_pdf"] if "has_pdf" in item else file_exists_cached(item["file_path"])
         self.open_btn.configure(state="normal" if has_pdf else "disabled")
         self.show_btn.configure(state="normal" if has_pdf else "disabled")
         self.attach_btn.configure(text="PDF'i Değiştir…" if has_pdf else "PDF Bağla…")
@@ -8788,7 +8917,7 @@ class App(ctk.CTk):
         """Claude (ya da tarama görevi) kütüphaneyi değiştirdiyse pencereye dönünce listeyi tazele."""
         if self.sync.folder() is not None and time.time() - self._last_focus_sync > 60:
             self._last_focus_sync = time.time()
-            self.sync_in_background()
+            self.sync_in_background(send=False)
         stamp = self._library_stamp()
         if stamp != self._db_stamp:
             self._db_stamp = stamp
@@ -8845,7 +8974,7 @@ class App(ctk.CTk):
         finally:
             self.after(5 * 60_000, self._sync_tick)
 
-    def sync_in_background(self, manual=False, startup=False) -> bool:
+    def sync_in_background(self, manual=False, startup=False, send=True) -> bool:
         """Ortak kütüphaneyi arayüzü dondurmadan eşitler (bulut klasörü yavaş olabilir).
         Çakışma olursa soru ana pencerede sorulur."""
         if self.sync.folder() is None:
@@ -8861,8 +8990,13 @@ class App(ctk.CTk):
                 if startup:
                     others = sync.other_sessions()
                 sync.heartbeat()
+                folder = sync.folder()
+                if folder is not None:
+                    shared_state(folder, max_age=0)          # son tarama bilgisini tazele
                 state = sync.status()
-                if state in ("ilk", "gonder"):
+                if state in ("ilk", "gonder") and not send:
+                    result = "bekliyor"                       # bir sonraki 5 dakikalık turda gönderilir
+                elif state in ("ilk", "gonder"):
                     result = sync.push()
                 elif state == "al":
                     result = sync.pull()
@@ -8893,7 +9027,9 @@ class App(ctk.CTk):
             self.settings = load_settings()
             self.library_tab.refresh()
             self.toast(f"{machine or 'Öbür bilgisayar'} bilgisayarındaki değişiklikler alındı.")
-        if result in ("gonderildi", "alindi", "birlestirildi"):
+        if result in ("gonderildi", "alindi", "birlestirildi") and \
+                time.time() - getattr(self, "_last_phone_export", 0) > 30 * 60:
+            self._last_phone_export = time.time()
             self._write_phone_export()
         try:
             self.scan_tab.refresh_sync_label()
@@ -9517,6 +9653,8 @@ class App(ctk.CTk):
             n, total, title, no = message[1:]
             self.library_tab.count_label.configure(
                 text=f"PDF aranıyor · No {no} ({n + 1}/{total}): {shorten(title, 44)}")
+        elif kind == "files_checked":
+            self.library_tab.refresh()
         elif kind == "sync_bg":
             self.on_sync_bg(*message[1:])
         elif kind == "retry_done":
