@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.20"
+APP_VERSION = "2.21"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -7038,6 +7038,11 @@ class RangeDialog(ctk.CTkToplevel):
         return out
 
     def _prefill(self):
+        # filtreler her şeyi eliyorsa (ör. hepsi bugün denendi) kutuları baştan kaldır, boş pencere açılmasın
+        if not self._base() and self.skip_var.get():
+            self.skip_var.set(False)
+        if not self._base() and self.filtered and self.visible_var.get():
+            self.visible_var.set(False)
         base = self._base() or self.nopdf
         key = "retry_next_no" if self.purpose == "retry" else "queue_next_no"
         start_no = int(_load_settings_raw().get(key) or 0)
@@ -7087,9 +7092,10 @@ class RangeDialog(ctk.CTkToplevel):
             self.ok_btn.configure(state="disabled")
             return
         if not items:
-            self.summary.configure(text="Bu seçimde PDF'i olmayan kaynak yok.")
+            self.summary.configure(text=self._why_empty(rng), text_color=LOG_COLORS["warn"])
             self.ok_btn.configure(state="disabled")
             return
+        self.summary.configure(text_color=MUTED)
         minutes = max(1, round(len(items) * self.SECONDS[self.purpose] / 60))
         verb = "aranacak" if self.purpose == "retry" else "açılacak"
         listed = no_ranges_text([i.get("no") for i in items], 10)
@@ -7097,6 +7103,29 @@ class RangeDialog(ctk.CTkToplevel):
         self.summary.configure(text=f"{label}: {len(items)} PDF'siz kaynak {verb}{detail}\n"
                                     f"Tahmini süre: ~{minutes} dk")
         self.ok_btn.configure(state="normal")
+
+    def _why_empty(self, rng) -> str:
+        """Seçim neden boş? Kullanıcıya hangi kutuyu kaldırması gerektiğini söyler."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        pool = self.chosen if self.mode.get() == "selected" else \
+            [i for i in self.nopdf if rng and rng[0] <= (i.get("no") or 0) <= rng[1]]
+        if not pool:
+            if rng and self.nopdf:
+                lo, hi = self.nopdf[0].get("no") or 0, self.nopdf[-1].get("no") or 0
+                return (f"No {rng[0]}–{rng[1]} arasında PDF'i olmayan kaynak yok. PDF'siz kaynaklar No {lo} ile "
+                        f"{hi} arasında; 'Tümü'ne basabilirsiniz.")
+            return "Bu seçimde PDF'i olmayan kaynak yok."
+        reasons = []
+        today_n = sum(1 for i in pool if (i.get("pdf_tried") or "") == today)
+        hidden_n = sum(1 for i in pool if i["id"] not in self.visible_ids) \
+            if self.filtered and self.visible_var.get() and self.mode.get() != "selected" else 0
+        if self.skip_var.get() and today_n:
+            reasons.append(f"{today_n} tanesi bugün zaten denendi — yeniden denemek için "
+                           "'Bugün zaten denenmiş olanları atla' işaretini kaldırın")
+        if hidden_n:
+            reasons.append(f"{hidden_n} tanesi tablodaki arama/etiket filtresine uymuyor — "
+                           "'Yalnızca tabloda görünenler' işaretini kaldırın")
+        return f"Bu seçimde {len(pool)} PDF'siz kaynak var ama " + "; ".join(reasons or ["hepsi elendi"]) + "."
 
     def _ok(self):
         items, label, rng = self.selection()
