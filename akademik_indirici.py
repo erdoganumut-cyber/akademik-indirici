@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.19"
+APP_VERSION = "2.20"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -808,16 +808,132 @@ class WrongPdf(Exception):
     """İnen PDF'in başlığı makale sayfasındaki başlıkla uyuşmuyor (başka bir yayın)."""
 
 
+class RateLimited(DownloadError):
+    """Site 'çok fazla istek' (HTTP 429) dedi ve bir süre dinlendiriliyor."""
+
+
+class HostThrottle:
+    """Siteye nazik davranır: aynı siteye art arda istekler arasında en az belli bir süre bırakır,
+    'çok fazla istek' (429) gelirse o siteyi istenen süre (Retry-After) ya da giderek artan sürelerle
+    dinlendirir. Bütün iş parçacıkları (indirme, tarama, PDF arama) aynı sayacı paylaşır."""
+
+    DEFAULT_GAP = 1.0
+    GAPS = {"dergipark.org.tr": 3.0, "tez.yok.gov.tr": 1.5, "doi.org": 0.5, "api.crossref.org": 0.2,
+            "api.unpaywall.org": 0.3, "api.openalex.org": 0.2, "scholar.google.com": 15.0,
+            "127.0.0.1": 0.0, "localhost": 0.0}
+    MAX_GAP = 20.0
+    MAX_BLOCK = 60.0                 # bundan uzun dinlenme gerekiyorsa beklemeden RateLimited verilir
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.next_ok, self.cool_until, self.strikes, self.extra = {}, {}, {}, {}
+        self.local = threading.local()
+
+    @staticmethod
+    def key(host) -> str:
+        host = (host or "").lower()
+        host = host[4:] if host.startswith("www.") else host
+        for name in HostThrottle.GAPS:
+            if host == name or host.endswith("." + name):
+                return name
+        return host
+
+    def gap(self, key) -> float:
+        return min(self.GAPS.get(key, self.DEFAULT_GAP) * self.extra.get(key, 1.0), self.MAX_GAP)
+
+    def cooling(self, host) -> float:
+        """Sitenin dinlenmesine kalan süre (sn)."""
+        return max(0.0, self.cool_until.get(self.key(host), 0.0) - time.monotonic())
+
+    def wait(self, host):
+        key = self.key(host)
+        with self.lock:
+            now = time.monotonic()
+            cool = self.cool_until.get(key, 0.0) - now
+            if cool > self.MAX_BLOCK:
+                self.local.limited = True
+                raise RateLimited(f"{key} 'çok fazla istek' dedi; site yaklaşık {int(cool // 60) + 1} dakika "
+                                  "dinlendiriliyor, sonra yeniden deneyin")
+            start = max(now, self.next_ok.get(key, 0.0), self.cool_until.get(key, 0.0))
+            self.next_ok[key] = start + self.gap(key)
+        if start > now:
+            time.sleep(start - now)
+
+    def limited(self, host, retry_after=None) -> float:
+        key = self.key(host)
+        with self.lock:
+            strikes = self.strikes.get(key, 0) + 1
+            self.strikes[key] = strikes
+            pause = retry_after if retry_after else min(20 * 2 ** (strikes - 1), 900)
+            pause = min(max(pause, 5), 3600)
+            self.cool_until[key] = max(self.cool_until.get(key, 0.0), time.monotonic() + pause)
+            self.extra[key] = min(self.extra.get(key, 1.0) * 2, 8.0)      # bundan sonra daha yavaş git
+        self.local.limited = True
+        diag(f"{key}: çok fazla istek (429) — {pause:.0f} sn dinlendiriliyor, istek aralığı "
+             f"{self.gap(key):.1f} sn", throttle=True)
+        return pause
+
+    def success(self, host):
+        key = self.key(host)
+        if self.strikes.get(key):
+            with self.lock:
+                self.strikes[key] = max(0, self.strikes[key] - 1)
+
+    # iş parçacığı başına 'bu kaynakta istek sınırına takıldık mı?' işareti
+    def reset_flag(self):
+        self.local.limited = False
+
+    def was_limited(self) -> bool:
+        return bool(getattr(self.local, "limited", False))
+
+
+THROTTLE = HostThrottle()
+
+
+def parse_retry_after(value):
+    if not value:
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return float(value)
+    try:
+        from email.utils import parsedate_to_datetime
+        return max(0.0, (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds())
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+class PoliteAdapter(HTTPAdapter):
+    """Her isteği HostThrottle'dan geçirir; 429'da siteyi dinlendirir, kısa bir bekleme yetiyorsa bir kez
+    daha dener."""
+
+    def send(self, request, **kwargs):
+        host = urlparse(request.url).hostname or ""
+        for attempt in range(2):
+            THROTTLE.wait(host)
+            resp = super().send(request, **kwargs)
+            if resp.status_code == 429 or (resp.status_code == 503 and resp.headers.get("Retry-After")):
+                pause = THROTTLE.limited(host, parse_retry_after(resp.headers.get("Retry-After")))
+                if attempt == 0 and pause <= HostThrottle.MAX_BLOCK:
+                    resp.close()
+                    continue                                   # wait() dinlenme bitene kadar bekletir
+                return resp
+            if resp.status_code < 400:
+                THROTTLE.success(host)
+            return resp
+        return resp
+
+
 def make_session() -> requests.Session:
     session = requests.Session()
     session.headers.update(HEADERS)
     retry = Retry(
         total=2, connect=1, read=1, backoff_factor=1.0,
-        status_forcelist=(429, 500, 502, 503, 504),
+        status_forcelist=(500, 502, 504),                   # 429/503'ü PoliteAdapter ele alır
         allowed_methods=frozenset({"GET", "HEAD"}),
         raise_on_status=False, respect_retry_after_header=False,
     )
-    adapter = HTTPAdapter(max_retries=retry)
+    adapter = PoliteAdapter(max_retries=retry)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
@@ -2942,8 +3058,8 @@ def record_from_html_file(path: Path, link: str = "") -> tuple:
 class PdfRetryWorker(threading.Thread):
     """PDF'siz kaynakların PDF'ini yeniden arar: açık erişim (Unpaywall), yayıncı sayfası, YÖK Tez.
     Kaynaklar kayıt numarası sırasıyla denenir.
-    Mesajlar: ("retry", sıra, toplam, başlık, no) ·
-              ("retry_done", bulunan, denenen, durduruldu_mu, bulunan_nolar, denenen_nolar)"""
+    Mesajlar: ("retry", sıra, toplam, başlık, no) · ("retry_wait", saniye, ertelenen_sayısı) ·
+              ("retry_done", bulunan, denenen, durduruldu_mu, bulunan_nolar, denenen_nolar, ertelenen_nolar)"""
 
     PAUSE = 2.0                         # yayıncı sunucularını yormamak için kaynaklar arası bekleme
 
@@ -2953,72 +3069,103 @@ class PdfRetryWorker(threading.Thread):
         self.library, self.events, self.library_folder, self.email = library, events, library_folder, email
         self.cancel = threading.Event()
 
+    SECOND_PASS_WAIT = 300              # ertelenenler için en fazla bu kadar beklenir (sn)
+
     def run(self):
-        found = tried = 0
-        found_nos, tried_nos = [], []
+        found_nos, tried_nos, deferred = [], [], []
         try:
-            session = make_session()
-            downloader = DownloadWorker([], self.library_folder, {
+            self.session = make_session()
+            self.downloader = DownloadWorker([], self.library_folder, {
                 "find_pdf": True, "save_html": False, "email": self.email, "library": None,
                 "library_folder": self.library_folder}, queue.Queue(), self.cancel)
-            yses = None
+            self.yses = None
             today = datetime.now().strftime("%Y-%m-%d")
+            total = len(self.items)
             for n, item in enumerate(self.items):
                 if self.cancel.is_set():
                     break
-                self.events.put(("retry", n, len(self.items), item["title"], item.get("no") or 0))
-                current = self.library.get(item["id"])
-                if not current or (current["file_path"] and os.path.exists(current["file_path"])):
+                self.events.put(("retry", n, total, item["title"], item.get("no") or 0))
+                outcome = self._attempt(item, n)
+                if outcome is None:
                     continue
-                tried += 1
                 tried_nos.append(item.get("no") or 0)
-                before = found
-                try:
-                    tez = yok_tez_no(current)
-                    if tez:
-                        if yses is None:
-                            yses = make_session()
-                            yok_open_session(yses)
-                        hits = [r for r in search_yok(yses, tez) if r.get("tez_no") == tez]
-                        url = yok_pdf_url(yses, hits[0]["yok_keys"]) if hits else None
-                        if url:
-                            tmp = Path(self.library_folder) / f".yok_{tez}.part"
-                            with yses.get(url, stream=True, timeout=(15, 180)) as r:
-                                r.raise_for_status()
-                                with open(tmp, "wb") as fh:
-                                    for block in r.iter_content(1 << 16):
-                                        fh.write(block)
-                            if tmp.read_bytes()[:1024].find(b"%PDF-") >= 0:
-                                attach_pdf(self.library, item["id"], tmp, self.library_folder, move=True)
-                                found += 1
-                            else:
-                                tmp.unlink(missing_ok=True)
-                        time.sleep(YOK_PAUSE)
-                    else:
-                        links = (["https://doi.org/" + current["doi"]] if current["doi"] else []) + \
-                                ([current["url"]] if current["url"] else [])
-                        for link in links:
-                            downloader._last_saved = None
-                            downloader._tried = set()
-                            result = downloader._download_one(session, link, n)
-                            saved = downloader._last_saved
-                            if result[0] == "ok" and saved and str(saved["path"]).lower().endswith(".pdf"):
-                                other = self.library.find_by_sha(saved["sha"])
-                                if other and other != item["id"]:
-                                    break
-                                attach_pdf(self.library, item["id"], saved["path"], self.library_folder, move=True)
-                                found += 1
-                                break
-                        time.sleep(self.PAUSE)
-                except Exception as exc:
-                    diag(f"PDF yeniden arama: {item['title'][:60]}: {describe_error(exc)}")
-                if found > before:
+                if outcome == "found":
                     found_nos.append(item.get("no") or 0)
-                self.library.update(item["id"], {"pdf_tried": today})
-            session.close()
+                if outcome == "limited":
+                    deferred.append(item)                       # 'denendi' sayılmaz, sonra yeniden
+                else:
+                    self.library.update(item["id"], {"pdf_tried": today})
+            # istek sınırına takılanlar: siteler dinlenince bir kez daha
+            if deferred and not self.cancel.is_set():
+                wait = min(max((THROTTLE.cooling(h) for h in list(THROTTLE.cool_until)), default=0),
+                           self.SECOND_PASS_WAIT)
+                if wait > 0:
+                    self.events.put(("retry_wait", int(wait), len(deferred)))
+                    self.cancel.wait(wait)
+                retry_now, deferred = deferred, []
+                for n, item in enumerate(retry_now):
+                    if self.cancel.is_set():
+                        deferred.extend(retry_now[n:])
+                        break
+                    self.events.put(("retry", n, len(retry_now), "(ertelenen) " + item["title"],
+                                     item.get("no") or 0))
+                    outcome = self._attempt(item, n)
+                    if outcome == "found":
+                        found_nos.append(item.get("no") or 0)
+                    if outcome == "limited":
+                        deferred.append(item)
+                    elif outcome is not None:
+                        self.library.update(item["id"], {"pdf_tried": today})
+            self.session.close()
         except Exception:
             diag_exception("PDF yeniden arama")
-        self.events.put(("retry_done", found, tried, self.cancel.is_set(), found_nos, tried_nos))
+        self.events.put(("retry_done", len(found_nos), len(tried_nos), self.cancel.is_set(), found_nos,
+                         tried_nos, [i.get("no") or 0 for i in deferred]))
+
+    def _attempt(self, item, n):
+        """Tek kaynak için PDF arar. Dönüş: None (zaten PDF'i var) · 'found' · 'none' · 'limited'"""
+        current = self.library.get(item["id"])
+        if not current or (current["file_path"] and os.path.exists(current["file_path"])):
+            return None
+        THROTTLE.reset_flag()
+        try:
+            tez = yok_tez_no(current)
+            if tez:
+                if self.yses is None:
+                    self.yses = make_session()
+                    yok_open_session(self.yses)
+                hits = [r for r in search_yok(self.yses, tez) if r.get("tez_no") == tez]
+                url = yok_pdf_url(self.yses, hits[0]["yok_keys"]) if hits else None
+                if url:
+                    tmp = Path(self.library_folder) / f".yok_{tez}.part"
+                    with self.yses.get(url, stream=True, timeout=(15, 180)) as r:
+                        r.raise_for_status()
+                        with open(tmp, "wb") as fh:
+                            for block in r.iter_content(1 << 16):
+                                fh.write(block)
+                    if tmp.read_bytes()[:1024].find(b"%PDF-") >= 0:
+                        attach_pdf(self.library, item["id"], tmp, self.library_folder, move=True)
+                        return "found"
+                    tmp.unlink(missing_ok=True)
+                time.sleep(YOK_PAUSE)
+            else:
+                links = (["https://doi.org/" + current["doi"]] if current["doi"] else []) + \
+                        ([current["url"]] if current["url"] else [])
+                for link in links:
+                    self.downloader._last_saved = None
+                    self.downloader._tried = set()
+                    result = self.downloader._download_one(self.session, link, n)
+                    saved = self.downloader._last_saved
+                    if result[0] == "ok" and saved and str(saved["path"]).lower().endswith(".pdf"):
+                        other = self.library.find_by_sha(saved["sha"])
+                        if other and other != item["id"]:
+                            break
+                        attach_pdf(self.library, item["id"], saved["path"], self.library_folder, move=True)
+                        return "found"
+                time.sleep(self.PAUSE)
+        except Exception as exc:
+            diag(f"PDF yeniden arama: {item['title'][:60]}: {describe_error(exc)}")
+        return "limited" if THROTTLE.was_limited() else "none"
 
 
 class HtmlImportWorker(threading.Thread):
@@ -8056,7 +8203,7 @@ class LibraryTab:
         self.app._log("info", f"PDF yeniden arama başladı: {label} ({len(items)} kaynak).")
         self.retry_worker.start()
 
-    def on_retry_done(self, found, tried, stopped, found_nos=(), tried_nos=()):
+    def on_retry_done(self, found, tried, stopped, found_nos=(), tried_nos=(), deferred_nos=()):
         self.retry_btn.configure(text="PDF'leri Yeniden Ara", state="normal", fg_color="#1F8F4E",
                                  hover_color="#18723E")
         label, rng = getattr(self, "_retry_run", ("", None))
@@ -8069,7 +8216,11 @@ class LibraryTab:
         msg += f" (No {no_ranges_text(found_nos, 8)})." if found_nos else "."
         if stopped:
             msg = f"Durduruldu — No {last}'e kadar denendi. " + msg if last else "Durduruldu. " + msg
-        if tried - found > 0:
+        if deferred_nos:
+            msg += (f" {len(deferred_nos)} kaynakta site 'çok fazla istek' dediği için arama ertelendi "
+                    f"(No {no_ranges_text(deferred_nos, 6)}); bunlar 'denenmedi' sayılır, bir süre sonra "
+                    "aynı aralıkla yeniden başlatın.")
+        if tried - found - len(deferred_nos) > 0:
             msg += " Kalanlar için 'PDF'sizleri Sırayla Aç'ı aynı aralıkla kullanabilirsiniz."
         self.app.toast(msg)
         missing = sorted(set(tried_nos) - set(found_nos))
@@ -9657,6 +9808,11 @@ class App(ctk.CTk):
             self.library_tab.refresh()
         elif kind == "sync_bg":
             self.on_sync_bg(*message[1:])
+        elif kind == "retry_wait":
+            secs, count = message[1:]
+            self.library_tab.count_label.configure(
+                text=f"{count} kaynakta site 'çok fazla istek' dedi; site dinlensin diye "
+                     f"{max(1, round(secs / 60))} dk bekleniyor, sonra yeniden denenecek…")
         elif kind == "retry_done":
             self.library_tab.on_retry_done(*message[1:])
         elif kind == "html_done":
