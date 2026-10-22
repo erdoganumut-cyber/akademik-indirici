@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.27"
+APP_VERSION = "2.28"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -3587,20 +3587,32 @@ class PdfRetryWorker(threading.Thread):
     """PDF'siz kaynakların PDF'ini yeniden arar: açık erişim (Unpaywall), yayıncı sayfası, YÖK Tez.
     Kaynaklar kayıt numarası sırasıyla denenir.
     Mesajlar: ("retry", sıra, toplam, başlık, no) · ("retry_wait", saniye, ertelenen_sayısı) ·
-              ("retry_done", bulunan, denenen, durduruldu_mu, bulunan_nolar, denenen_nolar, ertelenen_nolar)"""
+              ("retry_done", bulunan, denenen, durduruldu_mu, bulunan_nolar, denenen_nolar, ertelenen_nolar,
+               rapor_yolu)"""
 
     PAUSE = 2.0                         # yayıncı sunucularını yormamak için kaynaklar arası bekleme
 
-    def __init__(self, items, library, events, library_folder, email=""):
+    def __init__(self, items, library, events, library_folder, email="", label=""):
         super().__init__(daemon=True)
         self.items = sorted(items, key=lambda i: i.get("no") or 0)
         self.library, self.events, self.library_folder, self.email = library, events, library_folder, email
+        self.label = label
         self.cancel = threading.Event()
+        self.rows = {}                  # kaynak kimliği → rapor satırı
+        self._via = {}
 
     SECOND_PASS_WAIT = 300              # ertelenenler için en fazla bu kadar beklenir (sn)
 
+    def _note(self, item, outcome):
+        row = self.rows.setdefault(item["id"], {"item": item})
+        row["outcome"] = outcome or "had"
+        if outcome == "found":
+            row.update(self._via.get(item["id"], {}))
+
     def run(self):
         found_nos, tried_nos, deferred = [], [], []
+        started = time.monotonic()
+        report = None
         try:
             self.session = make_session()
             self.downloader = DownloadWorker([], self.library_folder, {
@@ -3614,6 +3626,7 @@ class PdfRetryWorker(threading.Thread):
                     break
                 self.events.put(("retry", n, total, item["title"], item.get("no") or 0))
                 outcome = self._attempt(item, n)
+                self._note(item, outcome)
                 if outcome is None:
                     continue
                 tried_nos.append(item.get("no") or 0)
@@ -3638,6 +3651,7 @@ class PdfRetryWorker(threading.Thread):
                     self.events.put(("retry", n, len(retry_now), "(ertelenen) " + item["title"],
                                      item.get("no") or 0))
                     outcome = self._attempt(item, n)
+                    self._note(item, outcome)
                     if outcome == "found":
                         found_nos.append(item.get("no") or 0)
                     if outcome == "limited":
@@ -3647,8 +3661,15 @@ class PdfRetryWorker(threading.Thread):
             self.session.close()
         except Exception:
             diag_exception("PDF yeniden arama")
+        try:
+            report = write_retry_report(self.library_folder, self.label, [self.rows[k] for k in self.rows],
+                                        [i for i in self.items if i["id"] not in self.rows],
+                                        time.monotonic() - started, self.cancel.is_set(), bool(self.email),
+                                        bool(load_settings().get("core_api_key")))
+        except Exception:
+            diag_exception("PDF arama raporu")
         self.events.put(("retry_done", len(found_nos), len(tried_nos), self.cancel.is_set(), found_nos,
-                         tried_nos, [i.get("no") or 0 for i in deferred]))
+                         tried_nos, [i.get("no") or 0 for i in deferred], str(report) if report else ""))
 
     def _attempt(self, item, n):
         """Tek kaynak için PDF arar. Dönüş: None (zaten PDF'i var) · 'found' · 'none' · 'limited'"""
@@ -3673,7 +3694,8 @@ class PdfRetryWorker(threading.Thread):
                             for block in r.iter_content(1 << 16):
                                 fh.write(block)
                     if tmp.read_bytes()[:1024].find(b"%PDF-") >= 0:
-                        attach_pdf(self.library, item["id"], tmp, self.library_folder, move=True)
+                        placed = attach_pdf(self.library, item["id"], tmp, self.library_folder, move=True)
+                        self._via[item["id"]] = {"via": "YÖK Tez Merkezi", "file": Path(placed).name}
                         return "found"
                     tmp.unlink(missing_ok=True)
                 time.sleep(YOK_PAUSE)
@@ -3703,7 +3725,9 @@ class PdfRetryWorker(threading.Thread):
             if other and other != item["id"]:
                 Path(saved["path"]).unlink(missing_ok=True)
                 return False
-            attach_pdf(self.library, item["id"], saved["path"], self.library_folder, move=True)
+            placed = attach_pdf(self.library, item["id"], saved["path"], self.library_folder, move=True)
+            self._via[item["id"]] = {"via": (result[2] if len(result) > 2 else "") or "yayıncı sayfası",
+                                     "file": Path(placed).name}
             return True
         return False
 
@@ -4660,6 +4684,114 @@ def search_crossref(session, query: str, since: datetime, rows: int = 100):
 
 def _h(text) -> str:
     return html.escape(str(text or ""))
+
+
+def write_retry_report(library_folder, label, rows, untouched, seconds, stopped, has_email, has_core) -> Path:
+    """'PDF'leri Yeniden Ara' sonunda HTML rapor: kaç kaynak arandı, kaçının PDF'i nereden bulundu,
+    bulunamayanlar (makale sayfası ve Google Akademik bağlantılarıyla), ertelenenler."""
+    folder = Path(library_folder or settings_path().parent) / "Tarama Raporları"
+    now = datetime.now()
+    path = unique_path(folder, f"PDF Arama Raporu {now:%Y-%m-%d %H%M}.html")
+    found = [r for r in rows if r["outcome"] == "found"]
+    none = [r for r in rows if r["outcome"] == "none"]
+    limited = [r for r in rows if r["outcome"] == "limited"]
+    had = [r for r in rows if r["outcome"] == "had"]
+
+    def who(item):
+        people = item.get("authors") or []
+        name = people[0].get("family", "") if people else ""
+        return name + (" vd." if len(people) > 2 else f" ve {people[1].get('family', '')}" if len(people) == 2 else "")
+
+    def line(row, extra=""):
+        item = row["item"]
+        meta = " · ".join(x for x in (who(item), item.get("container"), str(item.get("year") or "")) if x)
+        return (f'<li><div class="t"><span class="no">No {_h(item.get("no") or "?")}</span> {_h(item.get("title"))}</div>'
+                f'<div class="m">{_h(meta)}</div>{extra}</li>')
+
+    def found_line(row):
+        via = re.sub(r"^[\d.,]+\s*[KMG]?B,?\s*", "", row.get("via", "")).strip()       # '515 KB, …' boyutu at
+        via = {"makale sayfasındaki PDF bağlantısından": "yayıncının makale sayfası",
+               "doğrudan PDF bağlantısı": "doğrudan PDF bağlantısı"}.get(via, via) or "yayıncı sayfası"
+        return line(row, f'<div class="c"><span class="chip ok">PDF bağlandı</span><span class="chip">{_h(via)}</span>'
+                         f'<span class="kw">{_h(row.get("file", ""))}</span></div>')
+
+    def missing_line(row, cls="warn", label="Bulunamadı"):
+        item = row["item"]
+        links = [f'<a href="{_h(item_open_link(item))}">Makale sayfası</a>',
+                 f'<a href="{_h(search_link(item, "Google Akademik"))}">Google Akademik</a>',
+                 f'<a href="{_h(search_link(item, "BASE (kurum arşivleri)"))}">BASE</a>']
+        db = database_for_doi(item.get("doi") or "")
+        return line(row, f'<div class="c"><span class="chip {cls}">{label}</span>'
+                         + (f'<span class="chip inst">kurum erişimi: {_h(db)}</span>' if db else "")
+                         + f'<span class="links">{" · ".join(links)}</span></div>')
+
+    searched = ["yayıncı sayfası (DOI / link)"] + (["Unpaywall"] if has_email else []) + \
+        ["OpenAlex", "Semantic Scholar", "CORE" + (" (anahtarlı)" if has_core else ""), "YÖK Tez Merkezi (tezlerde)"]
+    minutes = max(1, round(seconds / 60))
+    sections = []
+    if found:
+        sections.append(f'<section><h2>PDF\'i bulunup bağlananlar <small>{len(found)}</small></h2>'
+                        f'<ul>{"".join(found_line(r) for r in found)}</ul></section>')
+    if none:
+        sections.append(f'<section><h2>Bulunamayanlar <small>{len(none)}</small></h2>'
+                        '<p class="note">Bunların herkese açık kopyası bulunamadı. Kurum erişiminizle makale sayfasından '
+                        'ya da Google Akademik sonuçlarındaki [PDF] bağlantılarından indirebilirsiniz; '
+                        '"PDF\'sizleri Sırayla Aç" bu adımı kolaylaştırır.</p>'
+                        f'<ul>{"".join(missing_line(r) for r in none)}</ul></section>')
+    if limited:
+        sections.append(f'<section><h2>Ertelenenler <small>{len(limited)}</small></h2>'
+                        '<p class="note">Site "çok fazla istek" dediği için aranamadı; "denenmedi" sayıldı. Bir süre sonra '
+                        'aynı aralıkla yeniden başlatın.</p>'
+                        f'<ul>{"".join(missing_line(r, "inst", "Ertelendi") for r in limited)}</ul></section>')
+    if untouched and stopped:
+        sections.append(f'<section><h2>Durdurulduğu için sıra gelmeyenler <small>{len(untouched)}</small></h2>'
+                        f'<ul>{"".join(line({"item": i}) for i in untouched)}</ul></section>')
+    if not sections:
+        sections.append('<p class="empty">Aranacak PDF\'siz kaynak yoktu.</p>')
+    tried = len(found) + len(none) + len(limited)
+    rate = f"%{round(100 * len(found) / tried)}" if tried else "–"
+    doc = f"""<!doctype html><html lang="tr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF Arama Raporu {now:%d.%m.%Y %H:%M}</title>
+<style>
+:root{{--bg:#f6f5f2;--card:#fff;--text:#1d1d1f;--muted:#6b6b70;--line:#e3e1dc;--accent:#1f6f4e;
+--ok:#1f8f4e;--warn:#b7791f;--inst:#2b6cb0}}
+@media (prefers-color-scheme:dark){{:root{{--bg:#16171a;--card:#1f2125;--text:#ececef;--muted:#9a9ca3;
+--line:#2e3036;--accent:#5fc496;--ok:#5fc496;--warn:#e0b04c;--inst:#7fb3ee}}}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);
+font:15px/1.55 "Segoe UI",system-ui,sans-serif}}main{{max-width:880px;margin:0 auto;padding:32px 16px 64px}}
+h1{{font-size:26px;margin:0 0 4px}}.sub{{color:var(--muted);margin:0 0 24px}}
+.stats{{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:28px}}
+.stat{{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 16px;min-width:130px}}
+.stat b{{display:block;font-size:22px}}.stat span{{color:var(--muted);font-size:13px}}
+.stat.ok b{{color:var(--ok)}}.stat.warn b{{color:var(--warn)}}
+h2{{font-size:18px;margin:28px 0 10px;padding-bottom:6px;border-bottom:1px solid var(--line)}}
+h2 small{{color:var(--muted);font-weight:normal}}ul{{list-style:none;padding:0;margin:0}}
+li{{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin:8px 0}}
+.t{{font-weight:600}}.no{{color:var(--muted);font-weight:400;margin-right:4px}}
+.m{{color:var(--muted);font-size:13px;margin-top:2px}}.c{{margin-top:6px;display:flex;flex-wrap:wrap;gap:6px;align-items:center}}
+.chip{{font-size:12px;border:1px solid var(--line);border-radius:999px;padding:1px 9px;color:var(--muted)}}
+.chip.ok{{color:var(--ok);border-color:var(--ok)}}.chip.warn{{color:var(--warn);border-color:var(--warn)}}
+.chip.inst{{color:var(--inst);border-color:var(--inst)}}.kw{{font-size:12px;color:var(--muted)}}
+.links{{font-size:13px}}.links a{{color:var(--accent)}}.note,.empty{{color:var(--muted);font-size:14px}}
+footer{{color:var(--muted);font-size:12px;margin-top:40px}}
+</style></head><body><main>
+<h1>PDF Arama Raporu</h1>
+<p class="sub">{_h(label or "PDF'siz kaynaklar")} · {now:%d.%m.%Y %H:%M} · ~{minutes} dk{" · durduruldu" if stopped else ""}<br>
+Aranan yerler: {_h(", ".join(searched))}</p>
+<div class="stats">
+<div class="stat"><b>{tried}</b><span>kaynak arandı</span></div>
+<div class="stat ok"><b>{len(found)}</b><span>PDF bulunup bağlandı ({rate})</span></div>
+<div class="stat warn"><b>{len(none)}</b><span>bulunamadı</span></div>
+{f'<div class="stat"><b>{len(limited)}</b><span>ertelendi (site yoğun)</span></div>' if limited else ''}
+{f'<div class="stat"><b>{len(had)}</b><span>bu arada PDF&#39;i gelmişti</span></div>' if had else ''}
+</div>
+{''.join(sections)}
+<footer>{_h(APP_NAME)} v{_h(APP_VERSION)}</footer>
+</main></body></html>"""
+    folder.mkdir(parents=True, exist_ok=True)
+    path.write_text(doc, encoding="utf-8")
+    return path
 
 
 def write_scan_report(path: Path, info: dict, found: list, added_items: list) -> Path:
@@ -8887,12 +9019,13 @@ class LibraryTab:
     def _start_retry(self, items, label, rng):
         self._retry_run = (label, rng)
         email = self.app.email_entry.get().strip()
-        self.retry_worker = PdfRetryWorker(items, self.lib, self.app.events, self.app.library_folder(), email)
+        self.retry_worker = PdfRetryWorker(items, self.lib, self.app.events, self.app.library_folder(), email,
+                                           label=label)
         self.retry_btn.configure(text="Durdur", fg_color="#C9353A", hover_color="#A42A2E")
         self.app._log("info", f"PDF yeniden arama başladı: {label} ({len(items)} kaynak).")
         self.retry_worker.start()
 
-    def on_retry_done(self, found, tried, stopped, found_nos=(), tried_nos=(), deferred_nos=()):
+    def on_retry_done(self, found, tried, stopped, found_nos=(), tried_nos=(), deferred_nos=(), report=""):
         self.retry_btn.configure(text="PDF'leri Yeniden Ara", state="normal", fg_color="#1F8F4E",
                                  hover_color="#18723E")
         label, rng = getattr(self, "_retry_run", ("", None))
@@ -8915,6 +9048,9 @@ class LibraryTab:
         missing = sorted(set(tried_nos) - set(found_nos))
         self.app._log("success" if found else "info", "PDF yeniden arama: " + msg +
                       (f" Bulunamayanlar: No {no_ranges_text(missing)}." if missing else ""))
+        if report and Path(report).is_file():
+            self.app._log("muted", f"Rapor: {report}")
+            self.app.notify_report(report, f"PDF arama: {tried} arandı, {found} bulundu")
         left = [i for i in self.items if (i.get("no") or 0) in set(missing) - set(deferred_nos)
                 and not i.get("has_pdf")]
         queue_open = getattr(self.app, "pdf_queue", None) is not None and self.app.pdf_queue.winfo_exists()
