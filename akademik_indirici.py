@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.22"
+APP_VERSION = "2.23"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -80,6 +80,8 @@ PAUSE_BETWEEN = 0.5                 # sunucuları yormamak için dosyalar arası
 MAX_CANDIDATES = 4                  # bir sayfada denenecek en fazla PDF adayı
 
 UNPAYWALL_API = "https://api.unpaywall.org/v2/"
+OPENALEX_API = "https://api.openalex.org/works"
+S2_API = "https://api.semanticscholar.org/graph/v1/paper/"
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 HEADERS = {
@@ -820,6 +822,7 @@ class HostThrottle:
     DEFAULT_GAP = 1.0
     GAPS = {"dergipark.org.tr": 3.0, "tez.yok.gov.tr": 1.5, "doi.org": 0.5, "api.crossref.org": 0.2,
             "api.unpaywall.org": 0.3, "api.openalex.org": 0.2, "scholar.google.com": 15.0,
+            "api.semanticscholar.org": 1.5,
             "127.0.0.1": 0.0, "localhost": 0.0}
     MAX_GAP = 20.0
     MAX_BLOCK = 60.0                 # bundan uzun dinlenme gerekiyorsa beklemeden RateLimited verilir
@@ -1940,6 +1943,87 @@ def pdf_info(path) -> dict:
         return {"title": str(info.get("/Title") or ""), "author": str(info.get("/Author") or "")}
     except Exception:
         return {}
+
+
+def same_title(a: str, b: str) -> bool:
+    """İki başlık aynı yayını mı gösteriyor? (büyük/küçük harf, noktalama, alt başlık farkı tolere edilir)"""
+    wa = [w for w in re.findall(r"\w+", fold(a or "")) if len(w) >= 3]
+    wb = [w for w in re.findall(r"\w+", fold(b or "")) if len(w) >= 3]
+    if len(wa) < 2 or len(wb) < 2:
+        return False
+    if " ".join(wa) == " ".join(wb):
+        return True
+    short, long_ = (wa, wb) if len(wa) <= len(wb) else (wb, wa)
+    hit = sum(w in set(long_) for w in short) / len(short)
+    return hit >= 0.9 and len(short) / len(long_) >= 0.6
+
+
+def find_open_copies(session, item, email="") -> dict:
+    """Kaynağın yasal açık erişim kopyalarını OpenAlex ve Semantic Scholar'da arar (DOI varsa DOI ile,
+    yoksa başlıkla; başlık eşleşmesi doğrulanır). Kurum arşivleri, arXiv, Zenodo, dergi sayfaları gibi
+    konumlar gelir. Dönüş: {"pdfs": [...], "pages": [...], "by_doi": bool, "sources": [...]}"""
+    title, year, doi = item.get("title") or "", str(item.get("year") or ""), normalize_doi(item.get("doi") or "")
+    pdfs, pages, sources = [], [], []
+
+    def add(url, bucket):
+        if url and url.startswith("http") and not is_doi_host(url) and url not in pdfs and url not in pages:
+            bucket.append(url)
+
+    def year_ok(other):
+        try:
+            return not year or not other or abs(int(year[:4]) - int(str(other)[:4])) <= 1
+        except ValueError:
+            return True
+
+    # OpenAlex
+    try:
+        params = {"mailto": email} if email else {}
+        if doi:
+            r = session.get(f"{OPENALEX_API}/doi:{quote(doi, safe='/:;()._-')}", params=params, timeout=API_TIMEOUT)
+            works = [r.json()] if r.ok else []
+        elif len(title) >= 12:
+            r = session.get(OPENALEX_API, params=dict(params, search=title, **{"per-page": 5}), timeout=API_TIMEOUT)
+            works = r.json().get("results", []) if r.ok else []
+        else:
+            works = []
+        for w in works:
+            if not doi and not (same_title(title, w.get("title") or w.get("display_name") or "")
+                                and year_ok(w.get("publication_year"))):
+                continue
+            locs = [w.get("best_oa_location")] + list(w.get("locations") or [])
+            for loc in locs:
+                if not loc or not loc.get("is_oa"):
+                    continue
+                add(loc.get("pdf_url"), pdfs)
+                add(loc.get("landing_page_url"), pages)
+            add((w.get("open_access") or {}).get("oa_url"), pages)
+            if pdfs or pages:
+                sources.append("OpenAlex")
+            break
+    except (requests.RequestException, ValueError, AttributeError) as exc:
+        diag(f"OpenAlex: {describe_error(exc)}", throttle=True)
+
+    # Semantic Scholar
+    try:
+        fields = {"fields": "title,year,openAccessPdf"}
+        if doi:
+            r = session.get(S2_API + "DOI:" + quote(doi, safe="/:;()._-"), params=fields, timeout=API_TIMEOUT)
+            papers = [r.json()] if r.ok else []
+        elif len(title) >= 12:
+            r = session.get(S2_API + "search/match", params=dict(fields, query=title), timeout=API_TIMEOUT)
+            papers = (r.json().get("data") or []) if r.ok else []
+        else:
+            papers = []
+        for paper in papers[:1]:
+            if not doi and not (same_title(title, paper.get("title") or "") and year_ok(paper.get("year"))):
+                continue
+            before = len(pdfs)
+            add((paper.get("openAccessPdf") or {}).get("url"), pdfs)
+            if len(pdfs) > before:
+                sources.append("Semantic Scholar")
+    except (requests.RequestException, ValueError, AttributeError) as exc:
+        diag(f"Semantic Scholar: {describe_error(exc)}", throttle=True)
+    return {"pdfs": pdfs[:5], "pages": pages[:3], "by_doi": bool(doi), "sources": sources}
 
 
 def title_matches_text(title: str, text: str) -> bool:
@@ -3133,6 +3217,7 @@ class PdfRetryWorker(threading.Thread):
         if not current or (current["file_path"] and os.path.exists(current["file_path"])):
             return None
         THROTTLE.reset_flag()
+        self.downloader._tried = set()
         try:
             tez = yok_tez_no(current)
             if tez:
@@ -3156,21 +3241,48 @@ class PdfRetryWorker(threading.Thread):
             else:
                 links = (["https://doi.org/" + current["doi"]] if current["doi"] else []) + \
                         ([current["url"]] if current["url"] else [])
+                self.downloader._tried = set()
                 for link in links:
                     self.downloader._last_saved = None
-                    self.downloader._tried = set()
                     result = self.downloader._download_one(self.session, link, n)
-                    saved = self.downloader._last_saved
-                    if result[0] == "ok" and saved and str(saved["path"]).lower().endswith(".pdf"):
-                        other = self.library.find_by_sha(saved["sha"])
-                        if other and other != item["id"]:
-                            break
-                        attach_pdf(self.library, item["id"], saved["path"], self.library_folder, move=True)
+                    if self._take_saved(item, result):
                         return "found"
                 time.sleep(self.PAUSE)
+            if self.cancel.is_set():
+                return "none"
+            # başka yerlerde (kurum arşivleri, arXiv, Zenodo…) yasal açık kopya
+            if self._try_open_copies(current, item, n):
+                return "found"
         except Exception as exc:
             diag(f"PDF yeniden arama: {item['title'][:60]}: {describe_error(exc)}")
         return "limited" if THROTTLE.was_limited() else "none"
+
+    def _take_saved(self, item, result) -> bool:
+        saved = self.downloader._last_saved
+        if result and result[0] == "ok" and saved and str(saved["path"]).lower().endswith(".pdf"):
+            other = self.library.find_by_sha(saved["sha"])
+            if other and other != item["id"]:
+                Path(saved["path"]).unlink(missing_ok=True)
+                return False
+            attach_pdf(self.library, item["id"], saved["path"], self.library_folder, move=True)
+            return True
+        return False
+
+    def _try_open_copies(self, current, item, n) -> bool:
+        copies = find_open_copies(self.session, current, self.email)
+        cands = copies["pdfs"] + copies["pages"]
+        if not cands:
+            return False
+        first = (current.get("authors") or [{}])[0] or {}
+        meta = {"citation_title": current["title"], "citation_author": first.get("family", ""),
+                "citation_publication_date": str(current.get("year") or "")}
+        self.downloader._last_saved = None
+        # DOI ile bulunan PDF bağlantılarına güvenilir; başlıkla bulunanlarda inen PDF'in başlığı denetlenir
+        result = self.downloader._try_candidates(
+            self.session, cands, None, cands[0], n, meta,
+            note="açık erişim kopyası (" + ", ".join(copies["sources"] or ["OpenAlex"]) + ")",
+            trusted=copies["pdfs"] if copies["by_doi"] else ())
+        return self._take_saved(item, result)
 
 
 class HtmlImportWorker(threading.Thread):
@@ -6779,6 +6891,24 @@ def downloads_folder() -> Path:
     return downloads_folders()[0]
 
 
+SEARCH_SITES = ["Google Akademik", "Google (PDF dosyası)", "BASE (kurum arşivleri)", "CORE (açık erişim)",
+                "Semantic Scholar", "DergiPark"]
+
+
+def search_link(item, site) -> str:
+    """Başlıkla elle arama için tarayıcı adresi (aramayı ve indirmeyi kullanıcı yapar)."""
+    title = re.sub(r"\s+", " ", item.get("title") or "").strip()
+    exact = quote(f'"{title}"')
+    return {
+        "Google Akademik": "https://scholar.google.com/scholar?q=" + exact,
+        "Google (PDF dosyası)": "https://www.google.com/search?q=" + exact + quote(" filetype:pdf"),
+        "BASE (kurum arşivleri)": "https://www.base-search.net/Search/Results?lookfor=" + exact,
+        "CORE (açık erişim)": "https://core.ac.uk/search?q=" + exact,
+        "Semantic Scholar": "https://www.semanticscholar.org/search?q=" + quote(title),
+        "DergiPark": "https://dergipark.org.tr/tr/search?q=" + quote(title) + "&section=articles",
+    }[site]
+
+
 def item_open_link(item) -> str:
     """Kaynağın PDF'ine ulaşılacak sayfa: DOI, link, YÖK tezi ya da başlıkla Google Akademik araması."""
     if item.get("doi"):
@@ -7176,6 +7306,11 @@ class PdfQueuePanel(ctk.CTkToplevel):
                       command=self.skip).pack(side="left", padx=6)
         ctk.CTkButton(btns, text="Bitir", width=70, fg_color="transparent", border_width=1, text_color=TEXT,
                       command=self.finish).pack(side="left")
+        self.search_menu = ctk.CTkOptionMenu(btns, values=SEARCH_SITES, width=150, command=self._search_elsewhere,
+                                             dynamic_resizing=False, fg_color="#5B5F66", button_color="#4A4E54",
+                                             button_hover_color="#3D4046")
+        self.search_menu.set("Başka yerde ara ▾")
+        self.search_menu.pack(side="left", padx=(6, 0))
         self.folder_label = ctk.CTkLabel(self, text="", text_color=MUTED, anchor="w", font=ctk.CTkFont(size=11),
                                          wraplength=420, justify="left")
         self.folder_label.grid(row=5, column=0, **pad)
@@ -7245,6 +7380,13 @@ class PdfQueuePanel(ctk.CTkToplevel):
                                    "bağlanıp bir sonraki açılacak." + (f"\nKampüs dışındaysanız: VETİS → {db}." if db else ""),
                               text_color=MUTED)
         webbrowser.open_new_tab(item_open_link(item))
+
+    def _search_elsewhere(self, site):
+        self.search_menu.set("Başka yerde ara ▾")
+        if self.current:
+            webbrowser.open_new_tab(search_link(self.current, site))
+            self.status.configure(text=f"{site} açıldı. Bulduğunuz PDF'i indirin; başlığı uyuyorsa bu kaynağa "
+                                       "bağlanır.", text_color=MUTED)
 
     def skip(self):
         item = self.current
@@ -7673,6 +7815,17 @@ class LibraryTab:
         self.vetis_btn = ctk.CTkButton(btns, text="VETİS (kampüs dışı)", command=self._open_vetis,
                                        **small, **outline)
         self.vetis_btn.grid(row=2, column=1, sticky="ew", padx=2, pady=2)
+        self.search_menu = ctk.CTkOptionMenu(btns, values=SEARCH_SITES, command=self._search_elsewhere,
+                                             height=30, font=ctk.CTkFont(size=12), dynamic_resizing=False,
+                                             fg_color="#5B5F66", button_color="#4A4E54", button_hover_color="#3D4046")
+        self.search_menu.set("Başlıkla başka yerde ara ▾")
+        self.search_menu.grid(row=3, column=0, columnspan=3, sticky="ew", padx=2, pady=2)
+
+    def _search_elsewhere(self, site):
+        self.search_menu.set("Başlıkla başka yerde ara ▾")
+        if self.current:
+            webbrowser.open_new_tab(search_link(self.current, site))
+            self.app.toast(f"{site} tarayıcıda açıldı. PDF'i indirirseniz 'PDF Bağla…' ile bu kaynağa bağlayın.")
 
     def _build_cards_tab(self, tab):
         tab.grid_columnconfigure(0, weight=1)
@@ -7895,7 +8048,7 @@ class LibraryTab:
         self._reset_card_form()
         state = "normal" if item else "disabled"
         for btn in (self.save_btn, self.crossref_btn, self.attach_btn, self.inst_btn, self.reviewed_btn,
-                    self.remove_btn, self.card_save):
+                    self.remove_btn, self.card_save, self.search_menu):
             btn.configure(state=state)
         db = database_for_doi(item["doi"]) if item else ""
         self.vetis_btn.configure(text=f"VETİS → {db}" if db else "VETİS (kampüs dışı)")
