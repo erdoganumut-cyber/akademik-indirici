@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.26"
+APP_VERSION = "2.27"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -2392,12 +2392,14 @@ def find_open_copies(session, item, email="", core_key="") -> dict:
     except (requests.RequestException, ValueError, AttributeError) as exc:
         diag(f"Semantic Scholar: {describe_error(exc)}", throttle=True)
 
-    # CORE: dünyadaki kurum arşivlerinin tam metinleri (ücretsiz API anahtarı gerekir)
-    if core_key and len(title) >= 12:
+    # CORE: dünyadaki kurum arşivlerinin tam metinleri (anahtarsız da çalışır; anahtar hızlandırır)
+    if len(title) >= 12:
         try:
             q = f'doi:"{doi}"' if doi else f'title:"{title}"'
-            r = session.get(CORE_API, params={"q": q, "limit": 3}, timeout=API_TIMEOUT,
-                            headers={"Authorization": f"Bearer {core_key}", "Accept": "application/json"})
+            headers = {"Accept": "application/json"}
+            if core_key:
+                headers["Authorization"] = f"Bearer {core_key}"
+            r = session.get(CORE_API, params={"q": q, "limit": 3}, timeout=API_TIMEOUT, headers=headers)
             if r.status_code in (401, 403):
                 diag("CORE: API anahtarı kabul edilmedi", throttle=True)
             for work in (r.json().get("results") or []) if r.ok else []:
@@ -7538,7 +7540,7 @@ class RangeDialog(ctk.CTkToplevel):
                  "Hangi kayıt numaraları arasında çalışılsın?")
         if retry:
             intro += ("\n\nYayıncı sayfası, açık erişim kopyaları, YÖK Tez Merkezi ve başka yerler (OpenAlex, "
-                      "Semantic Scholar; anahtar girilirse CORE kurum arşivleri) aranır; bulunan PDF kendiliğinden "
+                      "Semantic Scholar, CORE kurum arşivleri) aranır; bulunan PDF kendiliğinden "
                       "kaynağına bağlanır. Bulunamayanları sonda Google Akademik'te sırayla açmayı önerir. "
                       "İstediğiniz an durdurabilirsiniz.")
             if not app.email_entry.get().strip():
@@ -7585,9 +7587,9 @@ class RangeDialog(ctk.CTkToplevel):
         self.core_entry = None
         self.open_mode = ctk.StringVar(value="page")
         if retry:
-            ctk.CTkLabel(extra, text="CORE anahtarı (isteğe bağlı):", font=ctk.CTkFont(size=12)).pack(side="left")
-            self.core_entry = ctk.CTkEntry(extra, width=170, height=26, show="•",
-                                           placeholder_text="kurum arşivleri için")
+            ctk.CTkLabel(extra, text="CORE anahtarı (gerekmez, aramayı hızlandırır):",
+                         font=ctk.CTkFont(size=12), text_color=MUTED).pack(side="left")
+            self.core_entry = ctk.CTkEntry(extra, width=120, height=26, show="•", placeholder_text="boş bırakılabilir")
             self.core_entry.pack(side="left", padx=6)
             if load_settings().get("core_api_key"):
                 self.core_entry.insert(0, load_settings()["core_api_key"])
