@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.25"
+APP_VERSION = "2.26"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -82,6 +82,8 @@ MAX_CANDIDATES = 4                  # bir sayfada denenecek en fazla PDF adayı
 UNPAYWALL_API = "https://api.unpaywall.org/v2/"
 OPENALEX_API = "https://api.openalex.org/works"
 S2_API = "https://api.semanticscholar.org/graph/v1/paper/"
+CORE_API = "https://api.core.ac.uk/v3/search/works"
+CORE_KEY_PAGE = "https://core.ac.uk/services/api"
 GOOGLE_BOOKS_API = "https://www.googleapis.com/books/v1/volumes"
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -823,7 +825,7 @@ class HostThrottle:
     DEFAULT_GAP = 1.0
     GAPS = {"dergipark.org.tr": 3.0, "tez.yok.gov.tr": 1.5, "doi.org": 0.5, "api.crossref.org": 0.2,
             "api.unpaywall.org": 0.3, "api.openalex.org": 0.2, "scholar.google.com": 15.0,
-            "api.semanticscholar.org": 1.5,
+            "api.semanticscholar.org": 1.5, "api.core.ac.uk": 2.0,
             "127.0.0.1": 0.0, "localhost": 0.0}
     MAX_GAP = 20.0
     MAX_BLOCK = 60.0                 # bundan uzun dinlenme gerekiyorsa beklemeden RateLimited verilir
@@ -2320,12 +2322,12 @@ def same_title(a: str, b: str) -> bool:
     return hit >= 0.9 and len(short) / len(long_) >= 0.6
 
 
-def find_open_copies(session, item, email="") -> dict:
+def find_open_copies(session, item, email="", core_key="") -> dict:
     """Kaynağın yasal açık erişim kopyalarını OpenAlex ve Semantic Scholar'da arar (DOI varsa DOI ile,
     yoksa başlıkla; başlık eşleşmesi doğrulanır). Kurum arşivleri, arXiv, Zenodo, dergi sayfaları gibi
     konumlar gelir. Dönüş: {"pdfs": [...], "pages": [...], "by_doi": bool, "sources": [...]}"""
     title, year, doi = item.get("title") or "", str(item.get("year") or ""), normalize_doi(item.get("doi") or "")
-    pdfs, pages, sources = [], [], []
+    pdfs, pages, sources, trusted = [], [], [], []
 
     def add(url, bucket):
         if url and url.startswith("http") and not is_doi_host(url) and url not in pdfs and url not in pages:
@@ -2361,6 +2363,8 @@ def find_open_copies(session, item, email="") -> dict:
             add((w.get("open_access") or {}).get("oa_url"), pages)
             if pdfs or pages:
                 sources.append("OpenAlex")
+            if doi:
+                trusted.extend(pdfs)                        # DOI ile bulunan PDF bağlantıları güvenilir
             break
     except (requests.RequestException, ValueError, AttributeError) as exc:
         diag(f"OpenAlex: {describe_error(exc)}", throttle=True)
@@ -2383,9 +2387,34 @@ def find_open_copies(session, item, email="") -> dict:
             add((paper.get("openAccessPdf") or {}).get("url"), pdfs)
             if len(pdfs) > before:
                 sources.append("Semantic Scholar")
+                if doi:
+                    trusted.append(pdfs[-1])
     except (requests.RequestException, ValueError, AttributeError) as exc:
         diag(f"Semantic Scholar: {describe_error(exc)}", throttle=True)
-    return {"pdfs": pdfs[:5], "pages": pages[:3], "by_doi": bool(doi), "sources": sources}
+
+    # CORE: dünyadaki kurum arşivlerinin tam metinleri (ücretsiz API anahtarı gerekir)
+    if core_key and len(title) >= 12:
+        try:
+            q = f'doi:"{doi}"' if doi else f'title:"{title}"'
+            r = session.get(CORE_API, params={"q": q, "limit": 3}, timeout=API_TIMEOUT,
+                            headers={"Authorization": f"Bearer {core_key}", "Accept": "application/json"})
+            if r.status_code in (401, 403):
+                diag("CORE: API anahtarı kabul edilmedi", throttle=True)
+            for work in (r.json().get("results") or []) if r.ok else []:
+                if not (same_title(title, work.get("title") or "") and year_ok(work.get("yearPublished"))):
+                    continue
+                before = len(pdfs)
+                add(work.get("downloadUrl"), pdfs)
+                for link in work.get("links") or []:
+                    if link.get("type") == "download":
+                        add(link.get("url"), pdfs)
+                if len(pdfs) > before:
+                    sources.append("CORE")
+                    break
+        except (requests.RequestException, ValueError, AttributeError) as exc:
+            diag(f"CORE: {describe_error(exc)}", throttle=True)
+    return {"pdfs": pdfs[:6], "pages": pages[:3], "by_doi": bool(doi), "sources": sources,
+            "trusted": [u for u in trusted if u in pdfs[:6]]}
 
 
 def title_matches_text(title: str, text: str) -> bool:
@@ -3677,7 +3706,7 @@ class PdfRetryWorker(threading.Thread):
         return False
 
     def _try_open_copies(self, current, item, n) -> bool:
-        copies = find_open_copies(self.session, current, self.email)
+        copies = find_open_copies(self.session, current, self.email, load_settings().get("core_api_key", ""))
         cands = copies["pdfs"] + copies["pages"]
         if not cands:
             return False
@@ -3689,7 +3718,7 @@ class PdfRetryWorker(threading.Thread):
         result = self.downloader._try_candidates(
             self.session, cands, None, cands[0], n, meta,
             note="açık erişim kopyası (" + ", ".join(copies["sources"] or ["OpenAlex"]) + ")",
-            trusted=copies["pdfs"] if copies["by_doi"] else ())
+            trusted=copies["trusted"])
         return self._take_saved(item, result)
 
 
@@ -7508,8 +7537,10 @@ class RangeDialog(ctk.CTkToplevel):
         intro = (f"Kütüphanede PDF'i olmayan {len(nopdf)} kaynak var (No {no_ranges_text(nos, 6)}). "
                  "Hangi kayıt numaraları arasında çalışılsın?")
         if retry:
-            intro += ("\n\nAçık erişim kopyası, yayıncı sayfası ve YÖK Tez Merkezi aranır; bulunan PDF kendiliğinden "
-                      "kaynağına bağlanır. İstediğiniz an durdurabilirsiniz.")
+            intro += ("\n\nYayıncı sayfası, açık erişim kopyaları, YÖK Tez Merkezi ve başka yerler (OpenAlex, "
+                      "Semantic Scholar; anahtar girilirse CORE kurum arşivleri) aranır; bulunan PDF kendiliğinden "
+                      "kaynağına bağlanır. Bulunamayanları sonda Google Akademik'te sırayla açmayı önerir. "
+                      "İstediğiniz an durdurabilirsiniz.")
             if not app.email_entry.get().strip():
                 intro += ("\n\nİpucu: İndir sekmesine e-posta yazarsanız açık erişim kopyaları da (Unpaywall) "
                           "aranır; bulunan PDF sayısı belirgin artar.")
@@ -7549,8 +7580,27 @@ class RangeDialog(ctk.CTkToplevel):
         self.summary = ctk.CTkLabel(self, text="", justify="left", anchor="w", wraplength=440, text_color=MUTED,
                                     font=ctk.CTkFont(size=12))
         self.summary.grid(row=4, column=0, pady=(12, 0), **pad)
+        extra = ctk.CTkFrame(self, fg_color="transparent")
+        extra.grid(row=5, column=0, pady=(12, 0), **pad)
+        self.core_entry = None
+        self.open_mode = ctk.StringVar(value="page")
+        if retry:
+            ctk.CTkLabel(extra, text="CORE anahtarı (isteğe bağlı):", font=ctk.CTkFont(size=12)).pack(side="left")
+            self.core_entry = ctk.CTkEntry(extra, width=170, height=26, show="•",
+                                           placeholder_text="kurum arşivleri için")
+            self.core_entry.pack(side="left", padx=6)
+            if load_settings().get("core_api_key"):
+                self.core_entry.insert(0, load_settings()["core_api_key"])
+            ctk.CTkButton(extra, text="Ücretsiz al…", width=90, height=26, fg_color="transparent", border_width=1,
+                          text_color=TEXT, command=lambda: webbrowser.open_new_tab(CORE_KEY_PAGE)).pack(side="left")
+        else:
+            ctk.CTkLabel(extra, text="Açılacak sayfa:", font=ctk.CTkFont(size=12)).pack(anchor="w")
+            ctk.CTkRadioButton(extra, text="Makale sayfası (yayıncı / kurum erişimi)", variable=self.open_mode,
+                               value="page").pack(anchor="w", padx=(8, 0), pady=(4, 0))
+            ctk.CTkRadioButton(extra, text="Google Akademik'te başlıkla arama (başka yerlerdeki kopyalar)",
+                               variable=self.open_mode, value="scholar").pack(anchor="w", padx=(8, 0), pady=(4, 0))
         btns = ctk.CTkFrame(self, fg_color="transparent")
-        btns.grid(row=5, column=0, pady=16, padx=18, sticky="e")
+        btns.grid(row=6, column=0, pady=16, padx=18, sticky="e")
         ctk.CTkButton(btns, text="Vazgeç", width=90, fg_color="transparent", border_width=1, text_color=TEXT,
                       command=self.destroy).pack(side="left", padx=(0, 8))
         self.ok_btn = ctk.CTkButton(btns, text="Başlat", width=110, command=self._ok)
@@ -7674,6 +7724,9 @@ class RangeDialog(ctk.CTkToplevel):
         items, label, rng = self.selection()
         if not items:
             return
+        self.open_mode_value = self.open_mode.get()
+        if self.core_entry is not None:
+            remember_setting("core_api_key", self.core_entry.get().strip())
         self.destroy()
         self.on_start(items, label, rng)
 
@@ -7684,9 +7737,10 @@ class PdfQueuePanel(ctk.CTkToplevel):
 
     POLL_MS = 1500
 
-    def __init__(self, app, items, label=""):
+    def __init__(self, app, items, label="", open_mode="page"):
         super().__init__(app)
         self.app, self.items, self.label = app, sorted(items, key=lambda i: i.get("no") or 0), label
+        self.open_mode = open_mode
         self.index, self.attached, self.skipped = -1, 0, 0
         self.pending = None                        # eşleşmeyen PDF: kullanıcıya soruluyor
         self.folders = downloads_folders()
@@ -7784,6 +7838,12 @@ class PdfQueuePanel(ctk.CTkToplevel):
         who = first_author_label(item)
         self.item_label.configure(text=f"{who + ' ' if who else ''}({item['year'] or 't.y.'}). {shorten(item['title'], 140)}")
         db = database_for_doi(item.get("doi") or "")
+        if self.open_mode == "scholar":
+            self.status.configure(text="Google Akademik'te başlıkla arama açıldı. Sonuçlarda [PDF] bağlantısı varsa "
+                                       "(kurum arşivi, ResearchGate, Academia…) indirin; dosya bu kaynağa bağlanıp "
+                                       "bir sonraki açılacak. Yoksa 'Atla'.", text_color=MUTED)
+            webbrowser.open_new_tab(search_link(item, "Google Akademik"))
+            return
         self.status.configure(text="Sayfa tarayıcıda açıldı. PDF'i indirin; dosya İndirilenler'e düşünce bu kaynağa "
                                    "bağlanıp bir sonraki açılacak." + (f"\nKampüs dışındaysanız: VETİS → {db}." if db else ""),
                               text_color=MUTED)
@@ -8853,6 +8913,16 @@ class LibraryTab:
         missing = sorted(set(tried_nos) - set(found_nos))
         self.app._log("success" if found else "info", "PDF yeniden arama: " + msg +
                       (f" Bulunamayanlar: No {no_ranges_text(missing)}." if missing else ""))
+        left = [i for i in self.items if (i.get("no") or 0) in set(missing) - set(deferred_nos)
+                and not i.get("has_pdf")]
+        queue_open = getattr(self.app, "pdf_queue", None) is not None and self.app.pdf_queue.winfo_exists()
+        if left and not stopped and not queue_open and messagebox.askyesno(
+                APP_NAME, f"{msg}\n\nBulunamayan {len(left)} kaynak (No {no_ranges_text([i.get('no') for i in left], 6)}) "
+                          "Google Akademik'te başlıkla sırayla açılsın mı?\n\nGoogle otomatik aramaya izin "
+                          "vermediği için bu adımı siz yaparsınız: sonuçlarda [PDF] bağlantısı varsa tıklayıp "
+                          "indirin, program dosyayı kaynağa bağlayıp bir sonrakini açar; yoksa 'Atla'.",
+                parent=self.parent):
+            self.app.pdf_queue = PdfQueuePanel(self.app, left, f"{label} · Google Akademik", open_mode="scholar")
 
     def _open_queue(self):
         """Seçilen numara aralığındaki PDF'siz kaynakları sırayla açar."""
@@ -8864,7 +8934,8 @@ class LibraryTab:
             if not self.app.library_folder():
                 return
         self._ask_range("queue", lambda items, label, rng: setattr(
-            self.app, "pdf_queue", PdfQueuePanel(self.app, items, label)))
+            self.app, "pdf_queue", PdfQueuePanel(self.app, items, label,
+                                                 open_mode=getattr(self.range_dialog, "open_mode_value", "page"))))
 
     def _add_isbn(self):
         """Ödünç okunan (indirilemeyen) e-kitaplar ya da basılı kitaplar için ISBN'den künye."""
