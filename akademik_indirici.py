@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.29"
+APP_VERSION = "2.30"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -3172,6 +3172,11 @@ class Library:
                 self.set_fulltext(item_id, fulltext)
             self.add_tags(item_id, tags)
             return item_id, True
+
+    def get_fulltext(self, item_id) -> str:
+        with self.lock:
+            row = self.db.execute("SELECT content FROM fulltext WHERE item_id=?", (item_id,)).fetchone()
+        return row[0] if row and row[0] else ""
 
     def mark_reviewed(self, ids):
         """'Yeni' işaretini kaldırır (tek işlemde, binlerce kaynak için de hızlı)."""
@@ -6291,11 +6296,313 @@ class ScopusImportWorker(threading.Thread):
 # ════════════════════════════════════════════════════════════════════════════
 
 MCP_SERVER_NAME = "akademik-kutuphane"
+# ── Claude için metin dizini: bütün PDF'lerin sayfa sayfa aranabilir hâli ────────────────────
+# Kütüphane veritabanından ayrı, bu bilgisayarda durur (Drive'a gönderilmez; her bilgisayar kendi
+# dizinini kurar). Program açıkken arka planda kurulur, yeni eklenenler kendiliğinden dizine girer.
+
+INDEX_NAME = "metin_dizini.db"
+INDEX_PAGE_LIMIT = 400
+_PASSAGE_CHARS = 1400
+
+
+def index_path() -> Path:
+    return settings_path().parent / INDEX_NAME
+
+
+def pdf_pages(path, max_pages=INDEX_PAGE_LIMIT, pause=0.0) -> list:
+    """[(sayfa_no, sayfa_etiketi, metin)] — etiket, yayıncının basılı sayfa numarasıdır (varsa)."""
+    from pypdf import PdfReader
+    reader = PdfReader(str(path))
+    try:
+        labels = list(reader.page_labels)
+    except Exception:
+        labels = []
+    out = []
+    for i, page in enumerate(reader.pages[:max_pages]):
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            text = ""
+        label = str(labels[i]) if i < len(labels) else ""
+        out.append((i + 1, label if label and label != str(i + 1) else "", text))
+        if pause:
+            time.sleep(pause)                                   # arka planda: arayüze nefes aldır
+    return out
+
+
+def epub_sections(path) -> list:
+    text = epub_text(path, max_chars=FULLTEXT_MAX_CHARS)
+    size = 6000
+    return [(n + 1, f"bölüm-parça {n + 1}", text[i:i + size]) for n, i in enumerate(range(0, len(text), size))]
+
+
+def split_passages(text, limit=_PASSAGE_CHARS) -> list:
+    """Sayfa metnini paragraf/cümle sınırlarından ~1400 karakterlik parçalara böler."""
+    text = re.sub(r"[ \t]+", " ", text or "").strip()
+    text = re.sub(r"-\n(?=[a-zçğıöşü])", "", text)                  # satır sonu tirelemesi
+    if len(text) <= limit:
+        return [text] if len(text) > 40 else []
+    parts, current = [], ""
+    for piece in re.split(r"(?<=[.!?…])\s+|\n{2,}", text):
+        if len(current) + len(piece) + 1 > limit and current:
+            parts.append(current.strip())
+            current = ""
+        current += " " + piece
+        while len(current) > limit * 1.5:
+            parts.append(current[:limit].strip())
+            current = current[limit:]
+    if current.strip():
+        parts.append(current.strip())
+    return [p for p in parts if len(p) > 40]
+
+
+class PassageIndex:
+    """Sayfa numaralı metin parçaları + tam metin arama (SQLite FTS5; yoksa basit yedek arama)."""
+
+    def __init__(self, path=None, readonly=False):
+        self.path = Path(path) if path else index_path()
+        self.lock = threading.RLock()
+        if readonly:
+            if not self.path.is_file():
+                raise FileNotFoundError(self.path)
+            self.db = sqlite3.connect(f"file:{self.path.as_posix()}?mode=ro", uri=True, check_same_thread=False,
+                                      timeout=30)
+        else:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.db = sqlite3.connect(str(self.path), check_same_thread=False, timeout=30)
+            with self.db:
+                self.db.executescript("""
+                CREATE TABLE IF NOT EXISTS docs (item_id INTEGER PRIMARY KEY, sig TEXT, pages INTEGER, chars INTEGER,
+                                                 paged INTEGER, indexed TEXT);
+                CREATE TABLE IF NOT EXISTS passages (id INTEGER PRIMARY KEY, item_id INTEGER, page INTEGER,
+                                                     label TEXT, text TEXT, folded TEXT);
+                CREATE INDEX IF NOT EXISTS idx_pass_item ON passages(item_id);
+                """)
+                # yer kazanmak için içeriksiz dizin (SQLite 3.43+); eski SQLite'ta içerik passages'tan okunur
+                for ddl in ("CREATE VIRTUAL TABLE IF NOT EXISTS pfts USING fts5(folded, content='', "
+                            "contentless_delete=1, tokenize='unicode61 remove_diacritics 2')",
+                            "CREATE VIRTUAL TABLE IF NOT EXISTS pfts USING fts5(folded, content='passages', "
+                            "content_rowid='id', tokenize='unicode61 remove_diacritics 2')"):
+                    try:
+                        self.db.execute(ddl)
+                        break
+                    except sqlite3.OperationalError:
+                        continue
+        row = self.db.execute("SELECT sql FROM sqlite_master WHERE name='pfts'").fetchone()
+        self.fts = bool(row)
+        self.contentless = bool(row) and "contentless_delete" in (row[0] or "")
+
+    def close(self):
+        with self.lock:
+            self.db.close()
+
+    def signatures(self) -> dict:
+        with self.lock:
+            return dict(self.db.execute("SELECT item_id, sig FROM docs"))
+
+    def put(self, item_id, sig, passages, paged):
+        """passages: [(sayfa, etiket, metin)]"""
+        with self.lock, self.db:
+            self._drop(item_id)
+            for page, label, text in passages:
+                cur = self.db.execute("INSERT INTO passages (item_id, page, label, text, folded) VALUES (?,?,?,?,?)",
+                                      (item_id, page, label, text, "" if self.contentless else fold(text)))
+                if self.fts:
+                    self.db.execute("INSERT INTO pfts (rowid, folded) VALUES (?, ?)", (cur.lastrowid, fold(text)))
+            self.db.execute("INSERT OR REPLACE INTO docs VALUES (?,?,?,?,?,?)",
+                            (item_id, sig, len({p for p, _, _ in passages}), sum(len(t) for _, _, t in passages),
+                             1 if paged else 0, datetime.now().strftime("%Y-%m-%d %H:%M")))
+
+    def _drop(self, item_id):
+        if self.fts:
+            for rid, folded in self.db.execute("SELECT id, folded FROM passages WHERE item_id=?", (item_id,)).fetchall():
+                if self.contentless:
+                    self.db.execute("DELETE FROM pfts WHERE rowid=?", (rid,))
+                else:
+                    self.db.execute("INSERT INTO pfts (pfts, rowid, folded) VALUES ('delete', ?, ?)", (rid, folded))
+        self.db.execute("DELETE FROM passages WHERE item_id=?", (item_id,))
+        self.db.execute("DELETE FROM docs WHERE item_id=?", (item_id,))
+
+    def remove_missing(self, valid_ids) -> int:
+        valid = set(valid_ids)
+        gone = [i for i in self.signatures() if i not in valid]
+        with self.lock, self.db:
+            for item_id in gone:
+                self._drop(item_id)
+        return len(gone)
+
+    def stats(self) -> dict:
+        with self.lock:
+            docs, chars = self.db.execute("SELECT COUNT(*), COALESCE(SUM(chars), 0) FROM docs").fetchone()
+            empty = self.db.execute("SELECT COUNT(*) FROM docs WHERE chars < 200 AND paged = 1").fetchone()[0]
+            passages = self.db.execute("SELECT COUNT(*) FROM passages").fetchone()[0]
+        return {"kaynak": docs, "parca": passages, "karakter": chars, "metinsiz": empty}
+
+    @staticmethod
+    def _terms(query) -> list:
+        words = re.findall(r"\w+", fold(query))
+        stop = {"ve", "ile", "bir", "bu", "da", "de", "icin", "the", "and", "of", "in", "on", "for", "a", "an", "to",
+                "ne", "nasil", "neden", "mi", "mu", "hangi", "olarak", "gibi", "daha", "cok", "en", "is", "are", "with"}
+        return [w for w in words if w not in stop and len(w) >= 2]
+
+    _SUFFIXES = sorted(["lerinin", "larinin", "lerinde", "larinda", "lerini", "larini", "lerine", "larina", "lerin",
+                        "larin", "leri", "lari", "ler", "lar", "nin", "nun", "nda", "nde", "dan", "den", "tan", "ten",
+                        "yla", "yle", "in", "un", "da", "de", "ta", "te", "la", "le", "si", "su", "yi", "yu", "i", "u",
+                        "e", "a", "s"], key=len, reverse=True)
+
+    @classmethod
+    def stem(cls, word: str) -> str:
+        """Türkçe/İngilizce ekleri kabaca atar ('oyunlarının'→'oyun', 'sahneleme'→'sahnele', 'dances'→'danc');
+        aramada önek olarak kullanılır."""
+        for _ in range(3):
+            for suf in cls._SUFFIXES:
+                if word.endswith(suf) and len(word) - len(suf) >= 4:
+                    word = word[:-len(suf)]
+                    break
+            else:
+                break
+        return word
+
+    def search(self, query, allowed=None, limit=15, per_item=2) -> list:
+        """[(item_id, sayfa, etiket, metin, skor)] — en ilgiliden başlayarak."""
+        terms = self._terms(query)
+        if not terms:
+            return []
+        phrases = [fold(p) for p in re.findall(r'"([^"]+)"', query)]
+        with self.lock:
+            if self.fts:
+                stems = [self.stem(w) for w in terms]
+                match = " OR ".join([f'"{t}"*' for t in dict.fromkeys(stems)])
+                phrases_ok = [" ".join(re.findall(r"\w+", ph)) for ph in phrases if re.findall(r"\w+", ph)]
+                if phrases_ok:
+                    near = " AND ".join(f'"{ph}"' for ph in phrases_ok)
+                    match = f"({near}) OR ({match})" if match else near
+                try:
+                    rows = self.db.execute(
+                        "SELECT p.item_id, p.page, p.label, p.text, bm25(pfts) AS score FROM pfts "
+                        "JOIN passages p ON p.id = pfts.rowid WHERE pfts MATCH ? ORDER BY score LIMIT 3000",
+                        (match,)).fetchall()
+                except sqlite3.OperationalError:
+                    rows = []
+                rows = [(a, b, c, d, -e) for a, b, c, d, e in rows]
+            else:
+                like = [f"%{self.stem(w)}%" for w in terms]
+                sql = "SELECT item_id, page, label, text, folded FROM passages WHERE " + \
+                      " OR ".join(["folded LIKE ?"] * len(like))
+                rows = []
+                for a, b, c, d, f in self.db.execute(sql, like).fetchall():
+                    score = sum(self.stem(w) in f for w in terms) + \
+                        sum(2 for ph in phrases if ph in f)
+                    rows.append((a, b, c, d, float(score)))
+                rows.sort(key=lambda r: -r[4])
+        # birden çok terim geçen parçalar öne; kaynak başına en fazla per_item parça
+        def coverage(text):
+            f = fold(text)
+            return sum(1 for w in terms if self.stem(w) in f)
+        rows.sort(key=lambda r: (-coverage(r[3]), -r[4]))
+        out, per = [], {}
+        for item_id, page, label, text, score in rows:
+            if allowed is not None and item_id not in allowed:
+                continue
+            if per.get(item_id, 0) >= per_item:
+                continue
+            per[item_id] = per.get(item_id, 0) + 1
+            out.append((item_id, page, label, text, score))
+            if len(out) >= limit:
+                break
+        return out
+
+    def matching_items(self, query) -> int:
+        return len({r[0] for r in self.search(query, limit=100000, per_item=1)})
+
+
+def item_signature(item) -> str:
+    return item.get("sha256") or ("meta:" + hashlib.sha1(
+        (str(item.get("file_path")) + str(item.get("title")) + str(item.get("notes"))).encode("utf-8")).hexdigest())
+
+
+def build_passages(library, item) -> tuple:
+    """Kaynağın dizine girecek parçaları. Dönüş: (parçalar, sayfalı_mı)"""
+    path = item.get("file_path") or ""
+    pages = []
+    paged = False
+    if path and os.path.isfile(path):
+        try:
+            if path.lower().endswith(".pdf"):
+                pages, paged = pdf_pages(path, pause=0.002), True
+            elif path.lower().endswith(".epub"):
+                pages, paged = epub_sections(path), True
+        except Exception as exc:
+            diag(f"dizin: {Path(path).name}: {describe_error(exc)}", throttle=True)
+            pages = []
+    if not any(t.strip() for _, _, t in pages):
+        stored = library.get_fulltext(item["id"])           # PDF okunamadıysa ya da yoksa: özet/kayıtlı metin
+        pages = [(0, "", stored)] if stored else []
+        paged = paged and bool(pages)
+    head = " · ".join(x for x in (item.get("title"), item.get("keywords"), ", ".join(item.get("tags") or [])) if x)
+    out = [(0, "künye", head)] if head else []
+    for page, label, text in pages:
+        out += [(page, label, part) for part in split_passages(text)]
+    return out, paged
+
+
+class IndexWorker(threading.Thread):
+    """Metin dizinini arka planda günceller: yeni/değişen kaynakları okur, silinenleri çıkarır.
+    Mesajlar: ("index", yapılan, toplam) · ("index_done", istatistik, durduruldu)"""
+
+    def __init__(self, library, events):
+        super().__init__(name="metin-dizini", daemon=True)
+        self.library, self.events = library, events
+        self.cancel = threading.Event()
+
+    def run(self):
+        index = None
+        old_switch = sys.getswitchinterval()
+        sys.setswitchinterval(0.0005)        # PDF okuma CPU'yu yorarken arayüz iş parçacığı sırasını çabuk alsın
+        try:
+            index = PassageIndex()
+            items = sorted(self.library.all_items(), key=lambda i: i.get("no") or 0)
+            index.remove_missing(i["id"] for i in items)
+            have = index.signatures()
+            todo = [i for i in items if have.get(i["id"]) != item_signature(i)]
+            for n, item in enumerate(todo):
+                if self.cancel.is_set():
+                    break
+                if n % 5 == 0:
+                    self.events.put(("index", n, len(todo)))
+                passages, paged = build_passages(self.library, item)
+                index.put(item["id"], item_signature(item), passages, paged)
+                time.sleep(0.05)                                # arayüze nefes aldır
+            stats = index.stats()
+            stats["toplam"] = len(items)
+            self.events.put(("index_done", stats, self.cancel.is_set()))
+        except Exception:
+            diag_exception("metin dizini")
+            self.events.put(("index_done", {}, True))
+        finally:
+            sys.setswitchinterval(old_switch)
+            if index is not None:
+                index.close()
+
+
+def abstract_of(text: str, limit=900) -> str:
+    """Kayıtlı tam metinden özet bölümü (Öz/Özet/Abstract başlığından sonrası), yoksa baştan bir parça."""
+    if not text:
+        return ""
+    m = re.search(r"(?i)\b(ÖZ|ÖZET|Öz|Özet|ABSTRACT|Abstract)\b\s*[:.\n]", text[:20000])
+    body = text[m.end():] if m else text
+    body = re.sub(r"\s+", " ", body).strip()
+    return body[:limit] + ("…" if len(body) > limit else "")
+
+
 MCP_INSTRUCTIONS = (
-    "Bu araçlar kullanıcının kişisel akademik kütüphanesine (Akademik Kaynak İndirici) erişir. "
-    "Kaynakları bulmak için önce kutuphane_ara'yı kullan; kimlikleri (id) diğer araçlara ver. "
-    "Kaynak silmeden önce kullanıcıdan açık onay al. Kaynakça APA 7'dir; Türkçe için dil='tr'. "
-    "PDF içeriğini okumak için pdf_metni_oku'yu kullan; alıntı yaparken sayfa numarasını belirt."
+    "Bu araçlar kullanıcının kişisel akademik kütüphanesine (Akademik Kaynak İndirici; binlerce kaynak, PDF tam "
+    "metinleriyle) erişir. Kullanıcı alanıyla ilgili bir soru sorduğunda, değerlendirme, derleme ya da fikir "
+    "istediğinde ÖNCE kütüphanede ara: metinde_ara ile bütün PDF'lerin içinde kavramın geçtiği sayfaları bul "
+    "(Türkçe ve İngilizce karşılıklarıyla, eş anlamlılarla birkaç arama yap); genel bakış için kaynak_ozetleri; "
+    "derin okuma için pdf_metni_oku. Yanıtını kütüphanedeki kaynaklara dayandır, her bilgi için APA metin içi atıf "
+    "ve sayfa ver ((Yazar, yıl, s. X)); kütüphanede olmayan genel bilgiyi ayrıca belirt. Önemli alıntıları "
+    "kullanıcı isterse alinti_karti_ekle ile kaydet. Kaynak silmeden önce açık onay al. Kaynakça APA 7'dir."
 )
 
 STATUS_FILTER_VALUES = ["hepsi", "pdf_var", "pdf_yok", "yeni", "karti_olan", "scopus", "scopus_disi"]
@@ -6395,6 +6702,25 @@ class McpTools:
                  "no_min": {"type": "integer", "description": "Kayıt numarası en az"},
                  "no_max": {"type": "integer", "description": "Kayıt numarası en çok"},
                  "limit": {"type": "integer", "description": "En fazla sonuç (varsayılan 50)"}}}),
+            ("metinde_ara", "Kütüphanedeki BÜTÜN PDF'lerin metninde arar ve kavramın geçtiği sayfaları (parçaları) "
+                            "en ilgiliden başlayarak döndürür: kaynak, APA atıfı, sayfa ve metin. Bir konuda bilgi, "
+                            "değerlendirme ya da derleme istendiğinde ilk adım budur. Türkçe ve İngilizce terimlerle, "
+                            "eş anlamlılarla ayrı ayrı arayın; tam ifade için tırnak kullanın (\"halk oyunları\").",
+             {"type": "object", "properties": {
+                 "sorgu": s("Aranacak kavram/kelimeler"),
+                 "etiket": s("Yalnızca bu etiketteki kaynaklarda"),
+                 "yil_min": {"type": "integer"}, "yil_max": {"type": "integer"},
+                 "no_min": {"type": "integer"}, "no_max": {"type": "integer"},
+                 "kaynak_basina": {"type": "integer", "description": "Kaynak başına en fazla parça (varsayılan 2)"},
+                 "limit": {"type": "integer", "description": "En fazla parça (varsayılan 15, en çok 40)"}},
+              "required": ["sorgu"]}),
+            ("kaynak_ozetleri", "Birçok kaynağın kısa künyesini, özetini (Öz/Abstract), anahtar kelimelerini ve "
+                                "etiketlerini tek seferde verir; bir konunun ya da etiketin genel haritasını çıkarmak, "
+                                "okunacakları seçmek için.",
+             {"type": "object", "properties": {
+                 "idler": ids, "etiket": s("Bu etiketteki kaynaklar"), "sorgu": s("Başlık/anahtar kelime araması"),
+                 "no_min": {"type": "integer"}, "no_max": {"type": "integer"},
+                 "limit": {"type": "integer", "description": "En fazla kaynak (varsayılan 40, en çok 100)"}}}),
             ("kaynak_detay", "Bir kaynağın tüm künyesini, etiketlerini, anahtar kelimelerini, alıntı kartlarını, "
                              "PDF yolunu ve APA kaynakça satırını verir.",
              {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]}),
@@ -6454,6 +6780,62 @@ class McpTools:
         return {"toplam": len(items), "gosterilen": min(len(items), limit),
                 "kaynaklar": [_brief(i) for i in items[:limit]]}
 
+    def _index(self):
+        try:
+            return PassageIndex(readonly=True)
+        except (FileNotFoundError, sqlite3.Error):
+            return None
+
+    def t_metinde_ara(self, sorgu, etiket="", yil_min=None, yil_max=None, no_min=None, no_max=None,
+                      kaynak_basina=2, limit=15):
+        index = self._index()
+        if index is None:
+            raise ValueError("Metin dizini henüz hazır değil. Akademik Kaynak İndirici programını açık bırakın; "
+                             "dizin arka planda kurulur (Tarama sekmesinde ilerlemesi görünür). O zamana kadar "
+                             "kutuphane_ara ve pdf_metni_oku kullanılabilir.")
+        try:
+            allowed = None
+            if etiket or yil_min or yil_max or no_min or no_max:
+                allowed = {i["id"] for i in search_items(self.lib, "", etiket, "hepsi", False, yil_min, yil_max,
+                                                         no_min, no_max)}
+            limit = max(1, min(int(limit or 15), 40))
+            hits = index.search(sorgu, allowed, limit=limit, per_item=max(1, min(int(kaynak_basina or 2), 5)))
+            stats = index.stats()
+        finally:
+            index.close()
+        items = {}
+        out = []
+        for item_id, page, label, text, score in hits:
+            item = items.get(item_id) or self.lib.get(item_id)
+            if not item:
+                continue
+            items[item_id] = item
+            shown = label or (str(page) if page else "")
+            out.append({"id": item_id, "kayit_no": item.get("no") or 0, "baslik": item["title"],
+                        "atif": intext_citation(item, shown if page else ""),
+                        "sayfa": shown or ("künye/özet" if page == 0 else ""), "pdf_sayfasi": page or None,
+                        "metin": text[:1500]})
+        return {"sorgu": sorgu, "bulunan_parca": len(out), "kaynak_sayisi": len(items),
+                "dizin": {"dizindeki_kaynak": stats["kaynak"], "kutuphanedeki_kaynak": self.lib.count(),
+                          "metinsiz_pdf": stats["metinsiz"]},
+                "parcalar": out,
+                "not": "pdf_sayfasi, pdf_metni_oku'daki baslangic_sayfa değeridir; 'sayfa' basılı sayfa numarasıdır."}
+
+    def t_kaynak_ozetleri(self, idler=None, etiket="", sorgu="", no_min=None, no_max=None, limit=40):
+        if idler:
+            items = [i for i in (self.lib.get(x) for x in _ids(idler)) if i]
+        else:
+            items = search_items(self.lib, sorgu, etiket, "hepsi", False, None, None, no_min, no_max)
+        limit = max(1, min(int(limit or 40), 100))
+        out = []
+        for item in items[:limit]:
+            text = self.lib.get_fulltext(item["id"])
+            out.append({"id": item["id"], "kayit_no": item.get("no") or 0,
+                        "kunye": apa_text(item, "tr"), "anahtar_kelimeler": split_keywords(item.get("keywords", "")),
+                        "etiketler": item.get("tags") or [], "ozet": abstract_of(text),
+                        "pdf_var": bool(item["file_path"]) and Path(item["file_path"]).is_file()})
+        return {"toplam": len(items), "gosterilen": len(out), "kaynaklar": out}
+
     def t_kaynak_detay(self, id):
         item = self.lib.get(int(id))
         if not item:
@@ -6475,6 +6857,16 @@ class McpTools:
         item = self.lib.get(int(id))
         if not item or not item["file_path"] or not Path(item["file_path"]).is_file():
             raise ValueError("Bu kaynağın PDF'i yok")
+        if item["file_path"].lower().endswith(".epub"):
+            parts = epub_sections(item["file_path"])
+            if not parts:
+                raise ValueError("Bu e-kitap okunamıyor (kopya korumalı olabilir)")
+            start = max(1, int(baslangic_sayfa or 1))
+            count = max(1, min(int(sayfa_sayisi or 5), 10))
+            chosen = parts[start - 1:start - 1 + count]
+            return {"baslik": item["title"], "toplam_sayfa": len(parts),
+                    "metin": "\n".join(f"--- {label} ---\n{text}" for _, label, text in chosen)[:60_000],
+                    "not": "EPUB'da basılı sayfa yok; parçalar ~6000 karakterdir."}
         from pypdf import PdfReader
         reader = PdfReader(item["file_path"])
         start = max(1, int(baslangic_sayfa or 1))
@@ -9532,6 +9924,14 @@ class ScanTab:
                       command=self.connect_claude).pack(side="left")
         ctk.CTkButton(cl, text="Ayarı Kopyala", width=110, fg_color="transparent", border_width=1,
                       text_color=TEXT, command=self.copy_claude_config).pack(side="left", padx=8)
+        self.index_label = ctk.CTkLabel(side, text="Claude için metin dizini: açılıştan kısa süre sonra denetlenir.",
+                                        text_color=MUTED, font=ctk.CTkFont(size=12), wraplength=330,
+                                        justify="left", anchor="w")
+        self.index_label.grid(row=r, column=0, sticky="ew", padx=10); r += 1
+        self.index_btn = ctk.CTkButton(side, text="Dizini Şimdi Güncelle", height=26, width=170,
+                                       fg_color="transparent", border_width=1, text_color=TEXT,
+                                       font=ctk.CTkFont(size=12), command=self.update_index_clicked)
+        self.index_btn.grid(row=r, column=0, sticky="w", padx=10, pady=(4, 6)); r += 1
 
         section("Kütüphane ayarları")
         lf = ctk.CTkFrame(side, fg_color="transparent")
@@ -9721,6 +10121,23 @@ class ScanTab:
         meta = self.app.sync.meta()
         who = f" · son gönderen: {meta['machine']}" if meta.get("machine") else ""
         self.sync_label.configure(text=f"Açık · son eşitleme: {last or '—'}{who}", text_color=LOG_COLORS["success"])
+
+    def update_index_clicked(self):
+        if self.app.update_index(manual=True):
+            self.index_label.configure(text="Claude için metin dizini güncelleniyor…")
+        else:
+            self.app.toast("Dizin zaten güncelleniyor.")
+
+    def on_index_done(self, stats, stopped):
+        if not stats:
+            self.index_label.configure(text="Metin dizini kurulamadı; ayrıntı tanılama kaydında.")
+            return
+        mb = stats["karakter"] / 1_000_000
+        text = (f"Claude için metin dizini: {stats['kaynak']}/{stats['toplam']} kaynak, {stats['parca']} parça "
+                f"(~{mb:.0f} milyon karakter)")
+        if stats.get("metinsiz"):
+            text += f" · {stats['metinsiz']} PDF taranmış görüntü olduğu için okunamadı"
+        self.index_label.configure(text=text + (" · yarıda kaldı, sonra sürecek" if stopped else "") + ".")
 
     def check_theses(self):
         """Kütüphanedeki PDF'siz YÖK tezlerini Tez Merkezi'nde yoklar; sonra çıkarmak için onay ister."""
@@ -10117,11 +10534,28 @@ class App(ctk.CTk):
         self._watchdog_beat()
         self.watchdog.start()
         self.after(600, self._first_run)
+        self.index_worker = None
+        self.after(45_000, self._index_tick)
         self.after(15_000, self._watch_downloads)
         self._db_stamp = self._library_stamp()
         self.bind("<FocusIn>", self._on_focus, add="+")
         self.after(5 * 60_000, self._sync_tick)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _index_tick(self):
+        """Metin dizinini 10 dakikada bir (yalnızca değişenler için) günceller."""
+        try:
+            self.update_index()
+        finally:
+            self.after(10 * 60_000, self._index_tick)
+
+    def update_index(self, manual=False):
+        if self.index_worker is not None and self.index_worker.is_alive():
+            return False
+        self.index_worker = IndexWorker(self.library, self.events)
+        self.index_worker.manual = manual
+        self.index_worker.start()
+        return True
 
     def _watchdog_beat(self):
         self.watchdog.beat = time.monotonic()
@@ -10889,6 +11323,12 @@ class App(ctk.CTk):
             self.scan_tab.thesis_btn.configure(text=f"Yoklanıyor {n + 1}/{total}… (durdur)")
         elif kind == "thesis_check_done":
             self.scan_tab.on_theses_checked(*message[1:])
+        elif kind == "index":
+            done, total = message[1:]
+            self.scan_tab.index_label.configure(text=f"Claude için metin dizini hazırlanıyor: {done}/{total} kaynak "
+                                                     "okundu (arka planda)…")
+        elif kind == "index_done":
+            self.scan_tab.on_index_done(*message[1:])
         elif kind == "isbn_done":
             self.library_tab.on_isbn_done(*message[1:])
         elif kind == "retry_wait":
@@ -10964,6 +11404,9 @@ class App(ctk.CTk):
             self.scan_tab.cancel.set()
             scan.join(timeout=5)
         self.save_all_settings()
+        if getattr(self, "index_worker", None) is not None and self.index_worker.is_alive():
+            self.index_worker.cancel.set()
+            self.index_worker.join(timeout=5)
         running = getattr(self, "_sync_thread", None)
         if running is not None and running.is_alive():
             running.join(timeout=120)
