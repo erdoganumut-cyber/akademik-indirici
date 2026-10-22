@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.24"
+APP_VERSION = "2.25"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -1850,6 +1850,102 @@ def record_from_crossref(msg: dict) -> dict:
     }
 
 
+# ── Eksik künye bilgilerini tamamlama (bölüm sayfaları, kitap adı, editörler…) ─────────────
+
+def missing_fields(item) -> list:
+    """APA kaynakçası için eksik alanlar (türe göre)."""
+    t = item.get("type")
+    need = {"chapter": ("pages", "container", "editors", "publisher"),
+            "article": ("container", "volume", "pages"),
+            "conference": ("container", "pages"),
+            "book": ("publisher",)}.get(t, ())
+    return [f for f in need if not item.get(f)]
+
+
+def pdf_page_range(path) -> str:
+    """PDF'in kendi sayfa etiketlerinden (yayıncı koyduysa) bölümün sayfa aralığı: '45-67'."""
+    if not str(path or "").lower().endswith(".pdf") or not os.path.isfile(path):
+        return ""
+    try:
+        from pypdf import PdfReader
+        labels = list(PdfReader(str(path)).page_labels)
+    except Exception:
+        return ""
+    nums = [lab for lab in labels if str(lab).isdigit()]
+    if len(nums) >= 2 and int(nums[-1]) > int(nums[0]) > 1:
+        return f"{nums[0]}-{nums[-1]}"
+    return ""
+
+
+def crossref_search(session, item):
+    """DOI'si olmayan kaynağı Crossref'te başlık+yazar+yılla arar; başlık uyuşursa ham kaydı döner."""
+    first = (item.get("authors") or [{}])[0] or {}
+    query = " ".join(filter(None, [item.get("title"), first.get("family", ""), str(item.get("year") or "")]))
+    try:
+        r = session.get(CROSSREF_API.rstrip("/"), params={"query.bibliographic": query, "rows": 5},
+                        timeout=API_TIMEOUT, headers={"Accept": "application/json"})
+        if not r.ok:
+            return None
+        for msg in r.json().get("message", {}).get("items", []):
+            rec = record_from_crossref(msg)
+            if not same_title(item.get("title", ""), rec["title"]):
+                continue
+            if item.get("year") and rec["year"] and abs(int(item["year"][:4]) - int(rec["year"][:4])) > 1:
+                continue
+            if first.get("family") and rec["authors"] and \
+                    fold(first["family"]) not in {fold(a.get("family", "")) for a in rec["authors"]}:
+                continue
+            return msg
+    except (requests.RequestException, ValueError, AttributeError):
+        pass
+    return None
+
+
+def complete_record(session, item) -> dict:
+    """Kaynağın BOŞ alanlarını Crossref (DOI ya da başlık araması), üst kitabın künyesi ve PDF sayfa
+    etiketleriyle doldurur; dolu alanlara (sizin düzeltmelerinize) dokunmaz. Dönüş: güncellenecek alanlar."""
+    msg = None
+    doi = normalize_doi(item.get("doi") or "")
+    try:
+        if doi:
+            r = session.get(CROSSREF_API + quote(doi, safe="/:;()._-"), timeout=API_TIMEOUT,
+                            headers={"Accept": "application/json"})
+            msg = r.json().get("message") if r.ok else None
+        else:
+            msg = crossref_search(session, item)
+    except (requests.RequestException, ValueError):
+        msg = None
+    found = record_from_crossref(msg) if msg else {}
+    # bölümün editörleri çoğu zaman üst kitabın kaydında
+    if msg and found.get("type") == "chapter" and not found.get("editors") and not item.get("editors"):
+        for isbn in (msg.get("ISBN") or [])[:2]:
+            try:
+                r = session.get(CROSSREF_API.rstrip("/"), params={"filter": f"isbn:{isbn}", "rows": 3},
+                                timeout=API_TIMEOUT, headers={"Accept": "application/json"})
+                books = [b for b in (r.json().get("message", {}).get("items", []) if r.ok else [])
+                         if b.get("type") in ("book", "edited-book", "monograph", "reference-book")]
+            except (requests.RequestException, ValueError):
+                books = []
+            if books:
+                parent = record_from_crossref(books[0])
+                found["editors"] = parent.get("editors") or []
+                found["container"] = found.get("container") or parent.get("title", "")
+                found["publisher"] = found.get("publisher") or parent.get("publisher", "")
+                break
+    updates = {}
+    for field in ("container", "volume", "issue", "pages", "publisher", "editors", "issn", "doi", "year"):
+        if not item.get(field) and found.get(field):
+            updates[field] = found[field]
+    if item.get("type") in ("other", "", None) and found.get("type") not in (None, "other"):
+        updates["type"] = found["type"]
+    if not item.get("pages") and not updates.get("pages") and \
+            (updates.get("type") or item.get("type")) in ("chapter", "article", "conference"):
+        pages = pdf_page_range(item.get("file_path"))
+        if pages:
+            updates["pages"] = pages
+    return updates
+
+
 def crossref_record(session, doi: str, raise_network_errors: bool = False):
     """DOI'nin künyesini Crossref'ten alır (APA için en güvenilir kaynak).
     Kayıt yoksa None; raise_network_errors=True ise bağlantı hataları yükseltilir."""
@@ -3211,6 +3307,45 @@ def report_links_in(folder: Path) -> dict:
         except (OSError, csv.Error, UnicodeDecodeError):
             continue
     return links
+
+
+class CompleteWorker(threading.Thread):
+    """Eksik künye alanlarını tamamlar. Mesajlar: ("complete", sıra, toplam, başlık, no) ·
+    ("complete_done", güncellenen_nolar, alan_sayıları, denenen, durduruldu_mu)"""
+
+    def __init__(self, items, library, events):
+        super().__init__(daemon=True)
+        self.items = sorted(items, key=lambda i: i.get("no") or 0)
+        self.library, self.events = library, events
+        self.cancel = threading.Event()
+
+    def run(self):
+        updated, counts, tried = [], {}, 0
+        session = make_session()
+        try:
+            for n, item in enumerate(self.items):
+                if self.cancel.is_set():
+                    break
+                self.events.put(("complete", n, len(self.items), item["title"], item.get("no") or 0))
+                current = self.library.get(item["id"])
+                if not current:
+                    continue
+                tried += 1
+                try:
+                    changes = complete_record(session, current)
+                except Exception as exc:
+                    diag(f"künye tamamlama: {item['title'][:60]}: {describe_error(exc)}")
+                    continue
+                if changes.get("doi") and self.library.find_by_doi(changes["doi"]) not in (None, item["id"]):
+                    changes.pop("doi")                       # aynı DOI başka kayıtta: ikilenmesin
+                if changes:
+                    self.library.update(item["id"], changes)
+                    updated.append(item.get("no") or 0)
+                    for key in changes:
+                        counts[key] = counts.get(key, 0) + 1
+        finally:
+            session.close()
+            self.events.put(("complete_done", updated, counts, tried, self.cancel.is_set()))
 
 
 class AutoTagWorker(threading.Thread):
@@ -7983,6 +8118,9 @@ class LibraryTab:
             side="left", padx=(8, 0))
         self.autotag_btn = ctk.CTkButton(acts, text="Otomatik Etiketle", width=130, command=self._autotag, **outline)
         self.autotag_btn.pack(side="left", padx=(8, 0))
+        self.complete_btn = ctk.CTkButton(acts, text="Eksik Künyeleri Tamamla", width=170, command=self._complete,
+                                          **outline)
+        self.complete_btn.pack(side="left", padx=(8, 0))
         self.retry_btn = ctk.CTkButton(acts, text="PDF'leri Yeniden Ara", width=150, fg_color="#1F8F4E",
                                        hover_color="#18723E", command=self._retry_pdfs)
         self.retry_btn.pack(side="left", padx=(16, 0))
@@ -8872,6 +9010,55 @@ class LibraryTab:
             return
         self.autotag_btn.configure(state="disabled", text="Etiketleniyor…")
         AutoTagWorker(self.lib, self.app.events, [i["id"] for i in items] if items else None).start()
+
+    def _complete(self):
+        """Bölüm sayfaları, kitap adı, editör, yayınevi, cilt/sayı gibi eksik alanları toplu tamamlar."""
+        worker = getattr(self, "complete_worker", None)
+        if worker and worker.is_alive():
+            worker.cancel.set()
+            self.complete_btn.configure(text="Durduruluyor…", state="disabled")
+            return
+        chosen = self.selected_items()
+        pool = chosen if len(chosen) > 1 else [self.by_id[int(i)] for i in self.tree.get_children()
+                                                if int(i) in self.by_id]
+        items = [i for i in pool if missing_fields(i)]
+        if not items:
+            messagebox.showinfo(APP_NAME, "Listede eksik künye bilgisi olan kaynak yok.", parent=self.parent)
+            return
+        counts = {}
+        for i in items:
+            for f in missing_fields(i):
+                counts[f] = counts.get(f, 0) + 1
+        names = {"pages": "sayfa aralığı", "container": "dergi/kitap adı", "editors": "editör",
+                 "publisher": "yayınevi", "volume": "cilt"}
+        detail = ", ".join(f"{names.get(k, k)}: {v}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1]))
+        scope = "seçili" if len(chosen) > 1 else "listede görünen"
+        if not messagebox.askokcancel(
+                APP_NAME, f"{scope.capitalize()} {len(items)} kaynakta eksik künye bilgisi var ({detail}).\n\n"
+                          "Eksikler Crossref'ten (DOI ya da başlık+yazar+yıl ile), bölümlerde üst kitabın "
+                          "kaydından ve PDF'in sayfa numaralarından tamamlanacak. Doldurduğunuz alanlara "
+                          "dokunulmaz.", parent=self.parent):
+            return
+        self.complete_worker = CompleteWorker(items, self.lib, self.app.events)
+        self._complete_style = {k: self.complete_btn.cget(k) for k in ("fg_color", "hover_color", "text_color")}
+        self.complete_btn.configure(text="Durdur", fg_color="#C9353A", hover_color="#A42A2E", text_color="#ffffff")
+        self.complete_worker.start()
+
+    def on_complete_done(self, updated, counts, tried, stopped):
+        self.complete_btn.configure(text="Eksik Künyeleri Tamamla", state="normal",
+                                    **getattr(self, "_complete_style", {}))
+        self.refresh()
+        names = {"pages": "sayfa", "container": "dergi/kitap adı", "editors": "editör", "publisher": "yayınevi",
+                 "volume": "cilt", "issue": "sayı", "doi": "DOI", "issn": "ISSN", "year": "yıl", "type": "tür"}
+        detail = ", ".join(f"{v} {names.get(k, k)}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1]))
+        msg = (f"{tried} kaynağa bakıldı, {len(updated)} tanesi tamamlandı"
+               + (f" ({detail}; No {no_ranges_text(updated, 8)})." if updated else "."))
+        if stopped:
+            msg = "Durduruldu. " + msg
+        if tried > len(updated):
+            msg += " Bulunamayanlar Crossref'te kayıtlı değil; onları künye alanlarından elle doldurabilirsiniz."
+        self.app.toast(msg)
+        self.app._log("success" if updated else "info", "Künye tamamlama: " + msg)
 
     def autotag_finished(self, total, tagged, kw_added):
         self.autotag_btn.configure(state="normal", text="Otomatik Etiketle")
@@ -10356,6 +10543,12 @@ class App(ctk.CTk):
             self.library_tab.refresh()
         elif kind == "sync_bg":
             self.on_sync_bg(*message[1:])
+        elif kind == "complete":
+            n, total, title, no = message[1:]
+            self.library_tab.count_label.configure(
+                text=f"Künye tamamlanıyor · No {no} ({n + 1}/{total}): {shorten(title, 44)}")
+        elif kind == "complete_done":
+            self.library_tab.on_complete_done(*message[1:])
         elif kind == "isbn_done":
             self.library_tab.on_isbn_done(*message[1:])
         elif kind == "retry_wait":
