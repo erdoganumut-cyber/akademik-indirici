@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.23"
+APP_VERSION = "2.24"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -82,6 +82,7 @@ MAX_CANDIDATES = 4                  # bir sayfada denenecek en fazla PDF adayı
 UNPAYWALL_API = "https://api.unpaywall.org/v2/"
 OPENALEX_API = "https://api.openalex.org/works"
 S2_API = "https://api.semanticscholar.org/graph/v1/paper/"
+GOOGLE_BOOKS_API = "https://www.googleapis.com/books/v1/volumes"
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 HEADERS = {
@@ -1918,6 +1919,8 @@ def record_from_filename(stem: str) -> dict:
 # ── PDF içeriği ─────────────────────────────────────────────────────────────
 
 def pdf_text(path, max_pages=FULLTEXT_MAX_PAGES, max_chars=FULLTEXT_MAX_CHARS) -> str:
+    if str(path).lower().endswith(".epub"):
+        return epub_text(path, max_chars=max_chars)
     try:
         from pypdf import PdfReader
         reader = PdfReader(str(path))
@@ -1934,6 +1937,269 @@ def pdf_text(path, max_pages=FULLTEXT_MAX_PAGES, max_chars=FULLTEXT_MAX_CHARS) -
         return "\n".join(chunks)[:max_chars]
     except Exception:
         return ""
+
+
+# ── E-kitaplar: EPUB (DRM'siz ya da ödünç alınmış DRM'li), ACSM ödünç biletleri, ISBN ──────────
+
+EBOOK_EXTS = (".epub", ".acsm")
+DOC_EXTS = (".pdf",) + EBOOK_EXTS
+_FONT_OBFUSCATION = ("http://www.idpf.org/2008/embedding", "http://ns.adobe.com/pdf/enc#RC")
+
+
+def _xml_local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1].lower()
+
+
+def _epub_opf(zf):
+    container = ET.fromstring(zf.read("META-INF/container.xml"))
+    for el in container.iter():
+        if _xml_local(el.tag) == "rootfile" and el.get("full-path"):
+            return el.get("full-path"), ET.fromstring(zf.read(el.get("full-path")))
+    raise ValueError("EPUB içinde OPF yok")
+
+
+def epub_is_drm(zf) -> bool:
+    """Ödünç verilen e-kitaplar (Adobe ADEPT, LCP vb.) içerik dosyalarını şifreler; yalnızca yazı tipi
+    gizlemesi DRM sayılmaz."""
+    names = set(zf.namelist())
+    if "META-INF/rights.xml" in names or "META-INF/license.lcpl" in names:
+        return True
+    if "META-INF/encryption.xml" not in names:
+        return False
+    try:
+        root = ET.fromstring(zf.read("META-INF/encryption.xml"))
+    except ET.ParseError:
+        return True
+    for data in root.iter():
+        if _xml_local(data.tag) != "encrypteddata":
+            continue
+        algo = next((m.get("Algorithm", "") for m in data.iter() if _xml_local(m.tag) == "encryptionmethod"), "")
+        uri = next((c.get("URI", "") for c in data.iter() if _xml_local(c.tag) == "cipherreference"), "")
+        if algo not in _FONT_OBFUSCATION and not re.search(r"\.(otf|ttf|woff2?)$", uri, re.I):
+            return True
+    return False
+
+
+def epub_info(path) -> dict:
+    """EPUB künyesi: başlık, yazarlar, yıl, yayınevi, dil, ISBN; DRM'li mi?"""
+    out = {"title": "", "creators": [], "year": "", "publisher": "", "language": "", "isbn": "", "drm": False}
+    try:
+        with zipfile.ZipFile(path) as zf:
+            out["drm"] = epub_is_drm(zf)
+            _, opf = _epub_opf(zf)
+    except (zipfile.BadZipFile, KeyError, ValueError, ET.ParseError, OSError):
+        return out
+    for el in opf.iter():
+        name, text = _xml_local(el.tag), (el.text or "").strip()
+        if not text:
+            continue
+        if name == "title" and not out["title"]:
+            out["title"] = text
+        elif name == "creator":
+            out["creators"].append(text)
+        elif name == "date" and not out["year"]:
+            m = re.search(r"\b(1[5-9]\d\d|20\d\d)\b", text)
+            out["year"] = m.group(1) if m else ""
+        elif name == "publisher" and not out["publisher"]:
+            out["publisher"] = text
+        elif name == "language" and not out["language"]:
+            out["language"] = text[:2].lower()
+        elif name == "identifier" and not out["isbn"]:
+            out["isbn"] = find_isbn(text)
+    return out
+
+
+def epub_text(path, max_chars=FULLTEXT_MAX_CHARS) -> str:
+    """DRM'siz EPUB'un okuma sırasındaki düz metni (tam metin araması için)."""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            if epub_is_drm(zf):
+                return ""
+            opf_path, opf = _epub_opf(zf)
+            base = opf_path.rsplit("/", 1)[0] + "/" if "/" in opf_path else ""
+            manifest = {el.get("id"): el.get("href") for el in opf.iter()
+                        if _xml_local(el.tag) == "item" and el.get("href")}
+            order = [manifest.get(el.get("idref")) for el in opf.iter() if _xml_local(el.tag) == "itemref"]
+            chunks, size = [], 0
+            for href in order:
+                if not href:
+                    continue
+                try:
+                    raw = zf.read(base + unquote(href).split("#")[0]).decode("utf-8", "replace")
+                except KeyError:
+                    continue
+                raw = re.sub(r"(?is)<(script|style|head)\b.*?</\1>", " ", raw)
+                text = html.unescape(re.sub(r"<[^>]+>", " ", raw))
+                text = re.sub(r"\s+", " ", text).strip()
+                if text:
+                    chunks.append(text)
+                    size += len(text)
+                if size >= max_chars:
+                    break
+            return "\n".join(chunks)[:max_chars]
+    except (zipfile.BadZipFile, KeyError, ValueError, ET.ParseError, OSError):
+        return ""
+
+
+def acsm_info(path) -> dict:
+    """ACSM (Adobe ödünç bileti) içindeki künye; kitabın kendisi değildir."""
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+
+    def tag(name):
+        return [html.unescape(m.strip()) for m in re.findall(rf"<dc:{name}[^>]*>(.*?)</dc:{name}>", text, re.S)]
+    return {"title": (tag("title") or [""])[0], "creators": tag("creator"),
+            "publisher": (tag("publisher") or [""])[0], "isbn": next((find_isbn(i) for i in tag("identifier")
+                                                                     if find_isbn(i)), ""),
+            "language": ((tag("language") or [""])[0])[:2].lower(), "year": ""}
+
+
+def _isbn_ok(digits: str) -> bool:
+    if len(digits) == 13 and digits.isdigit():
+        return sum(int(d) * (1 if i % 2 == 0 else 3) for i, d in enumerate(digits)) % 10 == 0
+    if len(digits) == 10 and digits[:9].isdigit() and (digits[9].isdigit() or digits[9] in "Xx"):
+        total = sum(int(d) * (10 - i) for i, d in enumerate(digits[:9]))
+        total += 10 if digits[9] in "Xx" else int(digits[9])
+        return total % 11 == 0
+    return False
+
+
+def isbn13(digits: str) -> str:
+    if len(digits) == 13:
+        return digits
+    core = "978" + digits[:9]
+    check = (10 - sum(int(d) * (1 if i % 2 == 0 else 3) for i, d in enumerate(core)) % 10) % 10
+    return core + str(check)
+
+
+def find_isbns(text: str) -> list:
+    """Metindeki geçerli ISBN'ler (13 haneli biçimde, tekrarsız)."""
+    out = []
+    for m in re.finditer(r"(?<![\dXx])(97[89][\d\- ]{10,16}|[\d][\d\- ]{8,11}[\dXx])(?![\dXx])", text or ""):
+        digits = re.sub(r"[\- ]", "", m.group(1))
+        if _isbn_ok(digits):
+            code = isbn13(digits.upper())
+            if code not in out:
+                out.append(code)
+    return out
+
+
+def find_isbn(text: str) -> str:
+    found = find_isbns(text)
+    return found[0] if found else ""
+
+
+def book_record_by_isbn(session, isbn: str) -> dict:
+    """ISBN'den kitap künyesi: önce Crossref (akademik kitaplar, DOI'siyle), yoksa Google Books."""
+    try:
+        r = session.get(CROSSREF_API.rstrip("/"), params={"filter": f"isbn:{isbn}", "rows": 3},
+                        timeout=API_TIMEOUT, headers={"Accept": "application/json"})
+        if r.ok:
+            for msg in r.json().get("message", {}).get("items", []):
+                if msg.get("type") in ("book", "monograph", "edited-book", "reference-book"):
+                    rec = record_from_crossref(msg)
+                    if rec.get("title"):
+                        rec["type"] = "book"
+                        return rec
+    except (requests.RequestException, ValueError, AttributeError):
+        pass
+    try:
+        r = session.get(GOOGLE_BOOKS_API, params={"q": f"isbn:{isbn}"},
+                        timeout=API_TIMEOUT)
+        items = r.json().get("items") or [] if r.ok else []
+        if items:
+            v = items[0].get("volumeInfo", {})
+            title = v.get("title", "")
+            if v.get("subtitle"):
+                title += ": " + v["subtitle"]
+            year = re.match(r"\d{4}", v.get("publishedDate", "") or "")
+            return {"type": "book", "title": title, "authors": text_to_people("; ".join(v.get("authors") or [])),
+                    "year": year.group(0) if year else "", "publisher": v.get("publisher", ""),
+                    "language": (v.get("language") or "")[:2]}
+    except (requests.RequestException, ValueError, AttributeError):
+        pass
+    return {}
+
+
+EBOOK_DRM_NOTE = ("Ödünç alınmış (DRM'li) e-kitap: Adobe Digital Editions ya da kütüphanenin okuma uygulamasıyla "
+                  "açılır; ödünç süresi bitince dosya açılmaz. Alıntılarınızı alıntı kartlarına sayfa numarasıyla "
+                  "kaydedin.")
+ACSM_NOTE = ("Ödünç bileti (.acsm) eklendi, kitabın dosyası değil. Bileti Adobe Digital Editions ile açın; inen "
+             "EPUB 'Belgeler\\My Digital Editions' klasöründe olur, onu 'PDF Bağla…' ile bu kayda bağlayabilirsiniz.")
+
+
+def ebook_record(session, path, info) -> dict:
+    """E-kitap dosyasının künyesi; ISBN varsa Crossref/Google Books ile tamamlanır."""
+    people = []
+    for c in info.get("creators") or []:
+        people += text_to_people(c)
+    base = {"type": "book", "title": info.get("title") or Path(path).stem, "authors": people,
+            "year": info.get("year", ""), "publisher": info.get("publisher", ""), "language": info.get("language", "")}
+    looked = book_record_by_isbn(session, info["isbn"]) if info.get("isbn") and session is not None else {}
+    return merge_records(looked, base) if looked else base
+
+
+def catalog_ebook(library, session, path: Path, sha: str, tags=(), log=None, library_folder=None, move=True,
+                  source="", auto_tags=None):
+    """EPUB ya da ACSM dosyasını kitap olarak kütüphaneye ekler. Dönüş: (kimlik, yeni_mi)"""
+    path = Path(path)
+    acsm = path.suffix.lower() == ".acsm"
+    info = acsm_info(path) if acsm else epub_info(path)
+    record = ebook_record(session, path, info)
+    notes = []
+    if info.get("isbn"):
+        notes.append(f"ISBN: {info['isbn']}")
+    if acsm:
+        notes.append(ACSM_NOTE)
+    elif info.get("drm"):
+        notes.append(EBOOK_DRM_NOTE)
+    text = "" if acsm else epub_text(path)
+    tags = list(tags) + auto_group_tags(record, text[:20_000], auto_tags)
+    existing = (None if acsm else library.find_by_sha(sha)) or library.find_by_doi(record.get("doi")) or \
+        library.find_by_title(record.get("title"))
+    if existing:
+        old = library.get(existing)
+        library.add_tags(existing, tags)
+        if acsm or (old["file_path"] and Path(old["file_path"]).is_file()):
+            if log:
+                log("muted", f"   📚 Zaten kütüphanede: {old['title'][:80]}")
+            return existing, False
+        target = place_in_library(path, old, library_folder, move=move)
+        library.update(existing, {"file_path": str(target), "sha256": sha,
+                                  "notes": "\n".join(filter(None, [old.get("notes"), *notes]))})
+        if text:
+            library.set_fulltext(existing, text)
+        return existing, False
+    if not acsm:
+        try:
+            path = place_in_library(path, finalize_record(record), library_folder, move=move)
+        except OSError as exc:
+            if log:
+                log("warn", f"   ⚠ Kütüphane klasörüne taşınamadı: {describe_error(exc)}")
+    item_id, created = library.add(record, None if acsm else path, "" if acsm else sha, text, tags, source=source)
+    if notes:
+        old = library.get(item_id)
+        library.update(item_id, {"notes": "\n".join(filter(None, [old.get("notes"), *notes]))})
+    if log:
+        kind = "ödünç bileti" if acsm else "DRM'li e-kitap" if info.get("drm") else "e-kitap"
+        log("muted", f"   📚 Kütüphaneye eklendi ({kind}): {record.get('title', '')[:80]}")
+    return item_id, created
+
+
+def doc_head(path) -> str:
+    """Eşleştirme için belgenin başı: PDF'in ilk sayfaları ya da EPUB'un künyesi ve başı."""
+    head = pdf_text(path, max_pages=2, max_chars=20_000)
+    if str(path).lower().endswith(".epub"):
+        info = epub_info(path)
+        head = " ".join([info.get("title", ""), " ".join(info.get("creators") or []), info.get("isbn", ""), head])
+    return head
+
+
+def downloaded_docs(folder):
+    """Klasördeki PDF ve EPUB dosyaları."""
+    return [p for pattern in ("*.pdf", "*.epub") for p in Path(folder).glob(pattern)]
 
 
 def pdf_info(path) -> dict:
@@ -3023,6 +3289,13 @@ class LibraryScanWorker(threading.Thread):
                             self.library.update(existing, {"file_path": str(path)})
                         self.library.add_tags(existing, self.tags)
                         skipped += 1
+                        continue
+                    if path.suffix.lower() in EBOOK_EXTS:
+                        _, created = catalog_ebook(self.library, session, path, sha, tags=self.tags,
+                                                   library_folder=self.library_folder, move=self.move,
+                                                   source="klasör", auto_tags=self.auto_tags)
+                        added += 1 if created else 0
+                        updated += 0 if created else 1
                         continue
                     url = links.get(str(path), "")
                     _, created = catalog_pdf(self.library, session, path, sha, url=url,
@@ -7346,7 +7619,7 @@ class PdfQueuePanel(ctk.CTkToplevel):
         out = set()
         for folder in self.folders:
             try:
-                out |= {str(p) for p in folder.glob("*.pdf")}
+                out |= {str(p) for p in downloaded_docs(folder)}
             except OSError:
                 pass
         return out
@@ -7406,13 +7679,14 @@ class PdfQueuePanel(ctk.CTkToplevel):
         self.pending = None
         for w in self.ask.winfo_children():
             w.destroy()
+        self.ask.configure(height=1)                     # boş kalan çerçeve pencereyi uzatmasın
 
     def poll(self):
         if not self.winfo_exists():
             return
         try:
             if self.current and self.pending is None:
-                found = [p for folder in self.folders if folder.is_dir() for p in folder.glob("*.pdf")]
+                found = [p for folder in self.folders if folder.is_dir() for p in downloaded_docs(folder)]
                 for path in sorted(found, key=lambda p: p.stat().st_mtime):
                     if str(path) in self.seen:
                         continue
@@ -7430,7 +7704,7 @@ class PdfQueuePanel(ctk.CTkToplevel):
     def _matches(self, item, path) -> bool:
         if path.stem.isdigit() and yok_tez_no(item) == path.stem:
             return True
-        head = pdf_text(path, max_pages=2, max_chars=20_000)
+        head = doc_head(path)
         m = DOI_RE.search(head)
         if m and item.get("doi") and normalize_doi(clean_url(m.group(1))) == normalize_doi(item["doi"]):
             return True
@@ -7704,7 +7978,7 @@ class LibraryTab:
         acts = ctk.CTkFrame(bar, fg_color="transparent")          # ikinci satır: işlemler
         acts.grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
         outline = {"fg_color": "transparent", "border_width": 1, "text_color": TEXT}
-        ctk.CTkButton(acts, text="PDF Ekle…", width=96, command=self._add_pdfs).pack(side="left")
+        ctk.CTkButton(acts, text="Dosya Ekle…", width=100, command=self._add_pdfs).pack(side="left")
         ctk.CTkButton(acts, text="Klasör Tara…", width=110, command=self._scan_folder, **outline).pack(
             side="left", padx=(8, 0))
         self.autotag_btn = ctk.CTkButton(acts, text="Otomatik Etiketle", width=130, command=self._autotag, **outline)
@@ -7884,6 +8158,9 @@ class LibraryTab:
                       border_width=1, text_color=TEXT, command=self._export).grid(row=0, column=3, padx=4)
         ctk.CTkButton(bar, text="İçe Aktar (Piri / RIS / BibTeX)…", width=210, fg_color="transparent",
                       border_width=1, text_color=TEXT, command=self._import_refs).grid(row=0, column=4, padx=4)
+        self.isbn_btn = ctk.CTkButton(bar, text="ISBN ile Kitap…", width=120, fg_color="transparent",
+                                      border_width=1, text_color=TEXT, command=self._add_isbn)
+        self.isbn_btn.grid(row=0, column=5, padx=4)
 
     # ── görünüm ─────────────────────────────────────────────────────────────
     def apply_style(self):
@@ -8281,8 +8558,8 @@ class LibraryTab:
         item = self.current
         if not item:
             return
-        path = filedialog.askopenfilename(parent=self.parent, title="Bu kaynağın PDF'ini seçin",
-                                          filetypes=[("PDF", "*.pdf"), ("Tüm dosyalar", "*.*")])
+        path = filedialog.askopenfilename(parent=self.parent, title="Bu kaynağın PDF'ini ya da e-kitabını seçin",
+                                          filetypes=[("PDF ve EPUB", "*.pdf *.epub"), ("Tüm dosyalar", "*.*")])
         if not path:
             return
         move = messagebox.askyesno(APP_NAME, "Dosya kütüphane klasörüne TAŞINSIN mı?\n"
@@ -8369,8 +8646,9 @@ class LibraryTab:
         self.refresh(keep_selection=False)
 
     def _add_pdfs(self):
-        paths = filedialog.askopenfilenames(parent=self.parent, title="Kütüphaneye eklenecek PDF'ler",
-                                            filetypes=[("PDF", "*.pdf")])
+        paths = filedialog.askopenfilenames(parent=self.parent, title="Kütüphaneye eklenecek PDF'ler ve e-kitaplar",
+                                            filetypes=[("PDF ve e-kitap", "*.pdf *.epub *.acsm"), ("PDF", "*.pdf"),
+                                                       ("E-kitap (EPUB, ödünç bileti ACSM)", "*.epub *.acsm")])
         if paths:
             self._start_import(paths)
 
@@ -8450,6 +8728,64 @@ class LibraryTab:
         self._ask_range("queue", lambda items, label, rng: setattr(
             self.app, "pdf_queue", PdfQueuePanel(self.app, items, label)))
 
+    def _add_isbn(self):
+        """Ödünç okunan (indirilemeyen) e-kitaplar ya da basılı kitaplar için ISBN'den künye."""
+        dialog = ctk.CTkInputDialog(title="ISBN ile kitap ekle",
+                                    text="Kitabın ISBN'ini yazın (birden çok olabilir; boşluk ya da satırla ayırın).\n"
+                                         "Künye Crossref ya da Google Books'tan alınır.")
+        set_window_icon(dialog, delay=260)
+        text = dialog.get_input()
+        if not text:
+            return
+        isbns = find_isbns(text)
+        if not isbns:
+            messagebox.showwarning(APP_NAME, "Geçerli bir ISBN bulunamadı. 10 ya da 13 haneli numarayı "
+                                             "tirelerle ya da tiresiz yazabilirsiniz.", parent=self.parent)
+            return
+        answer = import_dialog(self.app, len(isbns), self.lib.all_tags(), show_move=False, unit="kitap")
+        if answer is None:
+            return
+        _, tags, auto = answer
+        self.isbn_btn.configure(state="disabled", text="Aranıyor…")
+        lib, events = self.lib, self.app.events
+
+        def work():
+            added, existing, missing = [], [], []
+            session = make_session()
+            try:
+                for isbn in isbns:
+                    rec = book_record_by_isbn(session, isbn)
+                    if not rec.get("title"):
+                        missing.append(isbn)
+                        continue
+                    found = lib.find_by_doi(rec.get("doi")) or lib.find_by_title(rec["title"])
+                    if found:
+                        lib.add_tags(found, tags)
+                        existing.append(found)
+                        continue
+                    item_id, _ = lib.add(rec, tags=list(tags) + auto_group_tags(rec, "", auto), source="elle")
+                    lib.update(item_id, {"notes": f"ISBN: {isbn}"})
+                    added.append(item_id)
+            except Exception:
+                diag_exception("ISBN ile ekleme")
+            finally:
+                session.close()
+            events.put(("isbn_done", added, existing, missing))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_isbn_done(self, added, existing, missing):
+        self.isbn_btn.configure(state="normal", text="ISBN ile Kitap…")
+        self.refresh()
+        if added:
+            self.select(added[0])
+        parts = [f"{len(added)} kitap eklendi"]
+        if existing:
+            parts.append(f"{len(existing)} tanesi zaten kütüphanedeydi")
+        if missing:
+            parts.append("bulunamayan ISBN: " + ", ".join(missing))
+        self.app.toast("; ".join(parts) + ".")
+
     def _import_refs(self):
         paths = filedialog.askopenfilenames(
             parent=self.parent, title="Kaynakça dosyası seçin (Piri, Google Akademik, Zotero, EndNote…)",
@@ -8494,13 +8830,14 @@ class LibraryTab:
                           f"Sayfalar kütüphane klasöründeki '{HTML_ARCHIVE_DIR}' klasörüne taşınır.",
                 parent=self.parent):
             self._start_html(pages)
-        paths = sorted(Path(folder).rglob("*.pdf"))
+        paths = sorted(p for p in Path(folder).rglob("*") if p.suffix.lower() in (".pdf", ".epub")
+                       and p.is_file())
         lib_folder = self.app.library_folder()
         if lib_folder:
             paths = [p for p in paths if Path(lib_folder) not in p.parents]
         if not paths:
             if not pages:
-                messagebox.showinfo(APP_NAME, "Bu klasörde (kütüphane klasörü dışında) PDF bulunamadı.",
+                messagebox.showinfo(APP_NAME, "Bu klasörde (kütüphane klasörü dışında) PDF ya da EPUB bulunamadı.",
                                     parent=self.parent)
             return
         self._start_import(paths, report_folders=[folder])
@@ -9147,7 +9484,7 @@ class DownloadsWatcher(threading.Thread):
 
     def run(self):
         try:
-            candidates = [p for folder in self.folders for p in folder.glob("*.pdf")
+            candidates = [p for folder in self.folders for p in downloaded_docs(folder)
                           if p.is_file() and self.since < p.stat().st_mtime < time.time() - 5]
         except OSError:
             candidates = []
@@ -9169,7 +9506,7 @@ class DownloadsWatcher(threading.Thread):
                         missing = [i for i in missing if i["id"] != target]
                         self.events.put(("watch_attached", target, placed.name))
                         continue
-                head = pdf_text(path, max_pages=2, max_chars=20_000)
+                head = doc_head(path)
                 m = DOI_RE.search(head)
                 if m:
                     found = self.library.find_by_doi(clean_url(m.group(1)))
@@ -9746,7 +10083,7 @@ class App(ctk.CTk):
         self.import_worker = LibraryScanWorker(paths, self.library, self.events, threading.Event(),
                                                tags=tags, library_folder=self.library_folder(), move=move,
                                                report_folders=report_folders, auto_tags=auto_tags)
-        self.library_tab.count_label.configure(text=f"{len(paths)} PDF kütüphaneye alınıyor…")
+        self.library_tab.count_label.configure(text=f"{len(paths)} dosya kütüphaneye alınıyor…")
         self.import_worker.start()
 
     def _watch_downloads(self):
@@ -10019,6 +10356,8 @@ class App(ctk.CTk):
             self.library_tab.refresh()
         elif kind == "sync_bg":
             self.on_sync_bg(*message[1:])
+        elif kind == "isbn_done":
+            self.library_tab.on_isbn_done(*message[1:])
         elif kind == "retry_wait":
             secs, count = message[1:]
             self.library_tab.count_label.configure(
