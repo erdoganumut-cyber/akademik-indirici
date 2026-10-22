@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.30"
+APP_VERSION = "2.32"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -1661,6 +1661,39 @@ def tr_sort_key(text: str):
 
 def looks_turkish(text: str, language: str = "") -> bool:
     return (language or "").lower().startswith("tr") or bool(re.search(r"[çğıöşüÇĞİÖŞÜ]", text or ""))
+
+
+_LANG_NAMES = {"tr": "Türkçe", "en": "İngilizce", "de": "Almanca", "fr": "Fransızca", "es": "İspanyolca",
+               "it": "İtalyanca", "ru": "Rusça", "bg": "Bulgarca", "el": "Yunanca", "sr": "Sırpça", "cs": "Çekçe",
+               "pt": "Portekizce", "ar": "Arapça", "zh": "Çince", "ja": "Japonca"}
+
+
+def guess_language(item) -> str:
+    """Kaynağın dili: kayıtta varsa o, yoksa başlıktan kaba tahmin."""
+    lang = (item.get("language") or "").lower()[:2]
+    if lang:
+        return lang
+    title = " " + (item.get("title") or "") + " "
+    low = title.lower()
+    english = len(re.findall(r" (the|of|and|in|on|for|with|from|to|an?) ", low))
+    turkish = len(re.findall(r"[çğıöşüÇĞİÖŞÜ]", title)) + len(re.findall(r" (ve|bir|ile|üzerine|için) ", low))
+    if english >= 2 and english > turkish:
+        return "en"
+    if turkish and not re.search(r"[äßñ]", low):
+        return "tr"
+    if re.search(r"[\u0400-\u04FF]", title):
+        return "bg" if re.search(r"[ъ]", low) else "ru"
+    if re.search(r"[\u0370-\u03FF]", title):
+        return "el"
+    if re.search(r"[ñ¿¡]| (el|los|las|del|y|una|en la) ", low):
+        return "es"
+    if re.search(r"[äß]| (der|die|das|und|zur|im) ", low):
+        return "de"
+    if re.search(r"[èêà]| (les|des|du|et|une|la) ", low):
+        return "fr"
+    if re.search(r"[ěřůčž]", low):
+        return "cs"
+    return "en"
 
 
 def is_shouting(text: str) -> bool:
@@ -6465,6 +6498,9 @@ class PassageIndex:
 
     def search(self, query, allowed=None, limit=15, per_item=2) -> list:
         """[(item_id, sayfa, etiket, metin, skor)] — en ilgiliden başlayarak."""
+        return rank_hits(self.raw(query), query, allowed, limit, per_item)
+
+    def raw(self, query) -> list:
         terms = self._terms(query)
         if not terms:
             return []
@@ -6495,25 +6531,28 @@ class PassageIndex:
                         sum(2 for ph in phrases if ph in f)
                     rows.append((a, b, c, d, float(score)))
                 rows.sort(key=lambda r: -r[4])
-        # birden çok terim geçen parçalar öne; kaynak başına en fazla per_item parça
-        def coverage(text):
-            f = fold(text)
-            return sum(1 for w in terms if self.stem(w) in f)
-        rows.sort(key=lambda r: (-coverage(r[3]), -r[4]))
-        out, per = [], {}
-        for item_id, page, label, text, score in rows:
-            if allowed is not None and item_id not in allowed:
-                continue
-            if per.get(item_id, 0) >= per_item:
-                continue
-            per[item_id] = per.get(item_id, 0) + 1
-            out.append((item_id, page, label, text, score))
-            if len(out) >= limit:
-                break
-        return out
+        return rows
 
-    def matching_items(self, query) -> int:
-        return len({r[0] for r in self.search(query, limit=100000, per_item=1)})
+
+def rank_hits(rows, query, allowed=None, limit=15, per_item=2) -> list:
+    """Birden çok terim geçen parçalar öne; kaynak başına en fazla per_item parça."""
+    terms = [PassageIndex.stem(w) for w in PassageIndex._terms(query)]
+
+    def coverage(text):
+        f = fold(text)
+        return sum(1 for w in terms if w in f)
+    rows = sorted(rows, key=lambda r: (-coverage(r[3]), -r[4]))
+    out, per = [], {}
+    for item_id, page, label, text, score in rows:
+        if allowed is not None and item_id not in allowed:
+            continue
+        if per.get(item_id, 0) >= per_item:
+            continue
+        per[item_id] = per.get(item_id, 0) + 1
+        out.append((item_id, page, label, text, score))
+        if len(out) >= limit:
+            break
+    return out
 
 
 def item_signature(item) -> str:
@@ -6546,36 +6585,227 @@ def build_passages(library, item) -> tuple:
     return out, paged
 
 
+INDEX_DIR_NAME = "Metin Dizini"
+SHARD_SIZE = 250                         # parça dosyası başına kaynak (kayıt numarasına göre)
+_SHARD_RE = re.compile(r"^dizin_(\d{3,})\.db$")
+
+
+def shard_name(no) -> str:
+    return f"dizin_{(max(int(no or 1), 1) - 1) // SHARD_SIZE + 1:03d}.db"
+
+
+def local_index_dir() -> Path:
+    return settings_path().parent / "metin_dizini"
+
+
+def shared_index_dir():
+    shared = shared_dir()
+    return shared / INDEX_DIR_NAME if shared is not None else None
+
+
+class ShardedIndex:
+    """Kayıt numarasına göre 250'şer kaynaklık parça dosyalarından oluşan metin dizini. Ortak kütüphanede
+    parçalar Drive'da durur; her bilgisayar değişen parçaları yerel önbelleğine alır, aramayı oradan yapar.
+    Yeni kaynak eklenince yalnızca son parça (birkaç on MB) yeniden yüklenir."""
+
+    def __init__(self, folder=None, readonly=False):
+        self.folder = Path(folder) if folder else local_index_dir()
+        self.readonly = readonly
+        if not readonly:
+            self.folder.mkdir(parents=True, exist_ok=True)
+        self.shards = {}
+
+    def names(self) -> list:
+        try:
+            return sorted(p.name for p in self.folder.iterdir() if _SHARD_RE.match(p.name))
+        except OSError:
+            return []
+
+    def shard(self, name) -> PassageIndex:
+        if name not in self.shards:
+            self.shards[name] = PassageIndex(self.folder / name, readonly=self.readonly)
+        return self.shards[name]
+
+    def close(self):
+        for idx in self.shards.values():
+            idx.close()
+        self.shards = {}
+
+    def search(self, query, allowed=None, limit=15, per_item=2) -> list:
+        rows = []
+        for name in self.names():
+            try:
+                rows += self.shard(name).raw(query)
+            except sqlite3.Error:
+                continue
+        return rank_hits(rows, query, allowed, limit, per_item)
+
+    def stats(self) -> dict:
+        total = {"kaynak": 0, "parca": 0, "karakter": 0, "metinsiz": 0}
+        for name in self.names():
+            try:
+                for k, v in self.shard(name).stats().items():
+                    total[k] += v
+            except sqlite3.Error:
+                continue
+        return total
+
+    def signatures(self) -> dict:
+        """{kimlik: (imza, parça adı)}"""
+        out = {}
+        for name in self.names():
+            for item_id, sig in self.shard(name).signatures().items():
+                out[item_id] = (sig, name)
+        return out
+
+
+def _stat(path):
+    try:
+        st = os.stat(path)
+        return [st.st_size, st.st_mtime_ns]
+    except OSError:
+        return None
+
+
 class IndexWorker(threading.Thread):
-    """Metin dizinini arka planda günceller: yeni/değişen kaynakları okur, silinenleri çıkarır.
-    Mesajlar: ("index", yapılan, toplam) · ("index_done", istatistik, durduruldu)"""
+    """Metin dizinini arka planda günceller. Ortak kütüphanede: önce Drive'daki değişen parçaları alır; sonra
+    (dizini o an başka bilgisayar güncellemiyorsa) eksik/değişen kaynakları okur ve yalnızca değişen
+    parçaları Drive'a geri yükler. Mesajlar: ("index", yapılan, toplam) · ("index_done", istatistik, durduruldu)"""
+
+    LOCK_NAME = "dizin_kilidi.json"
+    LOCK_FRESH = 20 * 60
 
     def __init__(self, library, events):
         super().__init__(name="metin-dizini", daemon=True)
         self.library, self.events = library, events
         self.cancel = threading.Event()
 
+    # --- Drive ile eşitleme ---------------------------------------------------
+    def _cache_state(self, local):
+        return _read_json(local / "onbellek.json")
+
+    def _pull(self, remote, local) -> int:
+        """Drive'da değişmiş parçaları yerel önbelleğe alır."""
+        state = self._cache_state(local)
+        got = 0
+        for f in sorted(remote.glob("dizin_*.db")):
+            if not _SHARD_RE.match(f.name):                  # 'dizin_003 (1).db' gibi çakışma kopyalarını atla
+                continue
+            st = _stat(f)
+            if st and st != state.get(f.name) or not (local / f.name).is_file():
+                tmp = local / (f.name + ".iniyor")
+                try:
+                    shutil.copyfile(f, tmp)
+                    os.replace(tmp, local / f.name)
+                    state[f.name] = st
+                    got += 1
+                except OSError:
+                    tmp.unlink(missing_ok=True)                 # Claude o an okuyor olabilir: sonra yeniden
+        _write_json(local / "onbellek.json", state)
+        return got
+
+    def _push(self, remote, local, names):
+        state = self._cache_state(local)
+        for name in names:
+            tmp = remote / (name + ".yukleniyor")
+            try:
+                shutil.copyfile(local / name, tmp)
+                os.replace(tmp, remote / name)
+                state[name] = _stat(remote / name)
+            except OSError as exc:
+                diag(f"dizin yüklenemedi {name}: {describe_error(exc)}")
+        _write_json(local / "onbellek.json", state)
+
+    def _take_lock(self, remote) -> bool:
+        info = _read_json(remote / self.LOCK_NAME)
+        if info.get("machine") not in (None, machine_name()) and time.time() - float(info.get("ts", 0)) < self.LOCK_FRESH:
+            self.holder = info.get("machine")
+            return False
+        _write_json(remote / self.LOCK_NAME, {"machine": machine_name(), "ts": time.time()})
+        return True
+
+    def _release_lock(self, remote):
+        try:
+            if _read_json(remote / self.LOCK_NAME).get("machine") == machine_name():
+                (remote / self.LOCK_NAME).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _migrate_single_file(self, index, items):
+        """v2.30'un tek dosyalık dizinini parçalara böler (yeniden okumaya gerek kalmasın)."""
+        old = index_path()
+        if not old.is_file():
+            return
+        try:
+            src = PassageIndex(old, readonly=True)
+            nos = {i["id"]: i.get("no") or 0 for i in items}
+            for item_id, sig in src.signatures().items():
+                if item_id not in nos:
+                    continue
+                with src.lock:
+                    rows = src.db.execute("SELECT page, label, text FROM passages WHERE item_id=? ORDER BY id",
+                                          (item_id,)).fetchall()
+                    paged = (src.db.execute("SELECT paged FROM docs WHERE item_id=?", (item_id,)).fetchone()
+                             or [0])[0]
+                index.shard(shard_name(nos[item_id])).put(item_id, sig, rows, bool(paged))
+            src.close()
+            old.replace(old.with_suffix(".db.eski"))
+        except Exception:
+            diag_exception("dizin taşıma")
+
     def run(self):
         index = None
         old_switch = sys.getswitchinterval()
         sys.setswitchinterval(0.0005)        # PDF okuma CPU'yu yorarken arayüz iş parçacığı sırasını çabuk alsın
+        remote, locked, self.holder = shared_index_dir(), False, None
+        local = local_index_dir()
         try:
-            index = PassageIndex()
+            local.mkdir(parents=True, exist_ok=True)
+            if remote is not None:
+                remote.mkdir(parents=True, exist_ok=True)
+                self._pull(remote, local)
+                locked = self._take_lock(remote)
+            index = ShardedIndex(local)
             items = sorted(self.library.all_items(), key=lambda i: i.get("no") or 0)
-            index.remove_missing(i["id"] for i in items)
-            have = index.signatures()
-            todo = [i for i in items if have.get(i["id"]) != item_signature(i)]
-            for n, item in enumerate(todo):
-                if self.cancel.is_set():
-                    break
-                if n % 5 == 0:
-                    self.events.put(("index", n, len(todo)))
-                passages, paged = build_passages(self.library, item)
-                index.put(item["id"], item_signature(item), passages, paged)
-                time.sleep(0.05)                                # arayüze nefes aldır
-            stats = index.stats()
-            stats["toplam"] = len(items)
-            self.events.put(("index_done", stats, self.cancel.is_set()))
+            if not index.names():
+                self._migrate_single_file(index, items)
+            stats_only = remote is not None and not locked
+            dirty = set()
+            if not stats_only:
+                have = index.signatures()
+                valid = {i["id"]: shard_name(i.get("no")) for i in items}
+                for item_id, (sig, name) in have.items():   # silinen ya da numarası değişen kaynaklar
+                    if valid.get(item_id) != name:
+                        with index.shard(name).lock, index.shard(name).db:
+                            index.shard(name)._drop(item_id)
+                        dirty.add(name)
+                todo = [i for i in items if have.get(i["id"], ("", ""))[0] != item_signature(i)
+                        or have.get(i["id"], ("", ""))[1] != shard_name(i.get("no"))]
+                last_push = time.time()
+                for n, item in enumerate(todo):
+                    if self.cancel.is_set():
+                        break
+                    if n % 5 == 0:
+                        self.events.put(("index", n, len(todo)))
+                    name = shard_name(item.get("no"))
+                    passages, paged = build_passages(self.library, item)
+                    index.shard(name).put(item["id"], item_signature(item), passages, paged)
+                    dirty.add(name)
+                    time.sleep(0.05)                            # arayüze nefes aldır
+                    if remote is not None and time.time() - last_push > 10 * 60 and dirty:
+                        index.close()                           # uzun ilk kurulumda ara ara Drive'a yükle
+                        self._push(remote, local, sorted(dirty))
+                        dirty.clear()
+                        _write_json(remote / self.LOCK_NAME, {"machine": machine_name(), "ts": time.time()})
+                        last_push = time.time()
+                index.close()
+                if remote is not None and dirty:
+                    self._push(remote, local, sorted(dirty))
+            stats = ShardedIndex(local, readonly=True)
+            result = stats.stats()
+            stats.close()
+            result.update(toplam=len(items), ortak=remote is not None, baska_bilgisayar=self.holder)
+            self.events.put(("index_done", result, self.cancel.is_set()))
         except Exception:
             diag_exception("metin dizini")
             self.events.put(("index_done", {}, True))
@@ -6583,6 +6813,8 @@ class IndexWorker(threading.Thread):
             sys.setswitchinterval(old_switch)
             if index is not None:
                 index.close()
+            if remote is not None and locked:
+                self._release_lock(remote)
 
 
 def abstract_of(text: str, limit=900) -> str:
@@ -6598,9 +6830,12 @@ def abstract_of(text: str, limit=900) -> str:
 MCP_INSTRUCTIONS = (
     "Bu araçlar kullanıcının kişisel akademik kütüphanesine (Akademik Kaynak İndirici; binlerce kaynak, PDF tam "
     "metinleriyle) erişir. Kullanıcı alanıyla ilgili bir soru sorduğunda, değerlendirme, derleme ya da fikir "
-    "istediğinde ÖNCE kütüphanede ara: metinde_ara ile bütün PDF'lerin içinde kavramın geçtiği sayfaları bul "
-    "(Türkçe ve İngilizce karşılıklarıyla, eş anlamlılarla birkaç arama yap); genel bakış için kaynak_ozetleri; "
-    "derin okuma için pdf_metni_oku. Yanıtını kütüphanedeki kaynaklara dayandır, her bilgi için APA metin içi atıf "
+    "istediğinde ÖNCE kütüphanede ara: metinde_ara ile bütün PDF'lerin içinde kavramın geçtiği sayfaları bul. "
+    "Kullanıcı Türkçe yazar ama kütüphanede İngilizce ve başka dillerde (İspanyolca, Bulgarca, Almanca…; dağılım "
+    "kutuphane_ozeti'nde) çok kaynak var: her aramada sorguyu bu dillere çevirip 'ceviriler' ile birlikte gönder, "
+    "eş anlamlılarla birkaç arama yap. Genel bakış için kaynak_ozetleri; derin okuma için pdf_metni_oku. Yabancı "
+    "kaynaklardan aktarılanları Türkçeye çevirerek yaz, doğrudan alıntıda özgün dili koru ya da çevirdiğini belirt. "
+    "Yanıtını kütüphanedeki kaynaklara dayandır, her bilgi için APA metin içi atıf "
     "ve sayfa ver ((Yazar, yıl, s. X)); kütüphanede olmayan genel bilgiyi ayrıca belirt. Önemli alıntıları "
     "kullanıcı isterse alinti_karti_ekle ile kaydet. Kaynak silmeden önce açık onay al. Kaynakça APA 7'dir."
 )
@@ -6703,11 +6938,17 @@ class McpTools:
                  "no_max": {"type": "integer", "description": "Kayıt numarası en çok"},
                  "limit": {"type": "integer", "description": "En fazla sonuç (varsayılan 50)"}}}),
             ("metinde_ara", "Kütüphanedeki BÜTÜN PDF'lerin metninde arar ve kavramın geçtiği sayfaları (parçaları) "
-                            "en ilgiliden başlayarak döndürür: kaynak, APA atıfı, sayfa ve metin. Bir konuda bilgi, "
-                            "değerlendirme ya da derleme istendiğinde ilk adım budur. Türkçe ve İngilizce terimlerle, "
-                            "eş anlamlılarla ayrı ayrı arayın; tam ifade için tırnak kullanın (\"halk oyunları\").",
+                            "en ilgiliden başlayarak döndürür: kaynak, dili, APA atıfı, sayfa ve metin. Bir konuda "
+                            "bilgi, değerlendirme ya da derleme istendiğinde ilk adım budur. Kütüphane çok dillidir: "
+                            "Türkçe sorgunun İngilizce (ve gerekirse başka dillerdeki) karşılıklarını 'ceviriler'e "
+                            "yazın; tam ifade için tırnak kullanın (\"halk oyunları\").",
              {"type": "object", "properties": {
                  "sorgu": s("Aranacak kavram/kelimeler"),
+                 "ceviriler": {"type": "array", "items": {"type": "string"},
+                               "description": "Aynı sorgunun başka dillerdeki karşılıkları (ör. İngilizce, "
+                                              "kütüphanede bulunan diğer diller); hepsi birlikte aranır ve "
+                                              "sonuçlar dillere dengeli dağıtılır. Kullanıcı Türkçe yazsa da "
+                                              "yabancı kaynakları bulmak için mutlaka kullanın."},
                  "etiket": s("Yalnızca bu etiketteki kaynaklarda"),
                  "yil_min": {"type": "integer"}, "yil_max": {"type": "integer"},
                  "no_min": {"type": "integer"}, "no_max": {"type": "integer"},
@@ -6781,13 +7022,16 @@ class McpTools:
                 "kaynaklar": [_brief(i) for i in items[:limit]]}
 
     def _index(self):
-        try:
-            return PassageIndex(readonly=True)
-        except (FileNotFoundError, sqlite3.Error):
-            return None
+        index = ShardedIndex(readonly=True)
+        if not index.names():
+            try:                                               # v2.30 tek dosyalık dizin (henüz bölünmediyse)
+                return PassageIndex(readonly=True)
+            except (FileNotFoundError, sqlite3.Error):
+                return None
+        return index
 
     def t_metinde_ara(self, sorgu, etiket="", yil_min=None, yil_max=None, no_min=None, no_max=None,
-                      kaynak_basina=2, limit=15):
+                      kaynak_basina=2, limit=15, ceviriler=None):
         index = self._index()
         if index is None:
             raise ValueError("Metin dizini henüz hazır değil. Akademik Kaynak İndirici programını açık bırakın; "
@@ -6799,7 +7043,23 @@ class McpTools:
                 allowed = {i["id"] for i in search_items(self.lib, "", etiket, "hepsi", False, yil_min, yil_max,
                                                          no_min, no_max)}
             limit = max(1, min(int(limit or 15), 40))
-            hits = index.search(sorgu, allowed, limit=limit, per_item=max(1, min(int(kaynak_basina or 2), 5)))
+            per_item = max(1, min(int(kaynak_basina or 2), 5))
+            queries = [sorgu] + [q for q in (ceviriler or []) if isinstance(q, str) and q.strip()][:6]
+            lists = [index.search(q, allowed, limit=limit, per_item=per_item) for q in queries]
+            hits, seen, per = [], set(), {}
+            for rank in range(limit):                         # dillere dengeli: sırayla her sorgudan bir parça
+                for lst in lists:
+                    if rank < len(lst):
+                        h = lst[rank]
+                        key = (h[0], h[1], h[3][:80])
+                        if key in seen or per.get(h[0], 0) >= per_item:
+                            continue
+                        seen.add(key)
+                        per[h[0]] = per.get(h[0], 0) + 1
+                        hits.append(h)
+                if len(hits) >= limit:
+                    break
+            hits = hits[:limit]
             stats = index.stats()
         finally:
             index.close()
@@ -6812,10 +7072,12 @@ class McpTools:
             items[item_id] = item
             shown = label or (str(page) if page else "")
             out.append({"id": item_id, "kayit_no": item.get("no") or 0, "baslik": item["title"],
+                        "dil": _LANG_NAMES.get(guess_language(item), guess_language(item)),
                         "atif": intext_citation(item, shown if page else ""),
                         "sayfa": shown or ("künye/özet" if page == 0 else ""), "pdf_sayfasi": page or None,
                         "metin": text[:1500]})
-        return {"sorgu": sorgu, "bulunan_parca": len(out), "kaynak_sayisi": len(items),
+        return {"sorgu": sorgu, "aranan": [sorgu] + list(ceviriler or []), "bulunan_parca": len(out),
+                "kaynak_sayisi": len(items),
                 "dizin": {"dizindeki_kaynak": stats["kaynak"], "kutuphanedeki_kaynak": self.lib.count(),
                           "metinsiz_pdf": stats["metinsiz"]},
                 "parcalar": out,
@@ -6983,7 +7245,12 @@ class McpTools:
             for t in i["tags"]:
                 tags[t] = tags.get(t, 0) + 1
         settings = load_settings()
-        return {"toplam": len(items), "pdf_yok": sum(1 for i in items if not i["has_pdf"]),
+        langs = {}
+        for i in items:
+            name = _LANG_NAMES.get(guess_language(i), guess_language(i))
+            langs[name] = langs.get(name, 0) + 1
+        return {"toplam": len(items), "diller_tahmini": dict(sorted(langs.items(), key=lambda kv: -kv[1])),
+                "pdf_yok": sum(1 for i in items if not i["has_pdf"]),
                 "scopus_dergilerinde": (sum(1 for i in items if i["_scopus"] in ("Scopus", "Scopus (pasif)"))
                                         if load_scopus() else "Scopus listesi yüklenmedi"),
                 "yeni": sum(1 for i in items if i["is_new"]), "alinti_karti_olan": sum(1 for i in items if i["cards"]),
@@ -10134,7 +10401,9 @@ class ScanTab:
             return
         mb = stats["karakter"] / 1_000_000
         text = (f"Claude için metin dizini: {stats['kaynak']}/{stats['toplam']} kaynak, {stats['parca']} parça "
-                f"(~{mb:.0f} milyon karakter)")
+                f"(~{mb:.0f} milyon karakter)" + (" · Drive'da ortak" if stats.get("ortak") else ""))
+        if stats.get("baska_bilgisayar"):
+            text += f" · şu an {stats['baska_bilgisayar']} bilgisayarı güncelliyor, buradan yalnızca okunuyor"
         if stats.get("metinsiz"):
             text += f" · {stats['metinsiz']} PDF taranmış görüntü olduğu için okunamadı"
         self.index_label.configure(text=text + (" · yarıda kaldı, sonra sürecek" if stopped else "") + ".")
