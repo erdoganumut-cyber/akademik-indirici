@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.21"
+APP_VERSION = "2.22"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -2695,6 +2695,11 @@ class Library:
                 self.set_fulltext(item_id, fulltext)
             self.add_tags(item_id, tags)
             return item_id, True
+
+    def mark_reviewed(self, ids):
+        """'Yeni' işaretini kaldırır (tek işlemde, binlerce kaynak için de hızlı)."""
+        with self.lock, self.db:
+            self.db.executemany("UPDATE items SET is_new=0 WHERE id=? AND is_new!=0", [(int(i),) for i in ids])
 
     def update(self, item_id: int, fields: dict):
         allowed = set(RECORD_FIELDS) | {"file_path", "sha256", "notes", "is_new", "source", "matched", "pdf_tried"}
@@ -7567,6 +7572,9 @@ class LibraryTab:
         self.retry_btn.pack(side="left", padx=(16, 0))
         ctk.CTkButton(acts, text="PDF'sizleri Sırayla Aç", width=160, fg_color="#1F6F8B", hover_color="#185A71",
                       command=self._open_queue).pack(side="left", padx=(8, 0))
+        self.allseen_btn = ctk.CTkButton(acts, text="Yenileri İncelendi Say", width=170, command=self._mark_all_reviewed,
+                                         **outline)
+        self.allseen_btn.pack(side="left", padx=(16, 0))
 
     def _build_table(self):
         from tkinter import ttk
@@ -7828,6 +7836,9 @@ class LibraryTab:
         new = sum(1 for i in self.items if i["is_new"])
         nopdf = sum(1 for i in self.items if not i["has_pdf"])
         self.count_label.configure(text=f"{len(shown)} / {len(self.items)} kaynak · {new} yeni · {nopdf} PDF'siz")
+        shown_new = sum(1 for i in shown if i["is_new"])
+        self.allseen_btn.configure(text=f"Yenileri İncelendi Say ({shown_new})" if shown_new else "Yenileri İncelendi Say",
+                                   state="normal" if shown_new else "disabled")
         if not keep:
             self._show(None)
         if to_check:
@@ -8158,9 +8169,27 @@ class LibraryTab:
         self.app.toast("Künye Crossref'ten güncellendi.")
 
     def _mark_reviewed(self):
-        for item in self.selected_items():
-            self.lib.update(item["id"], {"is_new": 0})
+        self.lib.mark_reviewed([item["id"] for item in self.selected_items()])
         self.refresh()
+
+    def _mark_all_reviewed(self):
+        """Listede görünen bütün 'yeni' kaynakları tek seferde incelendi sayar."""
+        new = [self.by_id[int(i)] for i in self.tree.get_children()
+               if int(i) in self.by_id and self.by_id[int(i)]["is_new"]]
+        if not new:
+            messagebox.showinfo(APP_NAME, "Listede 'yeni' işaretli kaynak yok.", parent=self.parent)
+            return
+        total_new = sum(1 for i in self.items if i["is_new"])
+        scope = "Listede görünen" if len(new) < total_new else "Bütün"
+        if not messagebox.askokcancel(
+                APP_NAME, f"{scope} {len(new)} yeni kaynak 'incelendi' sayılacak: kalın yazı ve ● işareti kalkar.\n\n"
+                          "Künye, PDF ve etiketler değişmez; kaynaklar kütüphanede kalır."
+                          + (f"\n\n(Listede görünmeyen {total_new - len(new)} yeni kaynağa dokunulmaz.)"
+                             if len(new) < total_new else ""), parent=self.parent):
+            return
+        self.lib.mark_reviewed([i["id"] for i in new])
+        self.refresh()
+        self.app.toast(f"{len(new)} kaynak incelendi sayıldı.")
 
     def _remove(self):
         items = self.selected_items()
