@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.28"
+APP_VERSION = "2.29"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -3379,6 +3379,59 @@ class CompleteWorker(threading.Thread):
             self.events.put(("complete_done", updated, counts, tried, self.cancel.is_set()))
 
 
+class ThesisCleanupWorker(threading.Thread):
+    """Kütüphanedeki PDF'siz YÖK tezlerini Tez Merkezi'nde yeniden yoklar: PDF'i sonradan açılmışsa indirip
+    bağlar, açılmamışsa çıkarılacaklar listesine koyar (silme kararı kullanıcıda).
+    Mesajlar: ("thesis_check", sıra, toplam) · ("thesis_check_done", kapalılar, indirilen, hata_sayısı, durduruldu)"""
+
+    def __init__(self, items, library, events, library_folder):
+        super().__init__(daemon=True)
+        self.items, self.library, self.events, self.library_folder = items, library, events, library_folder
+        self.cancel = threading.Event()
+
+    def run(self):
+        closed, attached, errors = [], 0, 0
+        session = make_session()
+        try:
+            yok_open_session(session)
+            for n, item in enumerate(self.items):
+                if self.cancel.is_set():
+                    break
+                self.events.put(("thesis_check", n, len(self.items)))
+                tez = yok_tez_no(item)
+                try:
+                    hits = [r for r in search_yok(session, tez) if r.get("tez_no") == tez]
+                    time.sleep(YOK_PAUSE)
+                    if not hits:                       # Tez Merkezi'nde bulunamadı: dokunma
+                        continue
+                    url = yok_pdf_url(session, hits[0]["yok_keys"])
+                    time.sleep(YOK_PAUSE)
+                    if not url:
+                        closed.append(item)
+                        continue
+                    if self.library_folder:
+                        tmp = Path(self.library_folder) / f".yok_{tez}.part"
+                        with session.get(url, stream=True, timeout=(15, 180)) as r:
+                            r.raise_for_status()
+                            with open(tmp, "wb") as fh:
+                                for block in r.iter_content(1 << 16):
+                                    fh.write(block)
+                        if tmp.read_bytes()[:1024].find(b"%PDF-") >= 0:
+                            attach_pdf(self.library, item["id"], tmp, self.library_folder, move=True)
+                            attached += 1
+                        else:
+                            tmp.unlink(missing_ok=True)
+                        time.sleep(YOK_PAUSE)
+                except Exception as exc:
+                    errors += 1
+                    diag(f"tez denetimi {tez}: {describe_error(exc)}")
+        except Exception:
+            diag_exception("tez denetimi")
+        finally:
+            session.close()
+            self.events.put(("thesis_check_done", closed, attached, errors, self.cancel.is_set()))
+
+
 class AutoTagWorker(threading.Thread):
     """Kütüphanedeki kaynaklara anahtar kelime (PDF'ten) ve grup etiketi ekler; elle verilen
     etiketlere dokunmaz. Mesajlar: ("autotag", sıra, toplam) · ("autotag_done", taranan, etiketlenen, kelime_eklenen)"""
@@ -4798,7 +4851,7 @@ def write_scan_report(path: Path, info: dict, found: list, added_items: list) ->
     """found: [{"record", "hits", "status", "item_id"}] · added_items: o hafta eklenen kaynaklar"""
     groups = {}
     for entry in found:
-        if entry["status"] == "known":          # önceki taramalarda zaten raporlandı
+        if entry["status"] in ("known", "thesis_skipped"):   # zaten raporlandı / PDF'siz tez eklenmedi
             continue
         for group in entry["hits"]:
             groups.setdefault(group, []).append(entry)
@@ -4846,7 +4899,7 @@ def write_scan_report(path: Path, info: dict, found: list, added_items: list) ->
         for i in added_items)
     errors = "".join(f"<li>{_h(e)}</li>" for e in info.get("errors", []))
     pdf_count = sum(1 for e in found if e["status"] in ("pdf", "pdf_found"))
-    new_count = sum(1 for e in found if e["status"] not in ("known", "pdf_found"))
+    new_count = sum(1 for e in found if e["status"] not in ("known", "pdf_found", "thesis_skipped"))
     doc = f"""<!doctype html><html lang="tr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Tarama Raporu {_h(info['until'])}</title>
@@ -4879,6 +4932,7 @@ li{{background:var(--card);border:1px solid var(--line);border-radius:10px;paddi
 <div class="stat"><b>{info.get('dergipark', 0)}</b><span>DergiPark kaydı tarandı</span></div>
 <div class="stat"><b>{info.get('crossref', 0)}</b><span>Crossref kaydı tarandı</span></div>
 {f'<div class="stat"><b>{info.get("yok", 0)}</b><span>YÖK tezi tarandı</span></div>' if "YÖK Tez" in info.get("sources", []) else ''}
+{f'<div class="stat"><b>{info.get("yok_skipped", 0)}</b><span>PDF&#39;i olmayan tez eklenmedi</span></div>' if info.get("yok_skipped") else ''}
 {f'<div class="stat"><b>{len(added_items)}</b><span>kütüphaneye eklendi (tümü)</span></div>' if added_items else ''}
 </div>
 {''.join(sections)}
@@ -5155,7 +5209,7 @@ class ScanWorker(threading.Thread):
         folder = Path(self.library_folder or settings_path().parent) / "Tarama Raporları"
         self.report_path = write_scan_report(folder / f"Tarama_{datetime.now():%Y-%m-%d_%H%M%S}.html",
                                              info, found, added_items)
-        new = sum(1 for e in found if e["status"] != "known")
+        new = sum(1 for e in found if e["status"] not in ("known", "thesis_skipped"))
         pdfs = sum(1 for e in found if e["status"] == "pdf")
         self.summary = f"{new} yeni yayın bulundu, {pdfs} tanesinin PDF'i indi."
         if not self.cancel.is_set():
@@ -5296,8 +5350,19 @@ class ScanWorker(threading.Thread):
         return self.yok_session
 
     def _add_thesis(self, rec, hits, source, max_downloads, info):
-        """YÖK tezini kütüphaneye ekler; yazar izin verdiyse PDF'ini indirir."""
+        """YÖK tezini kütüphaneye ekler; yazar izin verdiyse PDF'ini indirir. 'PDF'i yayımlanmamış tezleri
+        ekleme' açıksa (varsayılan) PDF'i olmayan tez hiç eklenmez."""
         session = self._yok()
+        if self.settings.get("yok_skip_closed", True):
+            try:
+                url = yok_pdf_url(session, rec["yok_keys"])
+                time.sleep(YOK_PAUSE)
+            except Exception as exc:
+                info["errors"].append(f"YÖK Tez {rec.get('tez_no')}: {describe_error(exc)}")
+                url = "?"                                   # bilinmiyor: eskisi gibi ekle
+            if not url:
+                info["yok_skipped"] = info.get("yok_skipped", 0) + 1
+                return "thesis_skipped", None
         try:
             detail = yok_detail(session, rec["yok_keys"])
             time.sleep(YOK_PAUSE)
@@ -5511,7 +5576,7 @@ class ScanWorker(threading.Thread):
                     save_retro_state(state)
         session.close()
 
-        new = sum(1 for e in found if e["status"] not in ("known", "pdf_found"))
+        new = sum(1 for e in found if e["status"] not in ("known", "pdf_found", "thesis_skipped"))
         pdfs = sum(1 for e in found if e["status"] == "pdf")
         later = sum(1 for e in found if e["status"] == "pdf_found")
         finished = not self.cancel.is_set() and bool(reached)
@@ -9426,6 +9491,14 @@ class ScanTab:
         ctk.CTkCheckBox(side, text="YÖK Ulusal Tez Merkezi (yeni tezler, izinli olanların PDF'i)",
                         variable=self.src_yok, command=self.app.save_all_settings).grid(
             row=r, column=0, sticky="w", padx=10, pady=3); r += 1
+        self.yok_skip_closed = ctk.BooleanVar(value=s.get("yok_skip_closed", True))
+        ctk.CTkCheckBox(side, text="PDF'i yayımlanmamış tezleri kütüphaneye ekleme", variable=self.yok_skip_closed,
+                        command=self.app.save_all_settings, font=ctk.CTkFont(size=12)).grid(
+            row=r, column=0, sticky="w", padx=34, pady=(0, 3)); r += 1
+        self.thesis_btn = ctk.CTkButton(side, text="PDF'siz tezleri kütüphaneden çıkar…", height=26, width=230,
+                                        fg_color="transparent", border_width=1, text_color=TEXT,
+                                        font=ctk.CTkFont(size=12), command=self.check_theses)
+        self.thesis_btn.grid(row=r, column=0, sticky="w", padx=34, pady=(0, 6)); r += 1
         ctk.CTkLabel(side, text="Google Scholar uyarı e-postalarını İndir sekmesine yapıştırırsanız "
                                 "içindeki makaleler de iner ve kütüphaneye girer.", text_color=MUTED,
                      font=ctk.CTkFont(size=12), wraplength=330, justify="left",
@@ -9648,6 +9721,59 @@ class ScanTab:
         meta = self.app.sync.meta()
         who = f" · son gönderen: {meta['machine']}" if meta.get("machine") else ""
         self.sync_label.configure(text=f"Açık · son eşitleme: {last or '—'}{who}", text_color=LOG_COLORS["success"])
+
+    def check_theses(self):
+        """Kütüphanedeki PDF'siz YÖK tezlerini Tez Merkezi'nde yoklar; sonra çıkarmak için onay ister."""
+        worker = getattr(self, "thesis_worker", None)
+        if worker and worker.is_alive():
+            worker.cancel.set()
+            self.thesis_btn.configure(text="Durduruluyor…", state="disabled")
+            return
+        lib = self.app.library
+        items = [i for i in lib.items_without_file() if yok_tez_no(i)]
+        if not items:
+            messagebox.showinfo(APP_NAME, "Kütüphanede PDF'i olmayan YÖK tezi yok.", parent=self.parent)
+            return
+        minutes = max(1, round(len(items) * 3.5 / 60))
+        if not messagebox.askokcancel(
+                APP_NAME, f"Kütüphanede PDF'i olmayan {len(items)} YÖK tezi var.\n\nÖnce her biri Tez Merkezi'nde "
+                          f"yeniden yoklanacak (~{minutes} dk): PDF'i sonradan açılmış olanlar indirilip bağlanır, "
+                          "açılmamış olanların listesi size sorulur. Hiçbir şey sormadan silinmez.",
+                parent=self.parent):
+            return
+        self.thesis_worker = ThesisCleanupWorker(items, lib, self.app.events, self.app.library_folder())
+        self.thesis_btn.configure(text="Yoklanıyor… (durdur)")
+        self.thesis_worker.start()
+
+    def on_theses_checked(self, closed, attached, errors, stopped):
+        self.thesis_btn.configure(text="PDF'siz tezleri kütüphaneden çıkar…", state="normal")
+        lib, tab = self.app.library, self.app.library_tab
+        tab.refresh()
+        note = (f"{attached} tezin PDF'i sonradan açılmış; indirilip bağlandı. " if attached else "") + \
+               (f"{errors} tez yoklanamadı (bağlantı sorunu); onlara dokunulmadı. " if errors else "") + \
+               ("Yoklama yarıda durduruldu. " if stopped else "")
+        cards = lib.card_counts()
+        keep = [i for i in closed if cards.get(i["id"])]
+        drop = [i for i in closed if not cards.get(i["id"])]
+        if not drop:
+            messagebox.showinfo(APP_NAME, (note or "") + ("PDF'i yayımlanmamış tez kalmadı." if not keep else
+                                f"PDF'i yayımlanmamış {len(keep)} tezde alıntı kartınız var; onlar kütüphanede "
+                                "bırakıldı."), parent=self.parent)
+            return
+        years = sorted(int(i["year"]) for i in drop if str(i.get("year") or "").isdigit())
+        span = f" ({years[0]}–{years[-1]} arası)" if years else ""
+        extra = f"\n\nAlıntı kartı olan {len(keep)} tez korunacak." if keep else ""
+        if not messagebox.askyesno(
+                APP_NAME, note + f"\n\nPDF'i Tez Merkezi'nde yayımlanmamış {len(drop)} tez{span} kütüphaneden "
+                                 f"çıkarılsın mı? (No {no_ranges_text([i.get('no') for i in drop], 8)})" + extra +
+                          "\n\nYeni taramalarda da PDF'i olmayan tezler eklenmez ('PDF'i yayımlanmamış tezleri "
+                          "kütüphaneye ekleme' açık olduğu sürece).", parent=self.parent):
+            return
+        for item in drop:
+            lib.delete(item["id"])
+        tab.refresh(keep_selection=False)
+        self.app.toast(f"{len(drop)} PDF'siz tez kütüphaneden çıkarıldı.")
+        self.app._log("info", f"PDF'i yayımlanmamış {len(drop)} tez çıkarıldı: No {no_ranges_text([i.get('no') for i in drop])}")
 
     def sync_clicked(self):
         if self.app.sync_in_background(manual=True):
@@ -10401,7 +10527,7 @@ class App(ctk.CTk):
             current.update({
                 "auto_scan": scan.auto_var.get(), "open_report": scan.open_report_var.get(),
                 "scan_dergipark": scan.src_dp.get(), "scan_crossref": scan.src_cr.get(),
-                "scan_yok": scan.src_yok.get(),
+                "scan_yok": scan.src_yok.get(), "yok_skip_closed": scan.yok_skip_closed.get(),
                 "watch_downloads": scan.watch_var.get(), "scan_day": scan.day_menu.get(),
                 "auto_tag": scan.autotag_var.get(), "auto_update": scan.update_var.get(),
                 "scan_hour": scan.hour_menu.get(),
@@ -10758,6 +10884,11 @@ class App(ctk.CTk):
                 text=f"Künye tamamlanıyor · No {no} ({n + 1}/{total}): {shorten(title, 44)}")
         elif kind == "complete_done":
             self.library_tab.on_complete_done(*message[1:])
+        elif kind == "thesis_check":
+            n, total = message[1:]
+            self.scan_tab.thesis_btn.configure(text=f"Yoklanıyor {n + 1}/{total}… (durdur)")
+        elif kind == "thesis_check_done":
+            self.scan_tab.on_theses_checked(*message[1:])
         elif kind == "isbn_done":
             self.library_tab.on_isbn_done(*message[1:])
         elif kind == "retry_wait":
