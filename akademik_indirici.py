@@ -49,7 +49,7 @@ import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import quote, unquote, urljoin, urlparse
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.32"
+APP_VERSION = "2.33"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -2252,6 +2252,199 @@ def book_record_by_isbn(session, isbn: str) -> dict:
     except (requests.RequestException, ValueError, AttributeError):
         pass
     return {}
+
+
+ARCHIVE_META_API = "https://archive.org/metadata/"
+_LOGIN_RE = re.compile(r"(login|signin|sign-in|shibboleth|/idp/|ezproxy|openathens|/sso|wayf|/auth/|"
+                       r"cas/login|myathens|giris)", re.I)
+EBOOK_PLATFORMS = {"ebookcentral.proquest.com": "ProQuest Ebook Central", "ebscohost.com": "EBSCO eBooks",
+                   "archive.org": "Internet Archive", "books.google": "Google Books", "play.google.com":
+                   "Google Play Kitaplar", "jstor.org": "JSTOR", "degruyter.com": "De Gruyter",
+                   "taylorfrancis.com": "Taylor & Francis", "cambridge.org": "Cambridge Core",
+                   "oapen.org": "OAPEN", "doabooks.org": "DOAB", "link.springer.com": "SpringerLink",
+                   "sciencedirect.com": "ScienceDirect", "perlego.com": "Perlego", "scribd.com": "Scribd",
+                   "vitalsource.com": "VitalSource", "dergipark.org.tr": "DergiPark", "openedition.org": "OpenEdition",
+                   "muse.jhu.edu": "Project MUSE", "bloomsburycollections.com": "Bloomsbury"}
+
+
+def platform_name(url) -> str:
+    host = (urlparse(url).hostname or "").lower()
+    return next((v for k, v in EBOOK_PLATFORMS.items() if k in host), host.replace("www.", ""))
+
+
+def page_plain_text(page: str) -> str:
+    page = re.sub(r"(?is)<(script|style|noscript|nav|header|footer|svg)\b.*?</\1>", " ", page)
+    text = html.unescape(re.sub(r"<[^>]+>", " ", page))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _jsonld_book(page) -> dict:
+    for block in re.findall(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>', page, re.S | re.I):
+        try:
+            data = json.loads(block.strip())
+        except ValueError:
+            continue
+        for obj in (data if isinstance(data, list) else data.get("@graph", [data]) if isinstance(data, dict) else []):
+            if isinstance(obj, dict) and str(obj.get("@type", "")).lower() in ("book", "chapter", "scholarlyarticle"):
+                authors = obj.get("author") or []
+                authors = authors if isinstance(authors, list) else [authors]
+                names = [a.get("name", "") if isinstance(a, dict) else str(a) for a in authors]
+                pub = obj.get("publisher") or {}
+                return {"title": obj.get("name") or obj.get("headline") or "",
+                        "authors": text_to_people("; ".join(n for n in names if n)),
+                        "year": str(obj.get("datePublished") or "")[:4],
+                        "publisher": pub.get("name", "") if isinstance(pub, dict) else str(pub),
+                        "isbn": find_isbn(str(obj.get("isbn") or "")),
+                        "type": "chapter" if str(obj.get("@type")).lower() == "chapter" else "book"}
+    return {}
+
+
+def online_book_info(session, url) -> dict:
+    """Bağlantıdaki kitabın künyesi ve erişimi. Kurum girişi isteyen sayfalara giriş YAPILMAZ; yalnızca herkese
+    açık içerik (açık erişim kitap, kamu malı eser, açık PDF/EPUB) okunur.
+    Dönüş: {"record", "isbn", "access": "open"|"restricted", "platform", "files": [...], "text"}"""
+    out = {"record": {"type": "book", "url": url}, "isbn": "", "access": "open", "platform": platform_name(url),
+           "files": [], "text": ""}
+    host = (urlparse(url).hostname or "").lower()
+    try:
+        if "archive.org" in host and "/details/" in url:
+            ident = url.split("/details/", 1)[1].split("/")[0].split("?")[0]
+            data = session.get(ARCHIVE_META_API + quote(ident), timeout=API_TIMEOUT).json()
+            md = data.get("metadata") or {}
+
+            def first(v):
+                return (v[0] if isinstance(v, list) and v else v) or ""
+            creators = md.get("creator") or []
+            creators = creators if isinstance(creators, list) else [creators]
+            out["record"].update(title=first(md.get("title")), authors=text_to_people("; ".join(creators)),
+                                 year=str(first(md.get("date")))[:4], publisher=first(md.get("publisher")),
+                                 language=str(first(md.get("language")))[:2])
+            out["isbn"] = find_isbn(" ".join(map(str, md.get("isbn") or [])) if isinstance(md.get("isbn"), list)
+                                    else str(md.get("isbn") or ""))
+            restricted = str(md.get("access-restricted-item", "")).lower() == "true" or data.get("is_dark")
+            out["access"] = "restricted" if restricted else "open"
+            if not restricted:
+                for f in data.get("files") or []:
+                    name = f.get("name", "")
+                    if name.lower().endswith((".pdf", ".epub")) and "_encrypted" not in name and f.get("private") != "true":
+                        out["files"].append(f"https://archive.org/download/{ident}/{quote(name)}")
+                out["files"].sort(key=lambda u: not u.lower().endswith(".pdf"))
+            return out
+        if "books.google" in host or ("google." in host and "/books" in url):
+            vid = parse_qs(urlparse(url).query).get("id", [""])[0] or \
+                (re.search(r"/books/edition/[^/]+/([\w-]+)", url) or [None, ""])[1]
+            if vid:
+                v = session.get(GOOGLE_BOOKS_API + "/" + quote(vid), timeout=API_TIMEOUT).json()
+                info, access = v.get("volumeInfo", {}), v.get("accessInfo", {})
+                title = info.get("title", "") + (": " + info["subtitle"] if info.get("subtitle") else "")
+                out["record"].update(title=title, authors=text_to_people("; ".join(info.get("authors") or [])),
+                                     year=str(info.get("publishedDate") or "")[:4], publisher=info.get("publisher", ""),
+                                     language=(info.get("language") or "")[:2])
+                out["isbn"] = find_isbn(" ".join(i.get("identifier", "") for i in info.get("industryIdentifiers") or []))
+                full = access.get("viewability") == "ALL_PAGES" and access.get("publicDomain")
+                out["access"] = "open" if full else "restricted"
+                for kind in ("pdf", "epub"):
+                    link = (access.get(kind) or {}).get("downloadLink")
+                    if full and link:
+                        out["files"].append(link)
+                return out
+        r = session.get(url, timeout=TIMEOUT, allow_redirects=True)
+        final = r.url
+        page = decode_html(r.content[:3_000_000], r) if is_html(content_type(r)) else ""
+        if content_type(r).startswith("application/pdf") or r.content[:5] == b"%PDF-":
+            out["files"].append(final)
+            return out
+        meta = parse_citation_meta(page)
+        rec = record_from_meta(meta, url) if meta else {}
+        ld = _jsonld_book(page)
+        title = rec.get("title") or ld.get("title") or page_title(page)
+        out["record"].update({k: v for k, v in rec.items() if v})
+        out["record"].update({k: v for k, v in ld.items() if v and k not in ("isbn",) and not out["record"].get(k)})
+        out["record"]["title"] = title
+        if out["record"].get("type") in ("other", "", None):
+            out["record"]["type"] = "book"
+        out["isbn"] = ld.get("isbn") or find_isbn(meta.get("citation_isbn", "")) or find_isbn(page[:200_000])
+        login = _LOGIN_RE.search(urlparse(final).path + " " + (urlparse(final).hostname or "")) or \
+            re.search(r'type=["\']password["\']', page, re.I) or r.status_code in (401, 403) or \
+            looks_like_bot_check(page, final)
+        if login:
+            out["access"] = "restricted"
+            if not rec.get("title") and not ld.get("title"):
+                out["record"]["title"] = ""                    # giriş sayfasının başlığı kitabın adı değil
+            return out
+        out["files"] = [c for c in find_pdf_candidates(page, final, meta)[:3]]
+        text = page_plain_text(page)
+        out["text"] = text if len(text) > 3000 else ""
+    except (requests.RequestException, ValueError, AttributeError) as exc:
+        diag(f"çevrimiçi kitap: {url}: {describe_error(exc)}", throttle=True)
+        out["access"] = "restricted"
+    return out
+
+
+ONLINE_RESTRICTED_NOTE = ("Çevrimiçi okunur ({platform}); kurum girişi ya da ödünç alma gerekir. Program ve Claude "
+                          "bu içeriği kendisi okumaz: okurken 'Okurken Not Al' penceresiyle alıntılarınızı "
+                          "sayfa numarasıyla alıntı kartlarına ekleyin.")
+ONLINE_OPEN_NOTE = "Açık çevrimiçi metin bağlantıdan alındı ({platform}); Claude ve metin dizini bunu okuyabilir."
+
+
+def add_online_book(library, session, url, tags=(), library_folder=None, auto_tags=None, isbn=""):
+    """Bağlantıdaki kitabı/bölümü kütüphaneye ekler; bağlantı kayıtta kalır. Açık dosya varsa indirip bağlar,
+    açık çevrimiçi metin varsa tam metin olarak saklar. Dönüş: (kimlik, yeni_mi, erişim)"""
+    info = online_book_info(session, url)
+    info["isbn"] = info["isbn"] or isbn
+    rec = dict(info["record"])
+    if info["isbn"]:
+        looked = book_record_by_isbn(session, info["isbn"])
+        if looked:
+            rec = merge_records(rec, looked) if rec.get("title") else merge_records(looked, rec)
+            rec["url"] = url
+    if not rec.get("title"):
+        rec["title"] = f"{info['platform']} kitabı (başlığı düzenleyin)"
+    existing = library.find_by_url(url) or library.find_by_doi(rec.get("doi")) or library.find_by_title(rec["title"])
+    created = not existing
+    if existing:
+        item_id = existing
+        old = library.get(item_id)
+        fill = {k: rec[k] for k in RECORD_FIELDS if rec.get(k) and not old.get(k)}
+        if fill:
+            library.update(item_id, fill)
+        library.add_tags(item_id, tags)
+    else:
+        item_id, _ = library.add(rec, tags=list(tags) + auto_group_tags(rec, info["text"][:20_000], auto_tags),
+                                 source="bağlantı")
+    item = library.get(item_id)
+    notes = [n for n in [item.get("notes"), f"ISBN: {info['isbn']}" if info["isbn"] else ""] if n]
+    attached = False
+    if not (item["file_path"] and os.path.exists(item["file_path"])) and info["files"] and library_folder:
+        for link in info["files"]:
+            try:
+                ext = ".epub" if link.lower().split("?")[0].endswith(".epub") else ".pdf"
+                tmp = Path(library_folder) / f".cevrimici_{item_id}{ext}.part"
+                with session.get(link, stream=True, timeout=(15, 180)) as r:
+                    r.raise_for_status()
+                    with open(tmp, "wb") as fh:
+                        for block in r.iter_content(1 << 16):
+                            fh.write(block)
+                head = tmp.read_bytes()[:1024]
+                if (ext == ".pdf" and b"%PDF-" in head) or (ext == ".epub" and head[:2] == b"PK"):
+                    final = tmp.with_name(tmp.name[:-5])
+                    os.replace(tmp, final)
+                    attach_pdf(library, item_id, final, library_folder, move=True)
+                    attached = True
+                    break
+                tmp.unlink(missing_ok=True)
+            except (requests.RequestException, OSError):
+                continue
+    if info["access"] == "restricted":
+        notes.append(ONLINE_RESTRICTED_NOTE.format(platform=info["platform"]))
+    elif info["text"] and not attached:
+        library.set_fulltext(item_id, info["text"])
+        notes.append(ONLINE_OPEN_NOTE.format(platform=info["platform"]))
+    if notes:
+        joined = "\n".join(dict.fromkeys(n for n in notes if n))
+        if joined != (item.get("notes") or ""):
+            library.update(item_id, {"notes": joined})
+    return item_id, created, ("dosya" if attached else "metin" if info["text"] else info["access"])
 
 
 EBOOK_DRM_NOTE = ("Ödünç alınmış (DRM'li) e-kitap: Adobe Digital Editions ya da kütüphanenin okuma uygulamasıyla "
@@ -6962,6 +7155,13 @@ class McpTools:
                  "idler": ids, "etiket": s("Bu etiketteki kaynaklar"), "sorgu": s("Başlık/anahtar kelime araması"),
                  "no_min": {"type": "integer"}, "no_max": {"type": "integer"},
                  "limit": {"type": "integer", "description": "En fazla kaynak (varsayılan 40, en çok 100)"}}}),
+            ("baglantidan_oku", "Kaynağın kayıttaki bağlantısından (çevrimiçi kitap/sayfa) metni okur; yalnızca "
+                                "herkese açık içerik okunur, kurum girişi ya da ödünç gerektiren sayfalar okunamaz "
+                                "(o zaman kullanıcının alıntı kartlarına bakın). Uzun metinlerde 'baslangic' ile "
+                                "devam edin.",
+             {"type": "object", "properties": {"id": {"type": "integer"},
+                                               "baslangic": {"type": "integer", "description": "Karakter konumu (0)"}},
+              "required": ["id"]}),
             ("kaynak_detay", "Bir kaynağın tüm künyesini, etiketlerini, anahtar kelimelerini, alıntı kartlarını, "
                              "PDF yolunu ve APA kaynakça satırını verir.",
              {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]}),
@@ -7082,6 +7282,32 @@ class McpTools:
                           "metinsiz_pdf": stats["metinsiz"]},
                 "parcalar": out,
                 "not": "pdf_sayfasi, pdf_metni_oku'daki baslangic_sayfa değeridir; 'sayfa' basılı sayfa numarasıdır."}
+
+    def t_baglantidan_oku(self, id, baslangic=0):
+        item = self.lib.get(int(id))
+        if not item:
+            raise ValueError(f"{id} numaralı kaynak yok")
+        text, source = "", ""
+        if item.get("url"):
+            session = make_session()
+            try:
+                info = online_book_info(session, item["url"])
+            finally:
+                session.close()
+            if info["access"] == "restricted":
+                cards = self.lib.cards(item["id"])
+                raise ValueError(f"Bu bağlantı ({info['platform']}) kurum girişi ya da ödünç alma istiyor; içerik "
+                                 f"okunamıyor. Kullanıcının bu kaynakta {len(cards)} alıntı kartı var "
+                                 "(kaynak_detay ile bakın).")
+            text, source = info["text"], info["platform"]
+        if not text:
+            text, source = self.lib.get_fulltext(item["id"]), "kayıtlı metin"
+        if not text:
+            raise ValueError("Bu kaynağın okunabilir çevrimiçi metni yok (PDF'i varsa pdf_metni_oku kullanın).")
+        start = max(0, int(baslangic or 0))
+        chunk = text[start:start + 40_000]
+        return {"baslik": item["title"], "kaynak": source, "toplam_karakter": len(text), "baslangic": start,
+                "sonraki": start + len(chunk) if start + len(chunk) < len(text) else None, "metin": chunk}
 
     def t_kaynak_ozetleri(self, idler=None, etiket="", sorgu="", no_min=None, no_max=None, limit=40):
         if idler:
@@ -8373,6 +8599,79 @@ class FreezeWatchdog(threading.Thread):
                     reported = False
 
 
+class ReadingNotes(ctk.CTkToplevel):
+    """Kitabı (tarayıcıda, okuma uygulamasında ya da PDF'te) okurken her zaman üstte duran küçük not penceresi:
+    sayfa + alıntı + yorum → kaynağın alıntı kartı. Okumayı ve kopyalamayı kullanıcı yapar."""
+
+    def __init__(self, app, item):
+        super().__init__(app)
+        self.app, self.item_id = app, item["id"]
+        self.title(f"Okurken not · {shorten(item['title'], 50)}")
+        set_window_icon(self, delay=260)
+        self.attributes("-topmost", True)
+        self.geometry(f"420x430+{max(0, self.winfo_screenwidth() - 450)}+80")      # sağ kenarda, okumayı kapatmasın
+        self.grid_columnconfigure(0, weight=1)
+        pad = {"padx": 14, "sticky": "ew"}
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.grid(row=0, column=0, pady=(12, 4), **pad)
+        ctk.CTkLabel(head, text="Sayfa:").pack(side="left")
+        self.page = ctk.CTkEntry(head, width=70)
+        self.page.pack(side="left", padx=6)
+        ctk.CTkButton(head, text="Panodan Yapıştır", width=130, fg_color="transparent", border_width=1,
+                      text_color=TEXT, command=self.paste).pack(side="right")
+        ctk.CTkLabel(self, text="Alıntı (okuyucudan kopyaladığınız metin):", anchor="w").grid(row=1, column=0, **pad)
+        self.quote = ctk.CTkTextbox(self, height=150, wrap="word")
+        self.quote.grid(row=2, column=0, pady=(2, 6), **pad)
+        ctk.CTkLabel(self, text="Yorumunuz / not:", anchor="w").grid(row=3, column=0, **pad)
+        self.comment = ctk.CTkTextbox(self, height=80, wrap="word")
+        self.comment.grid(row=4, column=0, pady=(2, 6), **pad)
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.grid(row=5, column=0, pady=(4, 4), **pad)
+        ctk.CTkButton(btns, text="Kartı Kaydet  (Ctrl+Enter)", command=self.save).pack(side="left")
+        ctk.CTkButton(btns, text="Kitabı Aç", width=90, fg_color="transparent", border_width=1, text_color=TEXT,
+                      command=self.open_book).pack(side="left", padx=8)
+        self.status = ctk.CTkLabel(self, text="", text_color=MUTED, anchor="w", font=ctk.CTkFont(size=12))
+        self.status.grid(row=6, column=0, pady=(0, 10), **pad)
+        self.bind("<Control-Return>", lambda _: self.save())
+        self._count()
+
+    def _count(self):
+        n = len(self.app.library.cards(self.item_id))
+        self.status.configure(text=f"Bu kaynakta {n} alıntı kartı var.")
+
+    def paste(self):
+        try:
+            text = self.clipboard_get()
+        except Exception:
+            text = ""
+        if text:
+            self.quote.delete("1.0", "end")
+            self.quote.insert("1.0", re.sub(r"[ \t]*\n[ \t]*", " ", text).strip())
+
+    def open_book(self):
+        item = self.app.library.get(self.item_id)
+        if item and item["file_path"] and os.path.exists(item["file_path"]):
+            open_file(Path(item["file_path"]))
+        elif item:
+            webbrowser.open_new_tab(item_open_link(item))
+
+    def save(self):
+        quote_text = self.quote.get("1.0", "end").strip()
+        comment = self.comment.get("1.0", "end").strip()
+        if not quote_text and not comment:
+            self.status.configure(text="Önce alıntı ya da not yazın.", text_color=LOG_COLORS["warn"])
+            return
+        self.app.library.add_card(self.item_id, self.page.get().strip(), quote_text, comment)
+        self.quote.delete("1.0", "end")
+        self.comment.delete("1.0", "end")
+        self.status.configure(text_color=MUTED)
+        self._count()
+        self.status.configure(text=self.status.cget("text") + "  ✓ kaydedildi")
+        tab = self.app.library_tab
+        if tab.current and tab.current["id"] == self.item_id:
+            tab._render_cards()
+
+
 class RangeDialog(ctk.CTkToplevel):
     """PDF'siz kaynaklardan hangi kayıt numaralarının işleneceğini seçtirir.
     on_start(kaynaklar, etiket, (alt, üst) ya da None) ile döner."""
@@ -9149,7 +9448,18 @@ class LibraryTab:
                                              height=30, font=ctk.CTkFont(size=12), dynamic_resizing=False,
                                              fg_color="#5B5F66", button_color="#4A4E54", button_hover_color="#3D4046")
         self.search_menu.set("Başlıkla başka yerde ara ▾")
-        self.search_menu.grid(row=3, column=0, columnspan=3, sticky="ew", padx=2, pady=2)
+        self.search_menu.grid(row=3, column=0, columnspan=2, sticky="ew", padx=2, pady=2)
+        self.notes_btn = ctk.CTkButton(btns, text="Okurken Not Al", command=self._reading_notes, **small, **outline)
+        self.notes_btn.grid(row=3, column=2, sticky="ew", padx=2, pady=2)
+
+    def _reading_notes(self):
+        if not self.current:
+            return
+        win = getattr(self, "notes_win", None)
+        if win is not None and win.winfo_exists():
+            win.destroy()
+        self.notes_win = ReadingNotes(self.app, self.current)
+        self.notes_win.open_book()
 
     def _search_elsewhere(self, site):
         self.search_menu.set("Başlıkla başka yerde ara ▾")
@@ -9214,7 +9524,7 @@ class LibraryTab:
                       border_width=1, text_color=TEXT, command=self._export).grid(row=0, column=3, padx=4)
         ctk.CTkButton(bar, text="İçe Aktar (Piri / RIS / BibTeX)…", width=210, fg_color="transparent",
                       border_width=1, text_color=TEXT, command=self._import_refs).grid(row=0, column=4, padx=4)
-        self.isbn_btn = ctk.CTkButton(bar, text="ISBN ile Kitap…", width=120, fg_color="transparent",
+        self.isbn_btn = ctk.CTkButton(bar, text="Kitap Ekle (ISBN / Bağlantı)…", width=200, fg_color="transparent",
                                       border_width=1, text_color=TEXT, command=self._add_isbn)
         self.isbn_btn.grid(row=0, column=5, padx=4)
 
@@ -9381,7 +9691,7 @@ class LibraryTab:
         self._reset_card_form()
         state = "normal" if item else "disabled"
         for btn in (self.save_btn, self.crossref_btn, self.attach_btn, self.inst_btn, self.reviewed_btn,
-                    self.remove_btn, self.card_save, self.search_menu):
+                    self.remove_btn, self.card_save, self.search_menu, self.notes_btn):
             btn.configure(state=state)
         db = database_for_doi(item["doi"]) if item else ""
         self.vetis_btn.configure(text=f"VETİS → {db}" if db else "VETİS (kampüs dışı)")
@@ -9800,31 +10110,43 @@ class LibraryTab:
                                                  open_mode=getattr(self.range_dialog, "open_mode_value", "page"))))
 
     def _add_isbn(self):
-        """Ödünç okunan (indirilemeyen) e-kitaplar ya da basılı kitaplar için ISBN'den künye."""
-        dialog = ctk.CTkInputDialog(title="ISBN ile kitap ekle",
-                                    text="Kitabın ISBN'ini yazın (birden çok olabilir; boşluk ya da satırla ayırın).\n"
-                                         "Künye Crossref ya da Google Books'tan alınır.")
+        """Kitap ekleme: ISBN ya da çevrimiçi okunan kitabın bağlantısı (bağlantı kayıtta kalır)."""
+        dialog = ctk.CTkInputDialog(title="Kitap ekle (ISBN ya da bağlantı)",
+                                    text="Kitabın ISBN'ini ya da çevrimiçi okunduğu sayfanın adresini yapıştırın "
+                                         "(birden çok olabilir).\nKünye bulunur, bağlantı kayıtta kalır; herkese açık "
+                                         "kitapların dosyası ya da metni de alınır.\nGiriş isteyen platformlarda "
+                                         "bağlantıyla birlikte ISBN'i de yazarsanız künye ISBN'den gelir.")
         set_window_icon(dialog, delay=260)
         text = dialog.get_input()
         if not text:
             return
-        isbns = find_isbns(text)
-        if not isbns:
-            messagebox.showwarning(APP_NAME, "Geçerli bir ISBN bulunamadı. 10 ya da 13 haneli numarayı "
-                                             "tirelerle ya da tiresiz yazabilirsiniz.", parent=self.parent)
+        urls = list(dict.fromkeys(u.rstrip(".,;)") for u in re.findall(r"https?://\S+", text)))
+        isbns = find_isbns(re.sub(r"https?://\S+", " ", text))
+        if not isbns and not urls:
+            messagebox.showwarning(APP_NAME, "Geçerli bir ISBN ya da bağlantı bulunamadı. ISBN'i 10 ya da 13 haneli, "
+                                             "bağlantıyı https:// ile başlayarak yazın.", parent=self.parent)
             return
-        answer = import_dialog(self.app, len(isbns), self.lib.all_tags(), show_move=False, unit="kitap")
+        answer = import_dialog(self.app, len(isbns) + len(urls), self.lib.all_tags(), show_move=False, unit="kitap")
         if answer is None:
             return
         _, tags, auto = answer
         self.isbn_btn.configure(state="disabled", text="Aranıyor…")
-        lib, events = self.lib, self.app.events
+        lib, events, folder = self.lib, self.app.events, self.app.library_folder()
 
         def work():
             added, existing, missing = [], [], []
             session = make_session()
             try:
-                for isbn in isbns:
+                pair = isbns[0] if len(urls) == 1 and len(isbns) == 1 else ""     # bağlantı + ISBN: aynı kitap
+                for url in urls:
+                    try:
+                        item_id, created, access = add_online_book(lib, session, url, tags, folder, auto, isbn=pair)
+                        (added if created else existing).append(item_id)
+                        events.put(("log", "info", f"Kitap bağlantısı eklendi ({access}): {url}"))
+                    except Exception as exc:
+                        missing.append(shorten(url, 50))
+                        diag(f"kitap bağlantısı {url}: {describe_error(exc)}")
+                for isbn in ([] if pair else isbns):
                     rec = book_record_by_isbn(session, isbn)
                     if not rec.get("title"):
                         missing.append(isbn)
@@ -9846,7 +10168,7 @@ class LibraryTab:
         threading.Thread(target=work, daemon=True).start()
 
     def on_isbn_done(self, added, existing, missing):
-        self.isbn_btn.configure(state="normal", text="ISBN ile Kitap…")
+        self.isbn_btn.configure(state="normal", text="Kitap Ekle (ISBN / Bağlantı)…")
         self.refresh()
         if added:
             self.select(added[0])
@@ -9854,7 +10176,7 @@ class LibraryTab:
         if existing:
             parts.append(f"{len(existing)} tanesi zaten kütüphanedeydi")
         if missing:
-            parts.append("bulunamayan ISBN: " + ", ".join(missing))
+            parts.append("bulunamayan: " + ", ".join(missing))
         self.app.toast("; ".join(parts) + ".")
 
     def _import_refs(self):
