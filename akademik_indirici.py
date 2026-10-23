@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.33"
+APP_VERSION = "2.34"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -2343,6 +2343,8 @@ def online_book_info(session, url) -> dict:
                 out["isbn"] = find_isbn(" ".join(i.get("identifier", "") for i in info.get("industryIdentifiers") or []))
                 full = access.get("viewability") == "ALL_PAGES" and access.get("publicDomain")
                 out["access"] = "open" if full else "restricted"
+                out["preview"] = {"PARTIAL": "sınırlı önizleme", "ALL_PAGES": "tam görünüm",
+                                  "NO_PAGES": "önizleme yok"}.get(access.get("viewability"), "")
                 for kind in ("pdf", "epub"):
                     link = (access.get(kind) or {}).get("downloadLink")
                     if full and link:
@@ -2385,6 +2387,35 @@ ONLINE_RESTRICTED_NOTE = ("Çevrimiçi okunur ({platform}); kurum girişi ya da 
                           "bu içeriği kendisi okumaz: okurken 'Okurken Not Al' penceresiyle alıntılarınızı "
                           "sayfa numarasıyla alıntı kartlarına ekleyin.")
 ONLINE_OPEN_NOTE = "Açık çevrimiçi metin bağlantıdan alındı ({platform}); Claude ve metin dizini bunu okuyabilir."
+GOOGLE_PREVIEW_NOTE = ("Google Books'ta {preview}: sayfalar yalnızca tarayıcıda görüntülenir; Google otomatik okumaya izin "
+                       "vermediği için program ve Claude içeriği okuyamaz. Okurken 'Okurken Not Al' penceresiyle "
+                       "alıntılarınızı sayfa numarasıyla alıntı kartlarına ekleyin.")
+
+
+def try_open_copy(library, session, item_id, rec, library_folder, email="") -> bool:
+    """Kitabın/bölümün yasal açık kopyasını (OpenAlex, Semantic Scholar, CORE) arar; PDF bulunursa başlığı
+    doğrulanıp bağlanır."""
+    copies = find_open_copies(session, rec, email, load_settings().get("core_api_key", ""))
+    for link in copies["pdfs"][:4]:
+        tmp = Path(library_folder) / f".acik_kopya_{item_id}.pdf"
+        try:
+            with session.get(link, stream=True, timeout=(15, 180)) as r:
+                r.raise_for_status()
+                with open(tmp, "wb") as fh:
+                    for block in r.iter_content(1 << 16):
+                        fh.write(block)
+            if b"%PDF-" not in tmp.read_bytes()[:1024]:
+                tmp.unlink(missing_ok=True)
+                continue
+            if link not in copies.get("trusted", []) and \
+                    not title_matches_text(rec.get("title", ""), pdf_text(tmp, max_pages=4, max_chars=30_000)):
+                tmp.unlink(missing_ok=True)
+                continue
+            attach_pdf(library, item_id, tmp, library_folder, move=True)
+            return True
+        except (requests.RequestException, OSError):
+            tmp.unlink(missing_ok=True)
+    return False
 
 
 def add_online_book(library, session, url, tags=(), library_folder=None, auto_tags=None, isbn=""):
@@ -2435,7 +2466,16 @@ def add_online_book(library, session, url, tags=(), library_folder=None, auto_ta
                 tmp.unlink(missing_ok=True)
             except (requests.RequestException, OSError):
                 continue
-    if info["access"] == "restricted":
+    if not attached and not info["text"] and library_folder:
+        try:                                                    # başka yerde yasal açık kopyası var mı?
+            attached = try_open_copy(library, session, item_id, library.get(item_id), library_folder)
+        except Exception as exc:
+            diag(f"açık kopya ({url}): {describe_error(exc)}")
+    if attached:
+        pass
+    elif info.get("preview"):
+        notes.append(GOOGLE_PREVIEW_NOTE.format(preview=info["preview"]))
+    elif info["access"] == "restricted":
         notes.append(ONLINE_RESTRICTED_NOTE.format(platform=info["platform"]))
     elif info["text"] and not attached:
         library.set_fulltext(item_id, info["text"])
