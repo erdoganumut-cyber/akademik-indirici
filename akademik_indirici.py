@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.34"
+APP_VERSION = "2.35"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -6602,6 +6602,125 @@ def epub_sections(path) -> list:
     return [(n + 1, f"bölüm-parça {n + 1}", text[i:i + size]) for n, i in enumerate(range(0, len(text), size))]
 
 
+# ── Taranmış PDF'ler: Windows'un kendi metin tanıması (Windows.Media.Ocr) ─────────────────────
+# Ek program kurmaz; Windows 10/11'in OCR'ı ve PDF çizicisi (Windows.Data.Pdf) kullanılır.
+
+OCR_PAGE_LIMIT = 400
+_OCR_STATE = {"checked": False, "error": ""}
+
+
+def ocr_unavailable_reason() -> str:
+    """Boş: kullanılabilir. Değilse nedeni (Windows değil, program eski sürüm…)."""
+    if _OCR_STATE["checked"]:
+        return _OCR_STATE["error"]
+    _OCR_STATE["checked"] = True
+    if sys.platform != "win32":
+        _OCR_STATE["error"] = "metin tanıma yalnızca Windows'ta çalışır"
+        return _OCR_STATE["error"]
+    try:
+        import importlib
+        for mod in ("winrt.windows.media.ocr", "winrt.windows.data.pdf", "winrt.windows.graphics.imaging",
+                    "winrt.windows.storage", "winrt.windows.storage.streams", "winrt.windows.globalization"):
+            importlib.import_module(mod)
+    except ImportError:
+        _OCR_STATE["error"] = ("bu program dosyasında metin tanıma bileşeni yok; programın yeni sürümünü "
+                               "(v2.35 ve sonrası) bir kez indirip kurun")
+    return _OCR_STATE["error"]
+
+
+def ocr_pdf(path, pages=None, language="", cancel=None, pause=0.0) -> dict:
+    """PDF sayfalarını resme çizip Windows OCR ile yazıya çevirir. pages: 1'den başlayan sayfa numaraları
+    (None: hepsi, en fazla OCR_PAGE_LIMIT). Dönüş: {sayfa_no: metin}"""
+    import asyncio
+    from winrt.windows.data.pdf import PdfDocument, PdfPageRenderOptions
+    from winrt.windows.globalization import Language
+    from winrt.windows.graphics.imaging import BitmapDecoder, BitmapPixelFormat, SoftwareBitmap
+    from winrt.windows.media.ocr import OcrEngine
+    from winrt.windows.storage import StorageFile
+    from winrt.windows.storage.streams import InMemoryRandomAccessStream
+    try:
+        from winrt.runtime import init_apartment, MTA
+        init_apartment(MTA)
+    except Exception:
+        pass
+
+    def engine_for(lang):
+        for tag in ([lang] if lang else []) + ["tr", "en-US", "en"]:
+            try:
+                language_obj = Language(tag)
+                if OcrEngine.is_language_supported(language_obj):
+                    return OcrEngine.try_create_from_language(language_obj)
+            except Exception:
+                continue
+        return OcrEngine.try_create_from_user_profile_languages()
+
+    async def run():
+        out = {}
+        file = await StorageFile.get_file_from_path_async(str(Path(path).resolve()))
+        doc = await PdfDocument.load_from_file_async(file)
+        engine = engine_for(language)
+        if engine is None:
+            raise RuntimeError("Windows'ta metin tanıma dili yüklü değil (Ayarlar → Dil → Türkçe → Dil özellikleri)")
+        limit = int(OcrEngine.max_image_dimension or 10000)
+        wanted = pages or range(1, min(int(doc.page_count), OCR_PAGE_LIMIT) + 1)
+        for number in wanted:
+            if cancel is not None and cancel.is_set():
+                break
+            if not 1 <= number <= doc.page_count:
+                continue
+            page = doc.get_page(number - 1)
+            size = page.size
+            scale = min(2.5, limit / max(size.width, size.height, 1)) if size.width and size.height else 2.0
+            options = PdfPageRenderOptions()
+            options.destination_width = max(1, int(size.width * scale))
+            options.destination_height = max(1, int(size.height * scale))
+            stream = InMemoryRandomAccessStream()
+            await page.render_with_options_to_stream_async(stream, options)
+            decoder = await BitmapDecoder.create_async(stream)
+            bitmap = await decoder.get_software_bitmap_async()
+            if bitmap.bitmap_pixel_format not in (BitmapPixelFormat.BGRA8, BitmapPixelFormat.GRAY8):
+                bitmap = SoftwareBitmap.convert(bitmap, BitmapPixelFormat.BGRA8)
+            result = await engine.recognize_async(bitmap)
+            out[number] = "\n".join(line.text for line in result.lines)
+            page.close()
+            stream.close()
+            if pause:
+                await asyncio.sleep(pause)
+        return out
+
+    return asyncio.run(run())
+
+
+def _minimal_text_pdf(path, text):
+    """Ek kütüphane olmadan tek sayfalık metinli PDF (OCR öz denetimi için)."""
+    content = f"BT /F1 28 Tf 60 700 Td ({text}) Tj ET".encode("latin-1")
+    objs = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R "
+            b"/Resources << /Font << /F1 5 0 R >> >> >>",
+            b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    data, offsets = b"%PDF-1.4\n", []
+    for i, obj in enumerate(objs, 1):
+        offsets.append(len(data))
+        data += b"%d 0 obj\n" % i + obj + b"\nendobj\n"
+    xref = len(data)
+    data += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)
+    data += b"".join(b"%010d 00000 n \n" % o for o in offsets)
+    data += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, xref)
+    Path(path).write_bytes(data)
+
+
+def ocr_selftest() -> str:
+    reason = ocr_unavailable_reason()
+    if reason:
+        return "OCR YOK: " + reason
+    import tempfile
+    path = Path(tempfile.mkdtemp()) / "ocr_deneme.pdf"
+    _minimal_text_pdf(path, "Halk oyunlari sahneleme 2026")
+    text = ocr_pdf(path).get(1, "")
+    return "OCR TAMAM: " + text if "sahneleme" in text.lower() else "OCR SONUCU BEKLENMEDİK: " + repr(text)
+
+
 def split_passages(text, limit=_PASSAGE_CHARS) -> list:
     """Sayfa metnini paragraf/cümle sınırlarından ~1400 karakterlik parçalara böler."""
     text = re.sub(r"[ \t]+", " ", text or "").strip()
@@ -6676,8 +6795,9 @@ class PassageIndex:
                 if self.fts:
                     self.db.execute("INSERT INTO pfts (rowid, folded) VALUES (?, ?)", (cur.lastrowid, fold(text)))
             self.db.execute("INSERT OR REPLACE INTO docs VALUES (?,?,?,?,?,?)",
-                            (item_id, sig, len({p for p, _, _ in passages}), sum(len(t) for _, _, t in passages),
-                             1 if paged else 0, datetime.now().strftime("%Y-%m-%d %H:%M")))
+                            (item_id, sig, len({p for p, _, _ in passages}),
+                             sum(len(t) for p, _, t in passages if p != 0), int(paged or 0),
+                             datetime.now().strftime("%Y-%m-%d %H:%M")))
 
     def _drop(self, item_id):
         if self.fts:
@@ -6700,9 +6820,15 @@ class PassageIndex:
     def stats(self) -> dict:
         with self.lock:
             docs, chars = self.db.execute("SELECT COUNT(*), COALESCE(SUM(chars), 0) FROM docs").fetchone()
-            empty = self.db.execute("SELECT COUNT(*) FROM docs WHERE chars < 200 AND paged = 1").fetchone()[0]
+            empty = self.db.execute("SELECT COUNT(*) FROM docs WHERE chars < 200 AND paged >= 1").fetchone()[0]
+            ocr = self.db.execute("SELECT COUNT(*) FROM docs WHERE paged = 2 AND chars >= 200").fetchone()[0]
             passages = self.db.execute("SELECT COUNT(*) FROM passages").fetchone()[0]
-        return {"kaynak": docs, "parca": passages, "karakter": chars, "metinsiz": empty}
+        return {"kaynak": docs, "parca": passages, "karakter": chars, "metinsiz": empty, "ocr": ocr}
+
+    def thin_docs(self) -> set:
+        """Metni çıkmamış ve henüz metin tanıma denenmemiş PDF'ler."""
+        with self.lock:
+            return {r[0] for r in self.db.execute("SELECT item_id FROM docs WHERE chars < 200 AND paged = 1")}
 
     @staticmethod
     def _terms(query) -> list:
@@ -6793,7 +6919,7 @@ def item_signature(item) -> str:
         (str(item.get("file_path")) + str(item.get("title")) + str(item.get("notes"))).encode("utf-8")).hexdigest())
 
 
-def build_passages(library, item) -> tuple:
+def build_passages(library, item, cancel=None) -> tuple:
     """Kaynağın dizine girecek parçaları. Dönüş: (parçalar, sayfalı_mı)"""
     path = item.get("file_path") or ""
     pages = []
@@ -6801,16 +6927,31 @@ def build_passages(library, item) -> tuple:
     if path and os.path.isfile(path):
         try:
             if path.lower().endswith(".pdf"):
-                pages, paged = pdf_pages(path, pause=0.002), True
+                pages, paged = pdf_pages(path, pause=0.002), 1
             elif path.lower().endswith(".epub"):
-                pages, paged = epub_sections(path), True
+                pages, paged = epub_sections(path), 1
         except Exception as exc:
             diag(f"dizin: {Path(path).name}: {describe_error(exc)}", throttle=True)
             pages = []
+        # taranmış (metni olmayan) sayfalar: Windows metin tanıması
+        blank = [n for n, _, t in pages if len(t.strip()) < 30]
+        if path.lower().endswith(".pdf") and blank and len(blank) >= max(1, len(pages) // 5) \
+                and not ocr_unavailable_reason():
+            try:
+                found = ocr_pdf(path, pages=blank, language=guess_language(item), cancel=cancel, pause=0.01)
+                if found:
+                    pages = [(n, label, found.get(n) or text) for n, label, text in pages]
+                    paged = 2
+                    text_all = "\n".join(t for _, _, t in pages)
+                    if len(text_all.strip()) > 200:
+                        library.set_fulltext(item["id"], text_all[:FULLTEXT_MAX_CHARS])
+            except Exception as exc:
+                diag(f"metin tanıma: {Path(path).name}: {describe_error(exc)}", throttle=True)
+                paged = 2
     if not any(t.strip() for _, _, t in pages):
         stored = library.get_fulltext(item["id"])           # PDF okunamadıysa ya da yoksa: özet/kayıtlı metin
         pages = [(0, "", stored)] if stored else []
-        paged = paged and bool(pages)
+        paged = paged if pages else (2 if paged == 2 else 0)
     head = " · ".join(x for x in (item.get("title"), item.get("keywords"), ", ".join(item.get("tags") or [])) if x)
     out = [(0, "künye", head)] if head else []
     for page, label, text in pages:
@@ -6874,7 +7015,7 @@ class ShardedIndex:
         return rank_hits(rows, query, allowed, limit, per_item)
 
     def stats(self) -> dict:
-        total = {"kaynak": 0, "parca": 0, "karakter": 0, "metinsiz": 0}
+        total = {"kaynak": 0, "parca": 0, "karakter": 0, "metinsiz": 0, "ocr": 0}
         for name in self.names():
             try:
                 for k, v in self.shard(name).stats().items():
@@ -6882,6 +7023,12 @@ class ShardedIndex:
             except sqlite3.Error:
                 continue
         return total
+
+    def thin_docs(self) -> set:
+        out = set()
+        for name in self.names():
+            out |= self.shard(name).thin_docs()
+        return out
 
     def signatures(self) -> dict:
         """{kimlik: (imza, parça adı)}"""
@@ -7012,8 +7159,10 @@ class IndexWorker(threading.Thread):
                         with index.shard(name).lock, index.shard(name).db:
                             index.shard(name)._drop(item_id)
                         dirty.add(name)
+                thin = index.thin_docs() if not ocr_unavailable_reason() else set()
                 todo = [i for i in items if have.get(i["id"], ("", ""))[0] != item_signature(i)
                         or have.get(i["id"], ("", ""))[1] != shard_name(i.get("no"))]
+                todo += [i for i in items if i["id"] in thin and i not in todo]    # taranmışlar: metin tanıma
                 last_push = time.time()
                 for n, item in enumerate(todo):
                     if self.cancel.is_set():
@@ -7021,7 +7170,9 @@ class IndexWorker(threading.Thread):
                     if n % 5 == 0:
                         self.events.put(("index", n, len(todo)))
                     name = shard_name(item.get("no"))
-                    passages, paged = build_passages(self.library, item)
+                    passages, paged = build_passages(self.library, item, self.cancel)
+                    if self.cancel.is_set():
+                        break
                     index.shard(name).put(item["id"], item_signature(item), passages, paged)
                     dirty.add(name)
                     time.sleep(0.05)                            # arayüze nefes aldır
@@ -7037,7 +7188,8 @@ class IndexWorker(threading.Thread):
             stats = ShardedIndex(local, readonly=True)
             result = stats.stats()
             stats.close()
-            result.update(toplam=len(items), ortak=remote is not None, baska_bilgisayar=self.holder)
+            result.update(toplam=len(items), ortak=remote is not None, baska_bilgisayar=self.holder,
+                          ocr_yok=ocr_unavailable_reason())
             self.events.put(("index_done", result, self.cancel.is_set()))
         except Exception:
             diag_exception("metin dizini")
@@ -7399,12 +7551,20 @@ class McpTools:
         reader = PdfReader(item["file_path"])
         start = max(1, int(baslangic_sayfa or 1))
         count = max(1, min(int(sayfa_sayisi or 5), 15))
-        pages = []
+        pages, texts = [], {}
         for n in range(start, min(start + count, len(reader.pages) + 1)):
             try:
-                text = reader.pages[n - 1].extract_text() or ""
+                texts[n] = reader.pages[n - 1].extract_text() or ""
             except Exception:
-                text = ""
+                texts[n] = ""
+        blank = [n for n, t in texts.items() if len(t.strip()) < 30]
+        if blank and not ocr_unavailable_reason():                # taranmış sayfa: Windows metin tanıması
+            try:
+                texts.update({n: t for n, t in ocr_pdf(item["file_path"], pages=blank[:8],
+                                                       language=guess_language(item)).items() if t})
+            except Exception as exc:
+                diag(f"Claude OCR: {describe_error(exc)}", throttle=True)
+        for n, text in texts.items():
             pages.append(f"--- sayfa {n} ---\n{text}")
         body = "\n".join(pages)[:60_000]
         return {"baslik": item["title"], "toplam_sayfa": len(reader.pages), "metin": body}
@@ -10766,8 +10926,12 @@ class ScanTab:
                 f"(~{mb:.0f} milyon karakter)" + (" · Drive'da ortak" if stats.get("ortak") else ""))
         if stats.get("baska_bilgisayar"):
             text += f" · şu an {stats['baska_bilgisayar']} bilgisayarı güncelliyor, buradan yalnızca okunuyor"
+        if stats.get("ocr"):
+            text += f" · {stats['ocr']} taranmış PDF metin tanımayla okundu"
         if stats.get("metinsiz"):
-            text += f" · {stats['metinsiz']} PDF taranmış görüntü olduğu için okunamadı"
+            text += f" · {stats['metinsiz']} PDF'te metin çıkmadı"
+            if stats.get("ocr_yok"):
+                text += f" (taranmış PDF okuma: {stats['ocr_yok']})"
         self.index_label.configure(text=text + (" · yarıda kaldı, sonra sürecek" if stopped else "") + ".")
 
     def check_theses(self):
@@ -12068,6 +12232,9 @@ class App(ctk.CTk):
 
 
 def main():
+    if "--ocr-selftest" in sys.argv:
+        print(ocr_selftest())
+        return
     if "--mcpb-pack" in sys.argv:            # derleme sırasında: .mcpb uzantı paketini üret
         i = sys.argv.index("--mcpb-pack")
         print(pack_mcpb(sys.argv[i + 1], sys.argv[i + 2]))
