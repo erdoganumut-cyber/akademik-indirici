@@ -24,9 +24,12 @@ jobs:
 
       - name: Metin tanıma öz denetimi
         continue-on-error: true
+        shell: pwsh
         run: |
-          python akademik_indirici.py --ocr-selftest
-          .\dist\AkademikIndirici\AkademikKutuphaneMCP.exe --ocr-selftest
+          $py = (python akademik_indirici.py --ocr-selftest 2>&1 | Out-String).Trim()
+          Write-Output "::notice title=OCR (python)::$py"
+          $exe = (.\dist\AkademikIndirici\AkademikKutuphaneMCP.exe --ocr-selftest 2>&1 | Out-String).Trim()
+          Write-Output "::notice title=OCR (exe)::$exe"
 
       - name: Claude uzantısını paketle
         run: .\dist\AkademikIndirici\AkademikKutuphaneMCP.exe --mcpb-pack dist\AkademikIndirici dist\akademik-kutuphane.mcpb
