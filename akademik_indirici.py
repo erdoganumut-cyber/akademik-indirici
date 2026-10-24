@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.36"
+APP_VERSION = "2.37"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -3444,6 +3444,45 @@ class Library:
         with self.lock:
             row = self.db.execute("SELECT content FROM fulltext WHERE item_id=?", (item_id,)).fetchone()
         return row[0] if row and row[0] else ""
+
+    def merge_items(self, keeper_id, other_ids, library_folder=None) -> int:
+        """Mükerrer kayıtları birleştirir: etiketler, kartlar, boş alanlar, Claude özeti ve (gerekirse) PDF
+        tutulan kayda geçer; öbürleri silinir. Fazla PDF kopyaları silinmez, 'Mükerrer PDF'ler' klasörüne taşınır."""
+        keeper = self.get(keeper_id)
+        moved = 0
+        spare_dir = Path(library_folder) / "Mükerrer PDF'ler (silinebilir)" if library_folder else None
+        for oid in other_ids:
+            other = self.get(oid)
+            if not other or oid == keeper_id:
+                continue
+            fill = {k: other[k] for k in RECORD_FIELDS if other.get(k) and not keeper.get(k)}
+            keeper_has_file = keeper["file_path"] and os.path.isfile(keeper["file_path"])
+            if not keeper_has_file and other["file_path"] and os.path.isfile(other["file_path"]):
+                fill.update(file_path=other["file_path"], sha256=other.get("sha256") or "")
+                with self.lock:
+                    row = self.db.execute("SELECT content FROM fulltext WHERE item_id=?", (oid,)).fetchone()
+                if row and row[0]:
+                    self.set_fulltext(keeper_id, row[0])
+            elif other["file_path"] and os.path.isfile(other["file_path"]) and spare_dir and \
+                    os.path.normcase(other["file_path"]) != os.path.normcase(keeper["file_path"] or ""):
+                try:
+                    spare_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.move(other["file_path"], str(unique_path(spare_dir, Path(other["file_path"]).name)))
+                    moved += 1
+                except OSError:
+                    pass
+            if len(other.get("ai_ozet") or "") > len(keeper.get("ai_ozet") or ""):
+                fill["ai_ozet"] = other["ai_ozet"]
+            if other.get("notes") and other["notes"] not in (keeper.get("notes") or ""):
+                fill["notes"] = "\n".join(filter(None, [keeper.get("notes"), other["notes"]]))
+            if fill:
+                self.update(keeper_id, fill)
+                keeper = self.get(keeper_id)
+            self.add_tags(keeper_id, other["tags"])
+            with self.lock, self.db:
+                self.db.execute("UPDATE cards SET item_id=? WHERE item_id=?", (keeper_id, oid))
+            self.delete(oid)
+        return moved
 
     def mark_reviewed(self, ids):
         """'Yeni' işaretini kaldırır (tek işlemde, binlerce kaynak için de hızlı)."""
@@ -6824,6 +6863,14 @@ class PassageIndex:
             if self.has_offset and page_offset:
                 self.db.execute("UPDATE docs SET page_offset=? WHERE item_id=?", (int(page_offset), item_id))
 
+    def passages_of_kind(self, kind) -> list:
+        """[(kimlik, metin)] — belge sırasıyla."""
+        if not self.has_kind:
+            return []
+        with self.lock:
+            return self.db.execute("SELECT item_id, text FROM passages WHERE kind=? ORDER BY item_id, id",
+                                   (kind,)).fetchall()
+
     def page_offset(self, item_id) -> int:
         if not self.has_offset:
             return 0
@@ -7153,6 +7200,289 @@ def local_index_dir() -> Path:
 def shared_index_dir():
     shared = shared_dir()
     return shared / INDEX_DIR_NAME if shared is not None else None
+
+
+# ── Atıf ağı: kaynakça sayfalarından kim kime atıf yapmış, kütüphanede olmayan sık atıflı eserler ─────
+
+CITATIONS_NAME = "atif_agi.json"
+_REF_START_RE = re.compile(
+    r"^\s*(?:\[\d{1,3}\]|\d{1,3}[.)])\s+\S|"                                  # [12] / 12. numaralı
+    r"^\s*[A-ZÇĞİÖŞÜÁÉÍÓÚÑÄË][\w'’\-çğıöşüáéíóúñäëß]+(?:\s(?:van|von|de|da|del|der)?\s?[A-ZÇĞİÖŞÜ][\w'’\-]+)?,"
+    r"\s*(?:[A-ZÇĞİÖŞÜÁÉÍÓÚÑ]\.|[A-ZÇĞİÖŞÜÁÉÍÓÚÑ][a-zçğıöşüáéíóúñäë]+)")
+_YEAR_RE = re.compile(r"(?<!\d)(1[89]\d{2}|20[0-4]\d)[a-z]?(?!\d)")
+
+
+def citations_path() -> Path:
+    return settings_path().parent / CITATIONS_NAME
+
+
+def split_references(text: str) -> list:
+    """Kaynakça metnini tek tek kaynak satırlarına böler."""
+    entries, current = [], ""
+    # parçalara bölünürken satır sonları kaybolmuş olabilir: 'Soyad, A. (2019)' gibi başlangıçlardan yeniden böl
+    text = re.sub(r"(?<=[.)\]])\s+(?=(?:\[\d{1,3}\]\s*)?[A-ZÇĞİÖŞÜÁÉÍÓÚÑ][\w'’\-çğıöşüáéíóúñäë]+,\s*"
+                  r"(?:[A-ZÇĞİÖŞÜÁÉÍÓÚÑ]\.|[A-ZÇĞİÖŞÜÁÉÍÓÚÑ][a-zçğıöşüáéíóúñäë]+)[^\n]{0,120}?(?:1[89]|20)\d{2})",
+                  "\n", text or "")
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if _REF_START_RE.match(line) and len(current) > 25:
+            entries.append(current)
+            current = line
+        else:
+            current = (current + " " + line).strip() if current else line
+    if current:
+        entries.append(current)
+    return [re.sub(r"\s+", " ", e) for e in entries if _YEAR_RE.search(e) and 30 <= len(e) <= 1200]
+
+
+def parse_reference(ref: str) -> dict:
+    """Kaynak satırından ilk yazar, yıl, başlık ve DOI (kaba ama hızlı)."""
+    text = re.sub(r"^\s*(?:\[\d+\]|\d{1,3}[.)])\s*", "", ref)
+    doi_m = DOI_RE.search(text)
+    year_m = _YEAR_RE.search(text)
+    author = re.split(r"[,(]", text, 1)[0].strip(" .")
+    title = ""
+    if year_m:
+        after = text[year_m.end():]
+        after = re.sub(r"^[a-z]?\)?[.,:;]?\s*", "", after)
+        parts = [p.strip(" \"“”'‘’") for p in re.split(r"(?<=[.?!])\s+(?=[A-ZÇĞİÖŞÜ“\"])", after) if p.strip()]
+        title = next((p for p in parts if len(p) >= 12), parts[0] if parts else "")
+    return {"author": author[:60], "year": year_m.group(1) if year_m else "", "title": title[:220].rstrip("."),
+            "doi": normalize_doi(clean_url(doi_m.group(1))) if doi_m else "", "raw": ref[:400]}
+
+
+def _sig_words(text) -> list:
+    return [w for w in re.findall(r"\w+", fold(text or "")) if len(w) >= 4]
+
+
+def build_citation_graph(library, index) -> dict:
+    """Bütün kaynakça parçalarını okuyup atıf ağını çıkarır (PDF açmaz; metin dizinini kullanır)."""
+    items = library.all_items()
+    by_doi = {normalize_doi(i["doi"]).lower(): i["id"] for i in items if i.get("doi")}
+    by_author = {}
+    for i in items:
+        fam = fold((i.get("authors") or [{}])[0].get("family", "")) if i.get("authors") else ""
+        if fam:
+            by_author.setdefault(fam, []).append(i)
+    texts = {}
+    for name in index.names():
+        for item_id, text in index.shard(name).passages_of_kind("kaynakça"):
+            texts.setdefault(item_id, []).append(text)
+    edges, missing = set(), {}
+    for citing, chunks in texts.items():
+        for ref in split_references("\n".join(chunks)):
+            info = parse_reference(ref)
+            target = by_doi.get(info["doi"].lower()) if info["doi"] else None
+            if not target and info["author"] and info["year"]:
+                fam = fold(info["author"].split()[0] if " " in info["author"] and info["author"].isupper()
+                           else info["author"]).split(" ")[0]
+                words = set(_sig_words(info["title"]))
+                for cand in by_author.get(fam, []):
+                    if str(cand.get("year") or "")[:4] and abs(int(str(cand["year"])[:4]) - int(info["year"])) > 1:
+                        continue
+                    cw = set(_sig_words(cand["title"]))
+                    if words and cw and len(words & cw) / max(1, min(len(words), len(cw))) >= 0.6:
+                        target = cand["id"]
+                        break
+            if target:
+                if target != citing:
+                    edges.add((citing, target))
+                continue
+            if not info["year"] or not info["author"] or len(_sig_words(info["title"])) < 2:
+                continue
+            key = info["doi"].lower() or (fold(info["author"]).split(" ")[0] + "|" + info["year"] + "|" +
+                                          " ".join(_sig_words(info["title"])[:5]))
+            entry = missing.setdefault(key, {**info, "citing": []})
+            if citing not in entry["citing"]:
+                entry["citing"].append(citing)
+    top = sorted((m for m in missing.values() if len(m["citing"]) >= 2), key=lambda m: -len(m["citing"]))[:600]
+    data = {"built": datetime.now().strftime("%Y-%m-%d %H:%M"), "edges": sorted(edges), "missing": top,
+            "parsed_items": len(texts)}
+    _write_json(citations_path(), data)
+    return data
+
+
+def load_citations() -> dict:
+    return _read_json(citations_path())
+
+
+def citation_counts(data) -> dict:
+    counts = {}
+    for _, cited in data.get("edges") or []:
+        counts[cited] = counts.get(cited, 0) + 1
+    return counts
+
+
+# ── PDF'lerdeki vurgular, altı çizililer ve notlar → alıntı kartları ─────────────────────────────
+
+HIGHLIGHT_STATE = "vurgu_tarama.json"
+_HIGHLIGHT_TYPES = {"/Highlight", "/Underline", "/Squiggly"}
+_NOTE_TYPES = {"/Text", "/FreeText"}
+
+
+def pdf_highlights(path) -> list:
+    """[(pdf_sayfa, vurgulanan_metin, not)] — vurgu/altı çizili/not ekleri."""
+    from pypdf import PdfReader
+    reader = PdfReader(str(path))
+    out = []
+    for n, page in enumerate(reader.pages, start=1):
+        try:
+            annots = page.get("/Annots")
+            annots = annots.get_object() if annots is not None else []
+        except Exception:
+            continue
+        marks = []
+        for ref in annots or []:
+            try:
+                a = ref.get_object()
+                sub = a.get("/Subtype")
+                note = str(a.get("/Contents") or "").strip()
+                if sub in _HIGHLIGHT_TYPES:
+                    q = [float(v) for v in (a.get("/QuadPoints") or [])]
+                    rects = []
+                    for i in range(0, len(q) - 7, 8):
+                        xs, ys = q[i:i + 8:2], q[i + 1:i + 8:2]
+                        rects.append((min(xs), min(ys), max(xs), max(ys)))
+                    if not rects and a.get("/Rect"):
+                        r = [float(v) for v in a["/Rect"]]
+                        rects = [(min(r[0], r[2]), min(r[1], r[3]), max(r[0], r[2]), max(r[1], r[3]))]
+                    marks.append((rects, note))
+                elif sub in _NOTE_TYPES and note:
+                    out.append((n, "", note))
+            except Exception:
+                continue
+        if not marks:
+            continue
+        pieces = []
+
+        def visit(text, cm, tm, font, size):
+            if not text or not text.strip():
+                return
+            x = tm[4] * cm[0] + tm[5] * cm[2] + cm[4]
+            y = tm[4] * cm[1] + tm[5] * cm[3] + cm[5]
+            pieces.append((x, y, text))
+        try:
+            page.extract_text(visitor_text=visit)
+        except Exception:
+            continue
+        for rects, note in marks:
+            got = []
+            for x, y, text in pieces:
+                for x0, y0, x1, y1 in rects:
+                    if y0 - 3 <= y <= y1 + 1 and x0 - 4 <= x <= x1:
+                        got.append(text)
+                        break
+            quote = re.sub(r"\s+", " ", " ".join(got)).strip()
+            if quote or note:
+                out.append((n, quote, note))
+    return out
+
+
+class HighlightWorker(threading.Thread):
+    """PDF'lerdeki vurguları alıntı kartlarına aktarır; değişmeyen dosyalar bir dahaki sefere atlanır.
+    Mesajlar: ("hl", sıra, toplam) · ("hl_done", eklenen_kart, kaynak_sayısı, durduruldu)"""
+
+    def __init__(self, library, events):
+        super().__init__(name="vurgular", daemon=True)
+        self.library, self.events = library, events
+        self.cancel = threading.Event()
+
+    def run(self):
+        added, sources = 0, set()
+        state_path = settings_path().parent / HIGHLIGHT_STATE
+        state = _read_json(state_path)
+        try:
+            items = [i for i in self.library.all_items()
+                     if (i.get("file_path") or "").lower().endswith(".pdf") and os.path.isfile(i["file_path"])]
+            offsets = {}
+            try:
+                idx = ShardedIndex(readonly=True)
+                offsets = {i["id"]: idx.page_offset(i["id"], i.get("no")) for i in items}
+                idx.close()
+            except Exception:
+                pass
+            for n, item in enumerate(items):
+                if self.cancel.is_set():
+                    break
+                if n % 10 == 0:
+                    self.events.put(("hl", n, len(items)))
+                stamp = str(_stat(item["file_path"]))
+                if state.get(str(item["id"])) == stamp:
+                    continue
+                try:
+                    marks = pdf_highlights(item["file_path"])
+                except Exception as exc:
+                    diag(f"vurgular: {Path(item['file_path']).name}: {describe_error(exc)}", throttle=True)
+                    marks = []
+                have = {(c["page"], fold(c["quote"])[:120], fold(c["comment"])[:120])
+                        for c in self.library.cards(item["id"])}
+                for page, marked, note in marks:
+                    off = offsets.get(item["id"]) or 0
+                    shown = str(page + off) if off else str(page)
+                    comment = (note + " " if note else "") + "[PDF işaretlemesi]"
+                    key = (shown, fold(marked)[:120], fold(comment)[:120])
+                    if key in have:
+                        continue
+                    self.library.add_card(item["id"], shown, marked, comment)
+                    have.add(key)
+                    added += 1
+                    sources.add(item["id"])
+                state[str(item["id"])] = stamp
+                time.sleep(0.01)
+            _write_json(state_path, state)
+        except Exception:
+            diag_exception("vurgu aktarımı")
+        self.events.put(("hl_done", added, len(sources), self.cancel.is_set()))
+
+
+def find_duplicates(items) -> list:
+    """Aynı yayının birden çok kaydı: aynı DOI, ya da aynı başlık (ön baskı/yayımlanmış hâli dahil) + aynı ilk
+    yazar ya da yakın yıl. Dönüş: [[kayıt, …], …] — her grubun ilki tutulması önerilen kayıt."""
+    parent = {i["id"]: i["id"] for i in items}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+    buckets = {}
+    for i in items:
+        if i.get("doi"):
+            buckets.setdefault("doi:" + normalize_doi(i["doi"]).lower(), []).append(i)
+        words = _sig_words(re.split(r"[:.?]\s", i.get("title") or "")[0])
+        if len(words) >= 3:
+            buckets.setdefault("t:" + " ".join(words[:5]), []).append(i)
+    for key, group in buckets.items():
+        if len(group) < 2:
+            continue
+        for a in group[1:]:
+            b = group[0]
+            if key.startswith("doi:"):
+                union(b["id"], a["id"])
+                continue
+            fa = fold((a.get("authors") or [{}])[0].get("family", "")) if a.get("authors") else ""
+            fb = fold((b.get("authors") or [{}])[0].get("family", "")) if b.get("authors") else ""
+            ya, yb = str(a.get("year") or "")[:4], str(b.get("year") or "")[:4]
+            close_year = not ya or not yb or (ya.isdigit() and yb.isdigit() and abs(int(ya) - int(yb)) <= 2)
+            same_author = bool(fa and fb and fa == fb)
+            unknown_author = not fa or not fb
+            if close_year and (same_author or (unknown_author and same_title(a["title"], b["title"]))):
+                union(b["id"], a["id"])
+    groups = {}
+    for i in items:
+        groups.setdefault(find(i["id"]), []).append(i)
+
+    def score(i):
+        has_file = bool(i.get("file_path")) and os.path.isfile(i["file_path"])
+        return (has_file, bool(i.get("doi")), sum(1 for k in RECORD_FIELDS if i.get(k)), -(i.get("no") or 0))
+    return [sorted(g, key=score, reverse=True) for g in groups.values() if len(g) > 1]
 
 
 class ShardedIndex:
@@ -7544,6 +7874,12 @@ class McpTools:
                                "description": "Sorgunun başka dillerdeki karşılıkları"},
                  "limit": {"type": "integer", "description": "En fazla kaynak (varsayılan 15, en çok 40)"}},
               "required": ["sorgu"]}),
+            ("atif_agi", "Kütüphanenin atıf ağı (kaynakça sayfalarından çıkarılır). id verilirse: o kaynağa "
+                         "kütüphanede kimlerin atıf yaptığı ve onun atıf yaptığı kütüphane kaynakları. id yoksa: "
+                         "kütüphanede en çok atıf alan temel kaynaklar ve kütüphanede OLMAYAN ama kaynaklarınızın "
+                         "sık atıf yaptığı eserler (eksik temel literatür).",
+             {"type": "object", "properties": {"id": {"type": "integer"},
+                                               "limit": {"type": "integer", "description": "Liste uzunluğu (20)"}}}),
             ("ozet_kaydet", "Bir kaynağı okuduktan sonra onun yapılandırılmış özetini kütüphaneye kaydeder; sonraki "
                             "sorularda bu özet arama ve yanıt için kullanılır (kütüphane böylece giderek 'öğrenir'). "
                             "Biçim: Ana argüman · Yöntem/veri · Temel bulgular · Kavramlar · Sınırlılıklar · "
@@ -7740,6 +8076,30 @@ class McpTools:
                         "claude_ozeti": item.get("ai_ozet") or "",
                         "pdf_var": bool(item["file_path"]) and Path(item["file_path"]).is_file()})
         return {"sorgu": sorgu, "kaynaklar": out}
+
+    def t_atif_agi(self, id=None, limit=20):
+        data = load_citations()
+        if not data:
+            raise ValueError("Atıf ağı henüz hesaplanmadı; metin dizini kurulunca kendiliğinden hesaplanır.")
+        limit = max(1, min(int(limit or 20), 100))
+        brief = lambda i: {"id": i["id"], "kayit_no": i.get("no") or 0, "atif": intext_citation(i),   # noqa: E731
+                           "baslik": i["title"]}
+        edges = data.get("edges") or []
+        if id:
+            item = self.lib.get(int(id))
+            if not item:
+                raise ValueError(f"{id} numaralı kaynak yok")
+            citing = [self.lib.get(a) for a, b in edges if b == item["id"]]
+            cited = [self.lib.get(b) for a, b in edges if a == item["id"]]
+            return {"kaynak": brief(item), "kutuphanede_atif_yapanlar": [brief(i) for i in citing if i][:limit],
+                    "kutuphanede_atif_yaptiklari": [brief(i) for i in cited if i][:limit]}
+        counts = citation_counts(data)
+        top = [dict(brief(self.lib.get(k)), atif_sayisi=v) for k, v in sorted(counts.items(), key=lambda kv: -kv[1])
+               if self.lib.get(k)][:limit]
+        missing = [{"atif_sayisi": len(m["citing"]), "yazar": m["author"], "yil": m["year"], "baslik": m["title"],
+                    "doi": m.get("doi") or "", "kaynak_satiri": m["raw"][:250]} for m in (data.get("missing") or [])[:limit]]
+        return {"hesaplandi": data.get("built"), "kaynakcasi_okunan": data.get("parsed_items"),
+                "en_cok_atif_alanlar": top, "kutuphanede_olmayan_sik_atiflilar": missing}
 
     def t_ozet_kaydet(self, id, ozet):
         item = self.lib.get(int(id))
@@ -9066,6 +9426,205 @@ class FreezeWatchdog(threading.Thread):
                     reported = False
 
 
+class CitationWindow(ctk.CTkToplevel):
+    """Atıf ağı: kütüphanede en çok atıf alan kaynaklar ve kütüphanede olmayan sık atıflı eserler."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("Atıf ağı ve eksik temel kaynaklar")
+        set_window_icon(self, delay=260)
+        self.geometry("980x620")
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 6))
+        self.info = ctk.CTkLabel(top, text="", anchor="w", justify="left", wraplength=700)
+        self.info.pack(side="left")
+        self.rebuild_btn = ctk.CTkButton(top, text="Yeniden Hesapla", width=130, command=self.rebuild)
+        self.rebuild_btn.pack(side="right")
+        tabs = ctk.CTkTabview(self)
+        tabs.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.t_in = self._tree(tabs.add("Kütüphanede en çok atıf alanlar"),
+                               (("n", "Atıf", 60), ("no", "No", 60), ("who", "Yazar", 160), ("year", "Yıl", 60),
+                                ("title", "Başlık", 560)))
+        miss = tabs.add("Kütüphanede olmayan sık atıflı eserler")
+        self.t_out = self._tree(miss, (("n", "Atıf", 60), ("who", "Yazar", 160), ("year", "Yıl", 60),
+                                       ("title", "Başlık / kaynak", 520), ("doi", "DOI", 140)))
+        bar = ctk.CTkFrame(miss, fg_color="transparent")
+        bar.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self.add_btn = ctk.CTkButton(bar, text="Seçilenleri İndir Sekmesine Ekle", width=230, command=self.add_selected)
+        self.add_btn.pack(side="left")
+        ctk.CTkLabel(bar, text="DOI'si olmayanlar için Crossref'te aranır; bulunanlar İndir sekmesine yazılır.",
+                     text_color=MUTED, font=ctk.CTkFont(size=12)).pack(side="left", padx=10)
+        self.t_in.bind("<Double-1>", lambda _: self.show_in_library())
+        self.data = load_citations()
+        self.fill()
+        if not self.data:
+            self.rebuild()
+
+    def _tree(self, parent, cols):
+        from tkinter import ttk
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(0, weight=1)
+        tree = ttk.Treeview(parent, columns=[c[0] for c in cols], show="headings", selectmode="extended",
+                            style="Lib.Treeview")
+        for key, text, width in cols:
+            tree.heading(key, text=text)
+            tree.column(key, width=width, stretch=key == "title", anchor="center" if key in ("n", "no", "year") else "w")
+        tree.grid(row=0, column=0, sticky="nsew")
+        return tree
+
+    def fill(self):
+        lib = self.app.library
+        for tree in (self.t_in, self.t_out):
+            tree.delete(*tree.get_children())
+        if not self.data:
+            self.info.configure(text="Atıf ağı hesaplanıyor…")
+            return
+        counts = citation_counts(self.data)
+        for item_id, n in sorted(counts.items(), key=lambda kv: -kv[1])[:500]:
+            item = lib.get(item_id)
+            if item:
+                self.t_in.insert("", "end", iid=str(item_id), values=(n, item.get("no") or "", first_author_label(item),
+                                                                      item.get("year"), item["title"]))
+        for k, m in enumerate(self.data.get("missing") or []):
+            self.t_out.insert("", "end", iid=f"m{k}", values=(len(m["citing"]), m["author"], m["year"],
+                                                              m["title"] or m["raw"][:160], m.get("doi") or ""))
+        self.info.configure(text=f"{self.data.get('parsed_items', 0)} kaynağın kaynakçası okundu · kütüphane içi "
+                                 f"{len(self.data.get('edges') or [])} atıf · kütüphanede olmayan ve en az 2 "
+                                 f"kaynağınızın atıf yaptığı {len(self.data.get('missing') or [])} eser · "
+                                 f"{self.data.get('built', '')}")
+
+    def rebuild(self):
+        self.rebuild_btn.configure(state="disabled", text="Hesaplanıyor…")
+        lib, events = self.app.library, self.app.events
+
+        def work():
+            try:
+                idx = ShardedIndex(readonly=True)
+                data = build_citation_graph(lib, idx)
+                idx.close()
+            except Exception:
+                diag_exception("atıf ağı")
+                data = {}
+            events.put(("cite_done", data))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_built(self, data):
+        if not self.winfo_exists():
+            return
+        self.rebuild_btn.configure(state="normal", text="Yeniden Hesapla")
+        self.data = data or {}
+        self.fill()
+        if not data:
+            self.info.configure(text="Metin dizini henüz hazır değil; dizin kurulunca yeniden deneyin.")
+
+    def show_in_library(self):
+        sel = self.t_in.selection()
+        if sel:
+            tab = self.app.library_tab
+            self.app.tabs.set("Kütüphanem")
+            tab.search.delete(0, "end")
+            tab.refresh()
+            tab.select(int(sel[0]))
+
+    def add_selected(self):
+        chosen = [self.data["missing"][int(i[1:])] for i in self.t_out.selection()]
+        if not chosen:
+            messagebox.showinfo(APP_NAME, "Önce listeden eser seçin (Ctrl ya da Shift ile birden çok).", parent=self)
+            return
+        self.add_btn.configure(state="disabled", text="DOI'ler aranıyor…")
+        events = self.app.events
+
+        def work():
+            links, unresolved = [], []
+            session = make_session()
+            try:
+                for m in chosen:
+                    doi = m.get("doi")
+                    if not doi:
+                        msg = crossref_search(session, {"title": m["title"], "year": m["year"],
+                                                        "authors": [{"family": m["author"].split(",")[0]}]})
+                        doi = record_from_crossref(msg)["doi"] if msg else ""
+                    (links.append("https://doi.org/" + doi) if doi else unresolved.append(m["raw"]))
+            finally:
+                session.close()
+            events.put(("cite_links", links, unresolved))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_links(self, links, unresolved):
+        if not self.winfo_exists():
+            return
+        self.add_btn.configure(state="normal", text="Seçilenleri İndir Sekmesine Ekle")
+        if links:
+            box = self.app.input_box
+            box.insert("end", ("\n" if box.get("1.0", "end-1c").strip() else "") +
+                       "──── Eksik temel kaynaklar ────\n" + "\n".join(links) + "\n")
+        msg = f"{len(links)} eser İndir sekmesine eklendi; oradan 'İndirmeyi Başlat' ile indirebilirsiniz."
+        if unresolved:
+            self.clipboard_clear()
+            self.clipboard_append("\n".join(unresolved))
+            msg += (f"\n\n{len(unresolved)} eserin DOI'si bulunamadı (çoğu kitap ya da eski yayın); kaynak "
+                    "satırları panoya kopyalandı — Piri'de ya da Google Akademik'te aratabilirsiniz.")
+        messagebox.showinfo(APP_NAME, msg, parent=self)
+
+
+class DuplicatesWindow(ctk.CTkToplevel):
+    """Mükerrer kayıtlar: gruplar listelenir, seçilen gruplar tek kayıtta birleştirilir."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("Mükerrer kayıtlar")
+        set_window_icon(self, delay=260)
+        self.geometry("900x600")
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+        self.groups = find_duplicates(app.library.all_items())
+        head = ("Mükerrer kayıt bulunamadı." if not self.groups else
+                f"{len(self.groups)} grup bulundu. Her grupta ★ işaretli kayıt tutulur; öbürlerinin etiketleri, alıntı "
+                "kartları, boş künye alanları ve Claude özeti ona aktarılıp silinir. Fazla PDF kopyaları silinmez, "
+                "kütüphane klasöründeki 'Mükerrer PDF'ler (silinebilir)' klasörüne taşınır.")
+        ctk.CTkLabel(self, text=head, anchor="w", justify="left", wraplength=860).grid(
+            row=0, column=0, sticky="ew", padx=14, pady=(12, 6))
+        body = ctk.CTkScrollableFrame(self)
+        body.grid(row=1, column=0, sticky="nsew", padx=10)
+        body.grid_columnconfigure(0, weight=1)
+        self.vars = []
+        for g, group in enumerate(self.groups):
+            var = ctk.BooleanVar(value=True)
+            self.vars.append(var)
+            box = ctk.CTkFrame(body)
+            box.grid(row=g, column=0, sticky="ew", pady=4)
+            ctk.CTkCheckBox(box, text=f"Grup {g + 1}: birleştir", variable=var).pack(anchor="w", padx=8, pady=(6, 2))
+            for k, item in enumerate(group):
+                has_file = bool(item.get("file_path")) and os.path.isfile(item["file_path"])
+                line = (f"{'★' if k == 0 else '  '} No {item.get('no')} · {first_author_label(item)} "
+                        f"({item.get('year') or 't.y.'}) {shorten(item['title'], 90)}"
+                        f"{' · PDF' if has_file else ''}{' · DOI' if item.get('doi') else ''}")
+                ctk.CTkLabel(box, text=line, anchor="w", font=ctk.CTkFont(size=12)).pack(anchor="w", padx=24)
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.grid(row=2, column=0, sticky="e", padx=14, pady=10)
+        ctk.CTkButton(btns, text="Kapat", width=90, fg_color="transparent", border_width=1, text_color=TEXT,
+                      command=self.destroy).pack(side="left", padx=8)
+        if self.groups:
+            ctk.CTkButton(btns, text="Seçili Grupları Birleştir", width=190, command=self.merge).pack(side="left")
+
+    def merge(self):
+        chosen = [g for g, v in zip(self.groups, self.vars) if v.get()]
+        if not chosen or not messagebox.askyesno(
+                APP_NAME, f"{len(chosen)} grup birleştirilecek ({sum(len(g) - 1 for g in chosen)} kayıt silinecek). "
+                          "Devam edilsin mi?", parent=self):
+            return
+        lib, moved = self.app.library, 0
+        for group in chosen:
+            moved += lib.merge_items(group[0]["id"], [i["id"] for i in group[1:]], self.app.library_folder())
+        self.app.library_tab.refresh(keep_selection=False)
+        self.app.toast(f"{len(chosen)} grup birleştirildi" + (f"; {moved} fazla PDF ayrı klasöre taşındı." if moved else "."))
+        self.destroy()
+
+
 class ReadingNotes(ctk.CTkToplevel):
     """Kitabı (tarayıcıda, okuma uygulamasında ya da PDF'te) okurken her zaman üstte duran küçük not penceresi:
     sayfa + alıntı + yorum → kaynağın alıntı kartı. Okumayı ve kopyalamayı kullanıcı yapar."""
@@ -9813,6 +10372,11 @@ class LibraryTab:
         self.allseen_btn = ctk.CTkButton(acts, text="Yenileri İncelendi Say", width=170, command=self._mark_all_reviewed,
                                          **outline)
         self.allseen_btn.pack(side="left", padx=(16, 0))
+        self.tools_menu = ctk.CTkOptionMenu(acts, width=120, dynamic_resizing=False, command=self._tool_chosen,
+                                            values=["Atıf ağı ve eksik kaynaklar…", "Mükerrer kayıtları bul…",
+                                                    "PDF işaretlemelerini kartlara aktar…"])
+        self.tools_menu.set("Araçlar ▾")
+        self.tools_menu.pack(side="left", padx=(8, 0))
 
     def _build_table(self):
         from tkinter import ttk
@@ -10449,6 +11013,40 @@ class LibraryTab:
     def _mark_reviewed(self):
         self.lib.mark_reviewed([item["id"] for item in self.selected_items()])
         self.refresh()
+
+    def _tool_chosen(self, choice):
+        self.tools_menu.set("Araçlar ▾")
+        if choice.startswith("Atıf"):
+            win = getattr(self, "cite_win", None)
+            if win is not None and win.winfo_exists():
+                win.lift()
+            else:
+                self.cite_win = CitationWindow(self.app)
+        elif choice.startswith("Mükerrer"):
+            DuplicatesWindow(self.app)
+        elif choice.startswith("PDF"):
+            self._import_highlights()
+
+    def _import_highlights(self):
+        worker = getattr(self.app, "hl_worker", None)
+        if worker and worker.is_alive():
+            self.app.toast("İşaretlemeler zaten aktarılıyor.")
+            return
+        if not messagebox.askokcancel(
+                APP_NAME, "Kütüphanedeki PDF'lerde Acrobat, Edge ya da başka bir okuyucuyla yaptığınız vurgular, "
+                          "altı çizili yerler ve notlar sayfa numarasıyla alıntı kartlarına aktarılacak.\n\n"
+                          "Her PDF bir kez okunur (ilk seferde biraz sürebilir, arka planda çalışır); sonra yalnızca "
+                          "değişen dosyalara bakılır. Aynı kart iki kez eklenmez.", parent=self.parent):
+            return
+        self.app.hl_worker = HighlightWorker(self.lib, self.app.events)
+        self.app.hl_worker.start()
+
+    def on_highlights_done(self, added, sources, stopped):
+        self.refresh()
+        msg = (f"{sources} kaynaktaki {added} işaretleme alıntı kartı olarak eklendi." if added
+               else "Yeni işaretleme bulunamadı.")
+        self.app.toast(("Durduruldu. " if stopped else "") + msg)
+        self.app._log("success" if added else "info", "PDF işaretlemeleri: " + msg)
 
     def _mark_all_reviewed(self):
         """Listede görünen bütün 'yeni' kaynakları tek seferde incelendi sayar."""
@@ -11619,6 +12217,19 @@ class App(ctk.CTk):
         self.after(5 * 60_000, self._sync_tick)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    def _rebuild_citations_quietly(self):
+        """Dizin güncellenince atıf ağını arka planda yeniden hesaplar (PDF açmaz, birkaç saniye)."""
+        lib = self.library
+
+        def work():
+            try:
+                idx = ShardedIndex(readonly=True)
+                build_citation_graph(lib, idx)
+                idx.close()
+            except Exception:
+                diag_exception("atıf ağı (arka plan)")
+        threading.Thread(target=work, daemon=True).start()
+
     def _index_tick(self):
         """Metin dizinini 10 dakikada bir (yalnızca değişenler için) günceller."""
         try:
@@ -12406,6 +13017,21 @@ class App(ctk.CTk):
                                                      "okundu (arka planda)…")
         elif kind == "index_done":
             self.scan_tab.on_index_done(*message[1:])
+            if message[1] and not message[2]:
+                self._rebuild_citations_quietly()
+        elif kind == "cite_done":
+            win = getattr(self.library_tab, "cite_win", None)
+            if win is not None and win.winfo_exists():
+                win.on_built(message[1])
+        elif kind == "cite_links":
+            win = getattr(self.library_tab, "cite_win", None)
+            if win is not None and win.winfo_exists():
+                win.on_links(*message[1:])
+        elif kind == "hl":
+            n, total = message[1:]
+            self.library_tab.count_label.configure(text=f"PDF işaretlemeleri okunuyor {n}/{total}…")
+        elif kind == "hl_done":
+            self.library_tab.on_highlights_done(*message[1:])
         elif kind == "isbn_done":
             self.library_tab.on_isbn_done(*message[1:])
         elif kind == "retry_wait":
