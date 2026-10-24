@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.35"
+APP_VERSION = "2.36"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -3034,6 +3034,7 @@ _EXTRA_COLUMNS = {
     "issn": "TEXT DEFAULT ''",          # derginin ISSN'leri ('1234-5678; 2345-6789'), Scopus eşleştirmesi için
     "pdf_tried": "TEXT DEFAULT ''",     # PDF'siz kaynak için en son ne zaman PDF arandı (YYYY-AA-GG)
     "no": "INTEGER DEFAULT 0",          # kayıt numarası: 1, 2, 3… (eklenme sırası, hiç değişmez)
+    "ai_ozet": "TEXT DEFAULT ''",       # Claude'un kaynağı okuyup kaydettiği yapılandırılmış özet
 }
 
 
@@ -3450,7 +3451,8 @@ class Library:
             self.db.executemany("UPDATE items SET is_new=0 WHERE id=? AND is_new!=0", [(int(i),) for i in ids])
 
     def update(self, item_id: int, fields: dict):
-        allowed = set(RECORD_FIELDS) | {"file_path", "sha256", "notes", "is_new", "source", "matched", "pdf_tried"}
+        allowed = set(RECORD_FIELDS) | {"file_path", "sha256", "notes", "is_new", "source", "matched", "pdf_tried",
+                                        "ai_ozet"}
         values = {}
         for key, value in fields.items():
             if key not in allowed:
@@ -6763,6 +6765,11 @@ class PassageIndex:
                                                      label TEXT, text TEXT, folded TEXT);
                 CREATE INDEX IF NOT EXISTS idx_pass_item ON passages(item_id);
                 """)
+                for table, column, decl in (("passages", "kind", "TEXT DEFAULT ''"),
+                                            ("docs", "page_offset", "INTEGER DEFAULT 0")):
+                    have = {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}
+                    if column not in have:
+                        self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
                 # yer kazanmak için içeriksiz dizin (SQLite 3.43+); eski SQLite'ta içerik passages'tan okunur
                 for ddl in ("CREATE VIRTUAL TABLE IF NOT EXISTS pfts USING fts5(folded, content='', "
                             "contentless_delete=1, tokenize='unicode61 remove_diacritics 2')",
@@ -6776,6 +6783,8 @@ class PassageIndex:
         row = self.db.execute("SELECT sql FROM sqlite_master WHERE name='pfts'").fetchone()
         self.fts = bool(row)
         self.contentless = bool(row) and "contentless_delete" in (row[0] or "")
+        self.has_kind = "kind" in {r[1] for r in self.db.execute("PRAGMA table_info(passages)")}
+        self.has_offset = "page_offset" in {r[1] for r in self.db.execute("PRAGMA table_info(docs)")}
 
     def close(self):
         with self.lock:
@@ -6785,19 +6794,39 @@ class PassageIndex:
         with self.lock:
             return dict(self.db.execute("SELECT item_id, sig FROM docs"))
 
-    def put(self, item_id, sig, passages, paged):
-        """passages: [(sayfa, etiket, metin)]"""
+    def put(self, item_id, sig, passages, paged, page_offset=0):
+        """passages: [(sayfa, etiket, metin[, tür, bağlam])] — bağlam (başlık, bölüm adı) yalnızca aramaya
+        katılır, gösterilmez (bağlamsal BM25)."""
         with self.lock, self.db:
             self._drop(item_id)
-            for page, label, text in passages:
-                cur = self.db.execute("INSERT INTO passages (item_id, page, label, text, folded) VALUES (?,?,?,?,?)",
-                                      (item_id, page, label, text, "" if self.contentless else fold(text)))
+            for entry in passages:
+                page, label, text = entry[:3]
+                kind = entry[3] if len(entry) > 3 else ""
+                context = entry[4] if len(entry) > 4 else ""
+                searchable = fold((context + " | " if context else "") + text)
+                if self.has_kind:
+                    cur = self.db.execute("INSERT INTO passages (item_id, page, label, text, folded, kind) "
+                                          "VALUES (?,?,?,?,?,?)", (item_id, page, label, text,
+                                                                   "" if self.contentless else searchable, kind))
+                else:
+                    cur = self.db.execute("INSERT INTO passages (item_id, page, label, text, folded) VALUES (?,?,?,?,?)",
+                                          (item_id, page, label, text, "" if self.contentless else searchable))
                 if self.fts:
-                    self.db.execute("INSERT INTO pfts (rowid, folded) VALUES (?, ?)", (cur.lastrowid, fold(text)))
-            self.db.execute("INSERT OR REPLACE INTO docs VALUES (?,?,?,?,?,?)",
-                            (item_id, sig, len({p for p, _, _ in passages}),
-                             sum(len(t) for p, _, t in passages if p != 0), int(paged or 0),
+                    self.db.execute("INSERT INTO pfts (rowid, folded) VALUES (?, ?)", (cur.lastrowid, searchable))
+            self.db.execute("INSERT OR REPLACE INTO docs (item_id, sig, pages, chars, paged, indexed) "
+                            "VALUES (?,?,?,?,?,?)",
+                            (item_id, sig, len({e[0] for e in passages}),
+                             sum(len(e[2]) for e in passages if e[0] != 0), int(paged or 0),
                              datetime.now().strftime("%Y-%m-%d %H:%M")))
+            if self.has_offset and page_offset:
+                self.db.execute("UPDATE docs SET page_offset=? WHERE item_id=?", (int(page_offset), item_id))
+
+    def page_offset(self, item_id) -> int:
+        if not self.has_offset:
+            return 0
+        with self.lock:
+            row = self.db.execute("SELECT page_offset FROM docs WHERE item_id=?", (item_id,)).fetchone()
+        return int(row[0] or 0) if row else 0
 
     def _drop(self, item_id):
         if self.fts:
@@ -6855,14 +6884,16 @@ class PassageIndex:
                 break
         return word
 
-    def search(self, query, allowed=None, limit=15, per_item=2) -> list:
-        """[(item_id, sayfa, etiket, metin, skor)] — en ilgiliden başlayarak."""
-        return rank_hits(self.raw(query), query, allowed, limit, per_item)
+    def search(self, query, allowed=None, limit=15, per_item=2, kinds=None) -> list:
+        """[(item_id, sayfa, etiket, metin, skor, tür)] — en ilgiliden başlayarak."""
+        return rank_hits(self.raw(query, kinds), query, allowed, limit, per_item)
 
-    def raw(self, query) -> list:
+    def raw(self, query, kinds=None) -> list:
+        """[(kimlik, sayfa, etiket, metin, skor, tür)] — kinds verilirse yalnızca o türdeki parçalar."""
         terms = self._terms(query)
         if not terms:
             return []
+        kind_col = "p.kind" if self.has_kind else "''"
         phrases = [fold(p) for p in re.findall(r'"([^"]+)"', query)]
         with self.lock:
             if self.fts:
@@ -6872,23 +6903,30 @@ class PassageIndex:
                 if phrases_ok:
                     near = " AND ".join(f'"{ph}"' for ph in phrases_ok)
                     match = f"({near}) OR ({match})" if match else near
+                where = ""
+                params = [match]
+                if kinds and self.has_kind:
+                    where = " AND p.kind IN (" + ",".join("?" * len(kinds)) + ")"
+                    params += list(kinds)
                 try:
                     rows = self.db.execute(
-                        "SELECT p.item_id, p.page, p.label, p.text, bm25(pfts) AS score FROM pfts "
-                        "JOIN passages p ON p.id = pfts.rowid WHERE pfts MATCH ? ORDER BY score LIMIT 3000",
-                        (match,)).fetchall()
+                        f"SELECT p.item_id, p.page, p.label, p.text, bm25(pfts) AS score, {kind_col} FROM pfts "
+                        f"JOIN passages p ON p.id = pfts.rowid WHERE pfts MATCH ?{where} ORDER BY score LIMIT 3000",
+                        params).fetchall()
                 except sqlite3.OperationalError:
                     rows = []
-                rows = [(a, b, c, d, -e) for a, b, c, d, e in rows]
+                rows = [(a, b, c, d, -e, k or "") for a, b, c, d, e, k in rows]
             else:
                 like = [f"%{self.stem(w)}%" for w in terms]
-                sql = "SELECT item_id, page, label, text, folded FROM passages WHERE " + \
-                      " OR ".join(["folded LIKE ?"] * len(like))
+                sql = f"SELECT item_id, page, label, text, folded, {kind_col.replace('p.', '')} FROM passages WHERE (" + \
+                      " OR ".join(["folded LIKE ?"] * len(like)) + ")"
                 rows = []
-                for a, b, c, d, f in self.db.execute(sql, like).fetchall():
+                for a, b, c, d, f, k in self.db.execute(sql, like).fetchall():
+                    if kinds and (k or "") not in kinds:
+                        continue
                     score = sum(self.stem(w) in f for w in terms) + \
                         sum(2 for ph in phrases if ph in f)
-                    rows.append((a, b, c, d, float(score)))
+                    rows.append((a, b, c, d, float(score), k or ""))
                 rows.sort(key=lambda r: -r[4])
         return rows
 
@@ -6900,23 +6938,150 @@ def rank_hits(rows, query, allowed=None, limit=15, per_item=2) -> list:
     def coverage(text):
         f = fold(text)
         return sum(1 for w in terms if w in f)
-    rows = sorted(rows, key=lambda r: (-coverage(r[3]), -r[4]))
+    # kaynakça sayfalarındaki geçişler (yalnızca atıf) en sona
+    rows = sorted(rows, key=lambda r: ((r[5] if len(r) > 5 else "") == "kaynakça", -coverage(r[3]), -r[4]))
     out, per = [], {}
-    for item_id, page, label, text, score in rows:
+    for row in rows:
+        item_id, page, label, text, score = row[:5]
         if allowed is not None and item_id not in allowed:
             continue
         if per.get(item_id, 0) >= per_item:
             continue
         per[item_id] = per.get(item_id, 0) + 1
-        out.append((item_id, page, label, text, score))
+        out.append(tuple(row))
         if len(out) >= limit:
             break
     return out
 
 
 def item_signature(item) -> str:
-    return item.get("sha256") or ("meta:" + hashlib.sha1(
+    base = item.get("sha256") or ("meta:" + hashlib.sha1(
         (str(item.get("file_path")) + str(item.get("title")) + str(item.get("notes"))).encode("utf-8")).hexdigest())
+    extra = hashlib.sha1((str(item.get("ai_ozet") or "") + "|" + str(item.get("pages") or "")).encode("utf-8")).hexdigest()[:8]
+    return f"{INDEX_VERSION}|{base}|{extra}"
+
+
+INDEX_VERSION = "v3"                      # dizin biçimi değişince bütün kaynaklar yeniden işlenir
+
+_REFS_RE = re.compile(r"^(?:\d+\.?\s*)?(kaynakca|kaynaklar|references?|bibliography|works cited|literatur(?:verzeichnis)?|"
+                      r"referanslar|bibliyografya|bibliografia|bibliographie|referencias|kullanilan kaynaklar|"
+                      r"yararlanilan kaynaklar|notes and references|sources)\s*:?$")
+_HEAD_WORDS_RE = re.compile(r"^(?:\d+(?:\.\d+)*\.?\s+)?(giris|sonuc|sonuclar|tartisma|bulgular|yontem|yontem ve|"
+                            r"amac|oz|ozet|abstract|introduction|conclusion|conclusions|discussion|method|methods|"
+                            r"methodology|results|findings|literature review|alanyazin|kuramsal cerceve|"
+                            r"theoretical framework|ekler|appendix|acknowledg\w*|tesekkur)\b")
+
+
+def printed_page_offset(pages, item) -> int:
+    """PDF sayfa sırası → basılı sayfa numarası farkı. Önce sayfaların üst/alt satırlarındaki numaralardan,
+    olmazsa künyedeki sayfa aralığından (555–580) bulunur. 0: bulunamadı."""
+    if any(label for _, label, _ in pages):
+        return 0                                       # yayıncı sayfa etiketi koymuş; o kullanılır
+    diffs = {}
+    for n, _, text in pages:
+        lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+        seen = set()
+        for line in lines[:3] + lines[-3:]:
+            for num in re.findall(r"(?<![\d.,/-])(\d{1,4})(?![\d.,/-])", line):
+                v = int(num)
+                if 1900 <= v <= 2100 or v == 0 or v in seen:
+                    continue
+                seen.add(v)
+                diffs[v - n] = diffs.get(v - n, 0) + 1
+    if diffs:
+        best, count = max(diffs.items(), key=lambda kv: kv[1])
+        if best > 0 and count >= max(3, len(pages) * 0.3):
+            return best
+    m = re.match(r"\s*(\d+)\s*[-–—]\s*(\d+)", str(item.get("pages") or ""))
+    if m:
+        start, end = int(m.group(1)), int(m.group(2))
+        span = end - start + 1
+        if start > 1 and span == len(pages):
+            return start - 1
+        if start > 1 and span == len(pages) - 1:           # başta dergi kapak sayfası
+            return start - 2
+    return 0
+
+
+def strip_running_lines(pages) -> list:
+    """Her sayfada tekrarlanan üst/alt bilgileri (dergi adı, yazar, sayfa numarası) atar."""
+    if len(pages) < 4:
+        return pages
+
+    def key(line):
+        return re.sub(r"\d+", "#", fold(line)).strip()
+    counts = {}
+    for _, _, text in pages:
+        lines = [l for l in (text or "").splitlines() if l.strip()]
+        for k in {key(l) for l in lines[:3] + lines[-3:]}:
+            counts[k] = counts.get(k, 0) + 1
+    noisy = {k for k, c in counts.items() if c >= max(3, len(pages) * 0.4) and len(k) <= 160}
+    out = []
+    for n, label, text in pages:
+        lines = (text or "").splitlines()
+        idx = [i for i, l in enumerate(lines) if l.strip()]
+        edge = set(idx[:3] + idx[-3:])
+        kept = [l for i, l in enumerate(lines)
+                if not (i in edge and (key(l) in noisy or re.fullmatch(r"[#\s\-–|.]*(sayfa|page|s\.)?[#\s\-–|.]*",
+                                                                       key(l))))]
+        out.append((n, label, "\n".join(kept)))
+    return out
+
+
+def _heading(line: str):
+    """Satır bir bölüm başlığıysa (başlık, kaynakça_mı), değilse None."""
+    raw = line.strip()
+    if not raw or len(raw) > 90 or raw.endswith((".", ",", ";")) and not re.match(r"^\d+\.\s", raw):
+        return None
+    if re.search(r"(\.\s?){4,}|…{2,}|\s\d+\s*$", raw) and re.search(r"\d\s*$", raw):
+        return None                                      # içindekiler satırı ('1.2 Başlık ........ 44')
+    f = re.sub(r"\s+", " ", fold(raw)).strip(" :")
+    if _REFS_RE.match(f):
+        return raw, True
+    letters = [c for c in raw if c.isalpha()]
+    upper = len(letters) >= 4 and sum(c.isupper() for c in letters) / len(letters) > 0.8 and len(raw.split()) <= 10
+    numbered = re.match(r"^\d+(\.\d+){0,3}\.?\s+[A-ZÇĞİÖŞÜ]", raw) and len(raw.split()) <= 12
+    if _HEAD_WORDS_RE.match(f) and len(raw.split()) <= 8 or upper or numbered:
+        return raw, False
+    return None
+
+
+def structured_passages(pages, title="", offset=0) -> list:
+    """[(sayfa, basılı_etiket, metin, tür, bağlam)] — bölüm başlıklarını izler, kaynakçayı işaretler."""
+    out, heading, in_refs = [], "", False
+    half = len(pages) / 2
+    for n, label, text in pages:
+        label = label or (str(n + offset) if offset and n + offset > 0 else "")
+        block = []
+
+        def flush():
+            body = "\n".join(block).strip()
+            for part in split_passages(body):
+                out.append((n, label, part, "kaynakça" if in_refs else "", f"{title} · {heading}" if heading else title))
+            block.clear()
+        for line in (text or "").splitlines():
+            h = _heading(line)
+            if h:
+                flush()
+                heading = h[0]
+                if h[1] and n >= half:
+                    in_refs = True
+                elif not h[1] and in_refs and re.match(r"(?i)^(ek|ekler|appendix|annex)", fold(h[0])):
+                    in_refs = False
+                continue
+            block.append(line)
+        flush()
+    return out
+
+
+def summary_passage(library, item) -> tuple:
+    """Belge düzeyi katman: künye + anahtar kelimeler + özet (Öz/Abstract) + Claude özeti tek parça."""
+    people = "; ".join(f"{p.get('family', '')} {p.get('given', '')}".strip() for p in item.get("authors") or [])
+    abstract = abstract_of(library.get_fulltext(item["id"]), 1500)
+    text = " · ".join(x for x in (item.get("title"), people, str(item.get("year") or ""), item.get("container"),
+                                  item.get("keywords"), ", ".join(item.get("tags") or []), abstract,
+                                  item.get("ai_ozet")) if x)
+    return (0, "künye", text, "künye", "")
 
 
 def build_passages(library, item, cancel=None) -> tuple:
@@ -6933,8 +7098,12 @@ def build_passages(library, item, cancel=None) -> tuple:
         except Exception as exc:
             diag(f"dizin: {Path(path).name}: {describe_error(exc)}", throttle=True)
             pages = []
-        # taranmış (metni olmayan) sayfalar: Windows metin tanıması
+        # taranmış (metni olmayan) sayfalar: daha önce okunduysa kayıtlı metinden, yoksa Windows metin tanıması
         blank = [n for n, _, t in pages if len(t.strip()) < 30]
+        stored_pages = library.get_fulltext(item["id"]).split("\f") if blank else []
+        if blank and len(stored_pages) == len(pages) and sum(len(x) for x in stored_pages) > 200:
+            pages = [(n, label, stored_pages[n - 1] if len(text.strip()) < 30 else text) for n, label, text in pages]
+            blank, paged = [], 2
         if path.lower().endswith(".pdf") and blank and len(blank) >= max(1, len(pages) // 5) \
                 and not ocr_unavailable_reason():
             try:
@@ -6942,7 +7111,7 @@ def build_passages(library, item, cancel=None) -> tuple:
                 if found:
                     pages = [(n, label, found.get(n) or text) for n, label, text in pages]
                     paged = 2
-                    text_all = "\n".join(t for _, _, t in pages)
+                    text_all = "\f".join(t for _, _, t in pages)           # sayfa sınırları korunur
                     if len(text_all.strip()) > 200:
                         library.set_fulltext(item["id"], text_all[:FULLTEXT_MAX_CHARS])
             except Exception as exc:
@@ -6952,10 +7121,16 @@ def build_passages(library, item, cancel=None) -> tuple:
         stored = library.get_fulltext(item["id"])           # PDF okunamadıysa ya da yoksa: özet/kayıtlı metin
         pages = [(0, "", stored)] if stored else []
         paged = paged if pages else (2 if paged == 2 else 0)
-    head = " · ".join(x for x in (item.get("title"), item.get("keywords"), ", ".join(item.get("tags") or [])) if x)
-    out = [(0, "künye", head)] if head else []
-    for page, label, text in pages:
-        out += [(page, label, part) for part in split_passages(text)]
+    offset = 0
+    if paged and pages and pages[0][0] != 0:
+        offset = printed_page_offset(pages, item)
+        pages = strip_running_lines(pages)
+        out = [summary_passage(library, item)] + structured_passages(pages, item.get("title") or "", offset)
+    else:
+        out = [summary_passage(library, item)]
+        for page, label, text in pages:
+            out += [(page, label, part, "", item.get("title") or "") for part in split_passages(text)]
+    build_passages.last_offset = offset
     return out, paged
 
 
@@ -7005,14 +7180,26 @@ class ShardedIndex:
             idx.close()
         self.shards = {}
 
-    def search(self, query, allowed=None, limit=15, per_item=2) -> list:
+    def search(self, query, allowed=None, limit=15, per_item=2, kinds=None) -> list:
         rows = []
         for name in self.names():
             try:
-                rows += self.shard(name).raw(query)
+                rows += self.shard(name).raw(query, kinds)
             except sqlite3.Error:
                 continue
         return rank_hits(rows, query, allowed, limit, per_item)
+
+    def page_offset(self, item_id, no=None) -> int:
+        names = [shard_name(no)] if no else self.names()
+        for name in names:
+            if name in self.names():
+                try:
+                    off = self.shard(name).page_offset(item_id)
+                except sqlite3.Error:
+                    off = 0
+                if off:
+                    return off
+        return 0
 
     def stats(self) -> dict:
         total = {"kaynak": 0, "parca": 0, "karakter": 0, "metinsiz": 0, "ocr": 0}
@@ -7170,10 +7357,12 @@ class IndexWorker(threading.Thread):
                     if n % 5 == 0:
                         self.events.put(("index", n, len(todo)))
                     name = shard_name(item.get("no"))
+                    build_passages.last_offset = 0
                     passages, paged = build_passages(self.library, item, self.cancel)
                     if self.cancel.is_set():
                         break
-                    index.shard(name).put(item["id"], item_signature(item), passages, paged)
+                    index.shard(name).put(item["id"], item_signature(item), passages, paged,
+                                          getattr(build_passages, "last_offset", 0))
                     dirty.add(name)
                     time.sleep(0.05)                            # arayüze nefes aldır
                     if remote is not None and time.time() - last_push > 10 * 60 and dirty:
@@ -7215,13 +7404,16 @@ def abstract_of(text: str, limit=900) -> str:
 MCP_INSTRUCTIONS = (
     "Bu araçlar kullanıcının kişisel akademik kütüphanesine (Akademik Kaynak İndirici; binlerce kaynak, PDF tam "
     "metinleriyle) erişir. Kullanıcı alanıyla ilgili bir soru sorduğunda, değerlendirme, derleme ya da fikir "
-    "istediğinde ÖNCE kütüphanede ara: metinde_ara ile bütün PDF'lerin içinde kavramın geçtiği sayfaları bul. "
+    "istediğinde ÖNCE kütüphanede ara: geniş sorularda kaynak_bul ile ilgili kaynakları seç, metinde_ara ile bütün "
+    "PDF'lerin içinde kavramın geçtiği sayfaları bul. "
     "Kullanıcı Türkçe yazar ama kütüphanede İngilizce ve başka dillerde (İspanyolca, Bulgarca, Almanca…; dağılım "
     "kutuphane_ozeti'nde) çok kaynak var: her aramada sorguyu bu dillere çevirip 'ceviriler' ile birlikte gönder, "
     "eş anlamlılarla birkaç arama yap. Genel bakış için kaynak_ozetleri; derin okuma için pdf_metni_oku. Yabancı "
     "kaynaklardan aktarılanları Türkçeye çevirerek yaz, doğrudan alıntıda özgün dili koru ya da çevirdiğini belirt. "
     "Yanıtını kütüphanedeki kaynaklara dayandır, her bilgi için APA metin içi atıf "
-    "ve sayfa ver ((Yazar, yıl, s. X)); kütüphanede olmayan genel bilgiyi ayrıca belirt. Önemli alıntıları "
+    "ve basılı sayfa ver ((Yazar, yıl, s. X)); kaynakça sayfalarındaki geçişleri bilgi kaynağı sayma. Bir kaynağı "
+    "derinlemesine okuduğunda ozet_kaydet ile yapılandırılmış özetini kaydet (sonraki sorular hızlanır). "
+    "Kütüphanede olmayan genel bilgiyi ayrıca belirt. Önemli alıntıları "
     "kullanıcı isterse alinti_karti_ekle ile kaydet. Kaynak silmeden önce açık onay al. Kaynakça APA 7'dir."
 )
 
@@ -7340,6 +7532,21 @@ class McpTools:
                  "kaynak_basina": {"type": "integer", "description": "Kaynak başına en fazla parça (varsayılan 2)"},
                  "limit": {"type": "integer", "description": "En fazla parça (varsayılan 15, en çok 40)"}},
               "required": ["sorgu"]}),
+            ("kaynak_bul", "Soruyla en ilgili KAYNAKLARI bulur (belge düzeyi: başlık, yazar, anahtar kelimeler, "
+                           "özet ve kayıtlı Claude özetleri üzerinde). Geniş bir soruda önce bununla okunacak "
+                           "kaynakları seçin, sonra metinde_ara / pdf_metni_oku ile içine inin.",
+             {"type": "object", "properties": {
+                 "sorgu": s("Konu/kavramlar"),
+                 "ceviriler": {"type": "array", "items": {"type": "string"},
+                               "description": "Sorgunun başka dillerdeki karşılıkları"},
+                 "limit": {"type": "integer", "description": "En fazla kaynak (varsayılan 15, en çok 40)"}},
+              "required": ["sorgu"]}),
+            ("ozet_kaydet", "Bir kaynağı okuduktan sonra onun yapılandırılmış özetini kütüphaneye kaydeder; sonraki "
+                            "sorularda bu özet arama ve yanıt için kullanılır (kütüphane böylece giderek 'öğrenir'). "
+                            "Biçim: Ana argüman · Yöntem/veri · Temel bulgular · Kavramlar · Sınırlılıklar · "
+                            "Kullanıcının alanına katkısı. Türkçe yazın; varsa önceki özetin üzerine yazar.",
+             {"type": "object", "properties": {"id": {"type": "integer"}, "ozet": s("Yapılandırılmış özet")},
+              "required": ["id", "ozet"]}),
             ("kaynak_ozetleri", "Birçok kaynağın kısa künyesini, özetini (Öz/Abstract), anahtar kelimelerini ve "
                                 "etiketlerini tek seferde verir; bir konunun ya da etiketin genel haritasını çıkarmak, "
                                 "okunacakları seçmek için.",
@@ -7423,7 +7630,7 @@ class McpTools:
         return index
 
     def t_metinde_ara(self, sorgu, etiket="", yil_min=None, yil_max=None, no_min=None, no_max=None,
-                      kaynak_basina=2, limit=15, ceviriler=None):
+                      kaynak_basina=2, limit=20, ceviriler=None):
         index = self._index()
         if index is None:
             raise ValueError("Metin dizini henüz hazır değil. Akademik Kaynak İndirici programını açık bırakın; "
@@ -7434,7 +7641,7 @@ class McpTools:
             if etiket or yil_min or yil_max or no_min or no_max:
                 allowed = {i["id"] for i in search_items(self.lib, "", etiket, "hepsi", False, yil_min, yil_max,
                                                          no_min, no_max)}
-            limit = max(1, min(int(limit or 15), 40))
+            limit = max(1, min(int(limit or 20), 40))
             per_item = max(1, min(int(kaynak_basina or 2), 5))
             queries = [sorgu] + [q for q in (ceviriler or []) if isinstance(q, str) and q.strip()][:6]
             lists = [index.search(q, allowed, limit=limit, per_item=per_item) for q in queries]
@@ -7457,7 +7664,8 @@ class McpTools:
             index.close()
         items = {}
         out = []
-        for item_id, page, label, text, score in hits:
+        for item_id, page, label, text, score, *rest in hits:
+            kind = rest[0] if rest else ""
             item = items.get(item_id) or self.lib.get(item_id)
             if not item:
                 continue
@@ -7467,13 +7675,15 @@ class McpTools:
                         "dil": _LANG_NAMES.get(guess_language(item), guess_language(item)),
                         "atif": intext_citation(item, shown if page else ""),
                         "sayfa": shown or ("künye/özet" if page == 0 else ""), "pdf_sayfasi": page or None,
+                        "bolum": "kaynakça (yalnızca atıf)" if kind == "kaynakça" else "",
                         "metin": text[:1500]})
         return {"sorgu": sorgu, "aranan": [sorgu] + list(ceviriler or []), "bulunan_parca": len(out),
                 "kaynak_sayisi": len(items),
                 "dizin": {"dizindeki_kaynak": stats["kaynak"], "kutuphanedeki_kaynak": self.lib.count(),
                           "metinsiz_pdf": stats["metinsiz"]},
                 "parcalar": out,
-                "not": "pdf_sayfasi, pdf_metni_oku'daki baslangic_sayfa değeridir; 'sayfa' basılı sayfa numarasıdır."}
+                "not": "Atıfta 'sayfa' (basılı sayfa numarası) kullanılır; pdf_sayfasi, pdf_metni_oku'daki "
+                       "baslangic_sayfa değeridir."}
 
     def t_baglantidan_oku(self, id, baslangic=0):
         item = self.lib.get(int(id))
@@ -7501,6 +7711,44 @@ class McpTools:
         return {"baslik": item["title"], "kaynak": source, "toplam_karakter": len(text), "baslangic": start,
                 "sonraki": start + len(chunk) if start + len(chunk) < len(text) else None, "metin": chunk}
 
+    def t_kaynak_bul(self, sorgu, ceviriler=None, limit=15):
+        index = self._index()
+        if index is None or not hasattr(index, "names"):
+            raise ValueError("Metin dizini henüz hazır değil; kutuphane_ara kullanılabilir.")
+        try:
+            limit = max(1, min(int(limit or 15), 40))
+            seen, hits = set(), []
+            for q in [sorgu] + [c for c in (ceviriler or []) if isinstance(c, str) and c.strip()][:6]:
+                for h in index.search(q, limit=limit, per_item=1, kinds=["künye"]):
+                    if h[0] not in seen:
+                        seen.add(h[0])
+                        hits.append(h)
+        finally:
+            index.close()
+        hits.sort(key=lambda h: -h[4])
+        out = []
+        for h in hits[:limit]:
+            item = self.lib.get(h[0])
+            if not item:
+                continue
+            out.append({"id": item["id"], "kayit_no": item.get("no") or 0, "atif": intext_citation(item),
+                        "baslik": item["title"], "dil": _LANG_NAMES.get(guess_language(item), guess_language(item)),
+                        "ozet": abstract_of(self.lib.get_fulltext(item["id"]), 700),
+                        "claude_ozeti": item.get("ai_ozet") or "",
+                        "pdf_var": bool(item["file_path"]) and Path(item["file_path"]).is_file()})
+        return {"sorgu": sorgu, "kaynaklar": out}
+
+    def t_ozet_kaydet(self, id, ozet):
+        item = self.lib.get(int(id))
+        if not item:
+            raise ValueError(f"{id} numaralı kaynak yok")
+        text = (ozet or "").strip()
+        if len(text) < 40:
+            raise ValueError("Özet çok kısa")
+        stamped = f"{text}\n\n[Claude özeti · {datetime.now():%d.%m.%Y}]"
+        self.lib.update(item["id"], {"ai_ozet": stamped})
+        return {"tamam": True, "kayit_no": item.get("no") or 0, "baslik": item["title"]}
+
     def t_kaynak_ozetleri(self, idler=None, etiket="", sorgu="", no_min=None, no_max=None, limit=40):
         if idler:
             items = [i for i in (self.lib.get(x) for x in _ids(idler)) if i]
@@ -7513,6 +7761,7 @@ class McpTools:
             out.append({"id": item["id"], "kayit_no": item.get("no") or 0,
                         "kunye": apa_text(item, "tr"), "anahtar_kelimeler": split_keywords(item.get("keywords", "")),
                         "etiketler": item.get("tags") or [], "ozet": abstract_of(text),
+                        "claude_ozeti": item.get("ai_ozet") or "",
                         "pdf_var": bool(item["file_path"]) and Path(item["file_path"]).is_file()})
         return {"toplam": len(items), "gosterilen": len(out), "kaynaklar": out}
 
@@ -7528,6 +7777,7 @@ class McpTools:
             "eklenme": item["added"], "kaynagi": item.get("source", ""), "tarama_eslesmesi": item.get("matched", ""),
             "kurum_erisimi_veritabani": database_for_doi(item["doi"]),
             "apa": apa_text(item, "tr"), "metin_ici_atif": intext_citation(item),
+            "claude_ozeti": item.get("ai_ozet") or "",
             "alinti_kartlari": [{"id": c["id"], "sayfa": c["page"], "alinti": c["quote"], "yorum": c["comment"],
                                  "atifla": card_citation_text(c, item)} for c in self.lib.cards(item["id"])],
         })
@@ -7564,10 +7814,24 @@ class McpTools:
                                                        language=guess_language(item)).items() if t})
             except Exception as exc:
                 diag(f"Claude OCR: {describe_error(exc)}", throttle=True)
+        offset = 0
+        try:
+            idx = ShardedIndex(readonly=True)
+            offset = idx.page_offset(item["id"], item.get("no"))
+            idx.close()
+        except Exception:
+            offset = 0
+        labels = {}
+        try:
+            labels = {i + 1: str(v) for i, v in enumerate(reader.page_labels)}
+        except Exception:
+            labels = {}
         for n, text in texts.items():
-            pages.append(f"--- sayfa {n} ---\n{text}")
+            printed = labels.get(n) if labels.get(n) and labels.get(n) != str(n) else (str(n + offset) if offset else "")
+            pages.append(f"--- PDF sayfası {n}" + (f" (basılı s. {printed})" if printed else "") + f" ---\n{text}")
         body = "\n".join(pages)[:60_000]
-        return {"baslik": item["title"], "toplam_sayfa": len(reader.pages), "metin": body}
+        return {"baslik": item["title"], "toplam_sayfa": len(reader.pages), "metin": body,
+                "not": "Atıfta 'basılı s.' numarasını kullanın (yoksa PDF sayfası)."}
 
     def t_etiket_ekle(self, idler, etiketler):
         for i in _ids(idler):
@@ -9578,6 +9842,11 @@ class LibraryTab:
         self._build_record_tab(tabs.add("Künye"))
         self._build_cards_tab(tabs.add("Alıntı Kartları"))
         self._build_apa_tab(tabs.add("APA"))
+        st = tabs.add("Claude Özeti")
+        st.grid_columnconfigure(0, weight=1)
+        st.grid_rowconfigure(0, weight=1)
+        self.summary_box = ctk.CTkTextbox(st, wrap="word", border_width=1, font=ctk.CTkFont(size=13))
+        self.summary_box.grid(row=0, column=0, sticky="nsew")
 
     def _field(self, parent, row, label, widget):
         ctk.CTkLabel(parent, text=label, font=ctk.CTkFont(size=12), text_color=MUTED,
@@ -9981,10 +10250,20 @@ class LibraryTab:
         self.select(item_id)
         self.app.toast("Künye kaydedildi.")
 
+    def _render_summary(self, rec):
+        self.summary_box.configure(state="normal")
+        self.summary_box.delete("1.0", "end")
+        self.summary_box.insert("1.0", (rec or {}).get("ai_ozet") or
+                                "Bu kaynağın henüz Claude özeti yok.\n\nClaude Desktop'ta örneğin "
+                                f"\"No {(rec or {}).get('no', '?')} numaralı kaynağı oku ve özetini kaydet\" "
+                                "diyebilirsiniz; özet buraya ve arama dizinine girer.")
+        self.summary_box.configure(state="disabled")
+
     def _render_apa(self):
         if not self.current:
             return
         rec = self.lib.get(self.current["id"])
+        self._render_summary(rec)
         lang = "tr" if self.apa_lang.get() == "Türkçe" else "en"
         box = self.apa_box
         box.configure(state="normal")
