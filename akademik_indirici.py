@@ -6634,6 +6634,7 @@ def ocr_pdf(path, pages=None, language="", cancel=None, pause=0.0) -> dict:
     """PDF sayfalarını resme çizip Windows OCR ile yazıya çevirir. pages: 1'den başlayan sayfa numaraları
     (None: hepsi, en fazla OCR_PAGE_LIMIT). Dönüş: {sayfa_no: metin}"""
     import asyncio
+    import warnings
     from winrt.windows.data.pdf import PdfDocument, PdfPageRenderOptions
     from winrt.windows.globalization import Language
     from winrt.windows.graphics.imaging import BitmapDecoder, BitmapPixelFormat, SoftwareBitmap
@@ -6677,7 +6678,9 @@ def ocr_pdf(path, pages=None, language="", cancel=None, pause=0.0) -> dict:
             options.destination_width = max(1, int(size.width * scale))
             options.destination_height = max(1, int(size.height * scale))
             stream = InMemoryRandomAccessStream()
-            await page.render_with_options_to_stream_async(stream, options)
+            with warnings.catch_warnings():                 # pywinrt: eski ad uyarısı (işlev aynı)
+                warnings.simplefilter("ignore", DeprecationWarning)
+                await page.render_with_options_to_stream_async(stream, options)
             decoder = await BitmapDecoder.create_async(stream)
             bitmap = await decoder.get_software_bitmap_async()
             if bitmap.bitmap_pixel_format not in (BitmapPixelFormat.BGRA8, BitmapPixelFormat.GRAY8):
