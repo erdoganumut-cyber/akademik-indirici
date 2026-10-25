@@ -20,7 +20,7 @@ KÜTÜPHANEM
   İndirilenler klasörünü izleyip indirilen PDF'i doğru kaynağa bağlama.
 
 TARAMA
-- Haftada bir, düzenlenebilir anahtar kelime gruplarıyla DergiPark (OAI-PMH) ve Crossref'i
+- Haftada bir, düzenlenebilir anahtar kelime gruplarıyla DergiPark (OAI-PMH), Crossref, OpenAlex, ERIC ve YÖK Tez'i
   tarar; bulunanları 'yeni' işaretiyle kütüphaneye ekler, açık erişimli PDF'leri indirir
   ve tarayıcıda açılan bir rapor yazar. Windows görev zamanlayıcısıyla uygulama
   kapalıyken de çalışır (exe --tara).
@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.37"
+APP_VERSION = "2.38"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -84,6 +84,8 @@ OPENALEX_API = "https://api.openalex.org/works"
 S2_API = "https://api.semanticscholar.org/graph/v1/paper/"
 CORE_API = "https://api.core.ac.uk/v3/search/works"
 CORE_KEY_PAGE = "https://core.ac.uk/services/api"
+OPENALEX_KEY_PAGE = "https://openalex.org/settings/api"
+ERIC_API = "https://api.ies.ed.gov/eric/"
 GOOGLE_BOOKS_API = "https://www.googleapis.com/books/v1/volumes"
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -825,7 +827,7 @@ class HostThrottle:
     DEFAULT_GAP = 1.0
     GAPS = {"dergipark.org.tr": 3.0, "tez.yok.gov.tr": 1.5, "doi.org": 0.5, "api.crossref.org": 0.2,
             "api.unpaywall.org": 0.3, "api.openalex.org": 0.2, "scholar.google.com": 15.0,
-            "api.semanticscholar.org": 1.5, "api.core.ac.uk": 2.0,
+            "api.semanticscholar.org": 1.5, "api.core.ac.uk": 2.0, "api.ies.ed.gov": 1.0,
             "127.0.0.1": 0.0, "localhost": 0.0}
     MAX_GAP = 20.0
     MAX_BLOCK = 60.0                 # bundan uzun dinlenme gerekiyorsa beklemeden RateLimited verilir
@@ -2607,7 +2609,7 @@ def find_open_copies(session, item, email="", core_key="") -> dict:
 
     # OpenAlex
     try:
-        params = {"mailto": email} if email else {}
+        params = openalex_params(email)
         if doi:
             r = session.get(f"{OPENALEX_API}/doi:{quote(doi, safe='/:;()._-')}", params=params, timeout=API_TIMEOUT)
             works = [r.json()] if r.ok else []
@@ -3585,7 +3587,7 @@ class Library:
 
 def catalog_pdf(library, session, path: Path, sha: str, meta=None, url="", doi=None,
                 tags=(), log=None, library_folder=None, move=True, source="", is_new=False,
-                matched="", auto_tags=None):
+                matched="", auto_tags=None, known=None):
     """İndirilen ya da taranan bir PDF'i künyesiyle kütüphaneye ekler; dosyayı kütüphane
     klasörüne 'Soyad (Yıl) - Başlık.pdf' adıyla yerleştirir. Dönüş: (kimlik, yeni_mi)"""
     path = Path(path)
@@ -3606,8 +3608,8 @@ def catalog_pdf(library, session, path: Path, sha: str, meta=None, url="", doi=N
     info_rec = {}
     if info.get("title") and len(info["title"]) > 10 and not re.search(r"\.docx?$|untitled|microsoft", info["title"], re.I):
         info_rec = {"title": info["title"], "authors": text_to_people(info.get("author", ""))}
-    record = merge_records(cr or {}, merge_records(page_rec, merge_records(
-        file_rec if " - " in path.stem else {}, merge_records(info_rec, file_rec))))
+    record = merge_records(cr or {}, merge_records(known or {}, merge_records(page_rec, merge_records(
+        file_rec if " - " in path.stem else {}, merge_records(info_rec, file_rec)))))
     if doi and not record.get("doi"):
         record["doi"] = doi
     if url and not record.get("url") and not is_doi_host(url):
@@ -5045,6 +5047,183 @@ def search_crossref(session, query: str, since: datetime, rows: int = 100):
     return out
 
 
+# ── OpenAlex ve ERIC (resmî, açık arama arayüzleri) ──────────────────────────
+
+def openalex_params(email="") -> dict:
+    """OpenAlex isteklerine eklenecek kimlik: kullanıcının ücretsiz anahtarı (varsa) ve e-postası."""
+    params = {}
+    try:
+        key = (load_settings().get("openalex_api_key") or "").strip()
+    except Exception:
+        key = ""
+    if key:
+        params["api_key"] = key
+    if email:
+        params["mailto"] = email
+    return params
+
+
+_OPENALEX_TYPES = {"article": "article", "review": "article", "letter": "article", "editorial": "article",
+                   "book-chapter": "chapter", "book": "book", "dissertation": "phd",
+                   "proceedings-article": "conference", "preprint": "article", "report": "other"}
+
+
+def openalex_abstract(inverted) -> str:
+    """OpenAlex özeti kelime → konum listesi olarak verir; düz metne çevirir."""
+    if not isinstance(inverted, dict):
+        return ""
+    words = []
+    for word, positions in inverted.items():
+        for pos in positions or []:
+            if isinstance(pos, int) and pos < 5000:
+                words.append((pos, word))
+    return " ".join(w for _, w in sorted(words))
+
+
+def record_from_openalex(w: dict) -> dict:
+    loc = w.get("primary_location") or {}
+    src = loc.get("source") or {}
+    bib = w.get("biblio") or {}
+    first, last = bib.get("first_page") or "", bib.get("last_page") or ""
+    authors = []
+    for a in w.get("authorships") or []:
+        person = parse_person(((a.get("author") or {}).get("display_name")) or a.get("raw_author_name") or "")
+        if person:
+            authors.append(person)
+    best = w.get("best_oa_location") or {}
+    oa = w.get("open_access") or {}
+    rtype = _OPENALEX_TYPES.get(w.get("type") or "", "other")
+    if rtype == "article" and not src.get("display_name"):
+        rtype = "other"
+    return {
+        "title": clean_text(w.get("title") or w.get("display_name") or ""), "authors": authors,
+        "year": str(w.get("publication_year") or ""), "type": rtype,
+        "container": clean_text(src.get("display_name") or ""), "volume": str(bib.get("volume") or ""),
+        "issue": str(bib.get("issue") or ""),
+        "pages": f"{first}-{last}" if first and last and first != last else str(first or ""),
+        "publisher": clean_text(src.get("host_organization_name") or ""),
+        "doi": normalize_doi(w.get("doi") or "") or "", "language": w.get("language") or "",
+        "issn": join_issns(src.get("issn") or []),
+        "keywords": ", ".join(k.get("display_name", "") for k in (w.get("keywords") or [])[:8]
+                              if isinstance(k, dict) and k.get("display_name")),
+        "description": clean_text(openalex_abstract(w.get("abstract_inverted_index"))),
+        "url": loc.get("landing_page_url") or oa.get("oa_url") or w.get("id") or "",
+        "pdf_url": best.get("pdf_url") or "", "source": "OpenAlex",
+    }
+
+
+def _openalex_get(session, params):
+    r = session.get(OPENALEX_API, params=params, timeout=(15, 60), headers={"Accept": "application/json"})
+    if r.status_code == 429:
+        raise RateLimited("OpenAlex günlük ücretsiz kullanım sınırı doldu"
+                          + ("" if params.get("api_key") else " (anahtarsız sınır düşüktür; Tarama sekmesinden "
+                                                              "ücretsiz anahtar eklenebilir)"))
+    if r.status_code in (401, 403):
+        raise DownloadError("OpenAlex anahtarı kabul edilmedi (Tarama sekmesindeki anahtarı kontrol edin)")
+    if r.status_code == 400:
+        raise DownloadError(f"OpenAlex sorguyu reddetti (HTTP 400): {r.text[:200]}")
+    r.raise_for_status()
+    return r.json()
+
+
+def search_openalex(session, query: str, since=None, limit: int = 100, newest_first=False, email=""):
+    """OpenAlex'te arar (başlık, özet ve tam metin). since: bu yayın tarihinden sonrakiler.
+    newest_first: haftalık taramada en yeniler; geçmişe dönük taramada ilgililik sırası."""
+    params = dict(openalex_params(email), search=query, **{"per-page": min(200, max(limit, 1))})
+    if since is not None:
+        params["filter"] = f"from_publication_date:{since.strftime('%Y-%m-%d')}"
+    if newest_first:
+        params["sort"] = "publication_date:desc"
+    params["cursor"] = "*"
+    got = 0
+    while got < limit:
+        data = _openalex_get(session, params)
+        results = data.get("results") or []
+        for w in results:
+            if isinstance(w, dict) and (w.get("title") or w.get("display_name")):
+                yield record_from_openalex(w)
+        got += len(results)
+        cursor = (data.get("meta") or {}).get("next_cursor")
+        if not results or not cursor or len(results) < params["per-page"]:
+            return
+        params = dict(params, cursor=cursor)
+
+
+_ERIC_TYPES = (("Doctoral Dissertations", "phd"), ("Masters Theses", "masters"), ("Journal Articles", "article"),
+               ("Books", "book"), ("Proceedings", "conference"), ("Meeting Papers", "conference"))
+
+
+def record_from_eric(doc: dict) -> dict:
+    def as_list(v):
+        return v if isinstance(v, list) else [v] if v else []
+    eid = str(doc.get("id") or "")
+    ptypes = " ".join(as_list(doc.get("publicationtype")))
+    rtype = next((t for key, t in _ERIC_TYPES if key in ptypes), "other")
+    langs = " ".join(as_list(doc.get("language")))
+    full = str(doc.get("e_fulltextauth") or "").strip().lower() in ("1", "true", "t", "yes")
+    return {
+        "title": clean_text(doc.get("title") or ""), "authors": [p for p in map(parse_person, as_list(doc.get("author"))) if p],
+        "year": str(doc.get("publicationdateyear") or ""), "type": rtype,
+        "container": clean_text(doc.get("source") or "") if rtype == "article" else "",
+        "publisher": clean_text(doc.get("source") or "") if rtype in ("book", "other") else "",
+        "issn": join_issns(find_issns(" ".join(as_list(doc.get("issn"))))),
+        "language": "en" if "English" in langs or not langs else "",
+        "description": clean_text(doc.get("description") or ""),
+        "subjects": [clean_text(x) for x in as_list(doc.get("subject"))],
+        "url": f"https://eric.ed.gov/?id={eid}" if eid else (doc.get("url") or ""),
+        "pdf_url": f"https://files.eric.ed.gov/fulltext/{eid}.pdf" if full and eid else "",
+        "source": "ERIC", "doi": "",
+    }
+
+
+ERIC_FIELDS = ("id,title,author,source,publicationdateyear,description,subject,publicationtype,"
+               "issn,language,e_fulltextauth,url")
+
+
+def batch_terms(queries, size=8) -> list:
+    """Haftalık taramada terimleri 'VEYA' ile birleştirir: OpenAlex'in günlük ücretsiz sınırı ve
+    ERIC'e gereksiz yük için 100 terim yerine ~13 sorgu."""
+    terms = list(dict.fromkeys(q for _, q in queries if q and '"' not in q))
+    out = []
+    for i in range(0, len(terms), size):
+        part = terms[i:i + size]
+        out.append(("", " OR ".join(f'"{t}"' if " " in t else t for t in part)))
+    return out
+
+
+def eric_query_ok(query: str) -> bool:
+    """ERIC yalnızca İngilizce: Türkçe harfli terimlerle boşuna sorgu atılmaz."""
+    return not re.search(r"[çğıöşüÇĞİÖŞÜ]", query or "")
+
+
+def search_eric(session, query: str, since_year=None, limit: int = 200):
+    """ERIC (ABD Eğitim Bakanlığı eğitim araştırmaları dizini) resmî arama arayüzü."""
+    phrase = f'"{query}"' if " " in query.strip() and '"' not in query else query
+    base = {"format": "json", "fields": ERIC_FIELDS, "rows": min(200, limit)}
+    search = f"({phrase}) AND publicationdateyear:[{since_year} TO 2100]" if since_year else phrase
+    start = 0
+    while start < limit:
+        r = session.get(ERIC_API, params=dict(base, search=search, start=start), timeout=(15, 60),
+                        headers={"Accept": "application/json"})
+        if r.status_code >= 400 and since_year and search != phrase:
+            search = phrase                                   # tarih süzgeci kabul edilmezse sonuçlar burada süzülür
+            continue
+        if r.status_code == 429:
+            raise RateLimited("ERIC 'çok fazla istek' dedi")
+        r.raise_for_status()
+        docs = ((r.json() or {}).get("response") or {}).get("docs") or []
+        for doc in docs:
+            rec = record_from_eric(doc)
+            if not rec["title"]:
+                continue
+            if since_year and rec["year"].isdigit() and int(rec["year"]) < since_year:
+                continue
+            yield rec
+        start += len(docs)
+        if len(docs) < base["rows"]:
+            return
+
+
 # ── Tarama raporu (HTML) ────────────────────────────────────────────────────
 
 def _h(text) -> str:
@@ -5243,6 +5422,8 @@ li{{background:var(--card);border:1px solid var(--line);border-radius:10px;paddi
 <div class="stat"><b>{pdf_count}</b><span>PDF indirildi</span></div>
 <div class="stat"><b>{info.get('dergipark', 0)}</b><span>DergiPark kaydı tarandı</span></div>
 <div class="stat"><b>{info.get('crossref', 0)}</b><span>Crossref kaydı tarandı</span></div>
+{f'<div class="stat"><b>{info.get("openalex", 0)}</b><span>OpenAlex kaydı tarandı</span></div>' if "OpenAlex" in info.get("sources", []) else ''}
+{f'<div class="stat"><b>{info.get("eric", 0)}</b><span>ERIC kaydı tarandı</span></div>' if "ERIC" in info.get("sources", []) else ''}
 {f'<div class="stat"><b>{info.get("yok", 0)}</b><span>YÖK tezi tarandı</span></div>' if "YÖK Tez" in info.get("sources", []) else ''}
 {f'<div class="stat"><b>{info.get("yok_skipped", 0)}</b><span>PDF&#39;i olmayan tez eklenmedi</span></div>' if info.get("yok_skipped") else ''}
 {f'<div class="stat"><b>{len(added_items)}</b><span>kütüphaneye eklendi (tümü)</span></div>' if added_items else ''}
@@ -5319,6 +5500,8 @@ def release_scan_lock():
 # ── Geçmişe dönük tarama ayarları ve kaldığı yer ────────────────────────────
 RETRO_PERIODS = {"Son 1 yıl": 1, "Son 3 yıl": 3, "Son 5 yıl": 5, "Son 10 yıl": 10, "Tüm zamanlar": 0}
 RETRO_CROSSREF_LIMIT = {1: 300, 3: 600, 5: 1000, 10: 1500, 0: 2000}   # terim başına en ilgili kayıt
+RETRO_OPENALEX_LIMIT = {1: 200, 3: 400, 5: 400, 10: 600, 0: 600}      # anahtarlı; anahtarsız 200
+OPENALEX_WEEKLY_LOOKBACK = 120     # gün: dergiler sayıları geriye tarihli yayımlayabildiği için
 RETRO_DOWNLOADS = {"Bulunanların hepsini dene": None, "En fazla 200 PDF": 200, "PDF indirme (yalnızca künye)": 0}
 RETRO_SCOPES = {"Alan dergileri (önerilen)": "alan", "Alan + sosyal bilimler dergileri": "sosyal",
                 "Bütün DergiPark (saatler sürer)": "tum"}
@@ -5332,6 +5515,8 @@ def _retro_key(retro: dict) -> str:
     parts = [str(retro.get("years")), retro.get("scope", ""), str(retro.get("dergipark", True)),
              str(retro.get("crossref", True)), ",".join(sorted(retro.get("groups") or [])),
              str(retro.get("yok", True))]
+    if retro.get("openalex") or retro.get("eric"):       # eski yarım taramaların anahtarı değişmesin
+        parts += [str(bool(retro.get("openalex"))), str(bool(retro.get("eric")))]
     return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
@@ -5415,7 +5600,7 @@ class ScanWorker(threading.Thread):
         matcher = KeywordMatcher(parse_keyword_groups(load_keywords_text()))
         session = make_session()
         info = {"since": since.strftime("%d.%m.%Y"), "until": now.strftime("%d.%m.%Y"),
-                "sources": [], "errors": [], "dergipark": 0, "crossref": 0,
+                "sources": [], "errors": [], "dergipark": 0, "crossref": 0, "openalex": 0, "eric": 0,
                 "created": datetime.now().strftime("%d.%m.%Y %H:%M")}
         candidates = {}       # anahtar → {"record", "hits"}
         reached = []          # ulaşılabilen kaynaklar (hiçbiri yoksa tarama 'yapılmamış' sayılır)
@@ -5478,6 +5663,22 @@ class ScanWorker(threading.Thread):
                         break
                 time.sleep(0.3)
 
+        # 2b) OpenAlex ve ERIC: her terim için en yeni yayınlar
+        email = self.settings.get("email", "")
+        extra = []
+        if self.settings.get("scan_openalex", True):
+            extra.append(("OpenAlex", "openalex", batch_terms(matcher.search_terms()),
+                          lambda q: search_openalex(session, q, since - timedelta(days=OPENALEX_WEEKLY_LOOKBACK),
+                                                    limit=200, newest_first=True, email=email)))
+        if self.settings.get("scan_eric", True):
+            extra.append(("ERIC", "eric", batch_terms([(g, q) for g, q in matcher.search_terms() if eric_query_ok(q)]),
+                          lambda q: search_eric(session, q, since_year=since.year - 1, limit=200)))
+        for name, counter, queries, run in extra:
+            if self.cancel.is_set():
+                break
+            info["sources"].append(name)
+            self._search_source(name, counter, queries, run, consider, info, reached)
+
         # 3) YÖK Ulusal Tez Merkezi: yeni tezler (bu yıl ve geçen yıl)
         if self.settings.get("scan_yok", True) and not self.cancel.is_set():
             info["sources"].append("YÖK Tez")
@@ -5534,6 +5735,45 @@ class ScanWorker(threading.Thread):
         self.events.put(("scan_finished", str(self.report_path), self.summary))
 
 
+    def _search_source(self, name, counter, queries, run, consider, info, reached, state=None, after=None):
+        """Bir arama kaynağında her terimi sorgular. Günlük sınır dolarsa (429) o kaynak bu tarama için
+        bırakılır; geçmişe dönük taramada kalan terimler sonraki çalıştırmada kaldığı yerden devam eder.
+        after(query): her terimden sonra (geçmişe dönük taramada bulunanları işlemek için)."""
+        failures = 0
+        for n, (group, query) in enumerate(queries, start=1):
+            if self.cancel.is_set():
+                return
+            step = f"{counter}:{query}"
+            if state is not None and step in state["done"]:
+                continue
+            self.status(f"{name}: “{query[:70]}{'…' if len(query) > 70 else ''}” aranıyor ({n}/{len(queries)})")
+            try:
+                for rec in run(query):
+                    info[counter] = info.get(counter, 0) + 1
+                    consider(rec)
+                failures = 0
+                if name not in reached:
+                    reached.append(name)
+            except RateLimited as exc:
+                if state is not None:
+                    self.limited_sources = getattr(self, "limited_sources", []) + [name]
+                info["errors"].append(f"{name}: {describe_error(exc)}; kalan terimler bu taramada atlandı.")
+                self.log("warn", f"{name}: {describe_error(exc)}")
+                return
+            except Exception as exc:
+                failures += 1
+                info["errors"].append(f"{name} “{query}”: {describe_error(exc)}")
+                if failures >= 3:
+                    info["errors"].append(f"{name}'e üst üste ulaşılamadı; {name} taraması atlandı.")
+                    self.log("warn", f"{name}'e ulaşılamadı; {name} taraması atlandı.")
+                    return
+                continue
+            if after is not None:
+                after(query)
+            if state is not None and not self.cancel.is_set():
+                state["done"].append(step)
+                save_retro_state(state)
+
     # ── bulunanları kütüphaneye işleme (haftalık ve geçmişe dönük ortak) ─────────────────
     def _prepare_downloads(self, info):
         self.library_folder = self.settings.get("library_folder") or None
@@ -5571,15 +5811,16 @@ class ScanWorker(threading.Thread):
                 status, item_id = self._add_thesis(rec, hits, source, max_downloads, info)
                 found.append({"record": rec, "hits": hits, "status": status, "item_id": item_id})
                 continue
-            if rec.get("source") == "Crossref" and rec.get("doi"):
+            if rec.get("source") in ("Crossref", "OpenAlex") and rec.get("doi"):
                 full = crossref_record(session, rec["doi"])         # cilt, sayı, sayfa, yayınevi
                 if full:
-                    rec = dict(merge_records(full, rec), source="Crossref", url=rec.get("url", ""))
+                    rec = dict(merge_records(full, rec), source=rec["source"], url=rec.get("url", ""),
+                               pdf_url=rec.get("pdf_url", ""))
                     entry["record"] = rec
             tags = list(hits)
             matched = describe_hits(hits)
             status, item_id = "nopdf", None
-            link = ("https://doi.org/" + rec["doi"]) if rec.get("doi") else rec.get("url")
+            link = ("https://doi.org/" + rec["doi"]) if rec.get("doi") else (rec.get("pdf_url") or rec.get("url"))
             if link and (max_downloads is None or self.attempts < max_downloads) and library_folder:
                 self.attempts += 1
                 try:
@@ -5592,7 +5833,8 @@ class ScanWorker(threading.Thread):
                                                  meta=saved["meta"], url=rec.get("url") or link,
                                                  doi=rec.get("doi") or None, tags=tags,
                                                  library_folder=library_folder, source=source,
-                                                 is_new=True, matched=matched)
+                                                 is_new=True, matched=matched,
+                                                 known={k: rec.get(k) for k in RECORD_FIELDS if rec.get(k)})
                         status = "pdf"
                 except Exception as exc:
                     info["errors"].append(f"{rec.get('title', '')[:60]}: {describe_error(exc)}")
@@ -5751,7 +5993,7 @@ class ScanWorker(threading.Thread):
         period = retro_period_label(years)
         info = {"since": since.strftime("%d.%m.%Y") if since else "en eski kayıt",
                 "until": now.strftime("%d.%m.%Y"), "sources": [], "errors": [], "dergipark": 0,
-                "crossref": 0, "created": datetime.now().strftime("%d.%m.%Y %H:%M"),
+                "crossref": 0, "openalex": 0, "eric": 0, "created": datetime.now().strftime("%d.%m.%Y %H:%M"),
                 "title": f"Geçmişe Dönük Tarama · {period}"}
         found, reached = [], []
         self._prepare_downloads(info)
@@ -5765,7 +6007,8 @@ class ScanWorker(threading.Thread):
 
         def collect(records, candidates, counter):
             for rec in records:
-                info[counter] += 1
+                if counter:
+                    info[counter] = info.get(counter, 0) + 1
                 if not year_ok(rec):
                     continue
                 strong = " ".join([rec.get("title", ""), " ".join(rec.get("all_titles", [])),
@@ -5886,12 +6129,39 @@ class ScanWorker(threading.Thread):
                 if not self.cancel.is_set():
                     state["done"].append("crossref:" + query)
                     save_retro_state(state)
+
+        # 3) OpenAlex (makale, kitap, bölüm, tez, kurum arşivleri) ve ERIC (eğitim araştırmaları)
+        email = self.settings.get("email", "")
+        all_terms = matcher.search_terms(with_context=True)
+        extra = []
+        if retro.get("openalex"):
+            oa_limit = RETRO_OPENALEX_LIMIT.get(years, 600) if openalex_params().get("api_key") else 200
+            extra.append(("OpenAlex", "openalex", all_terms,
+                          lambda q: search_openalex(session, q, since, limit=oa_limit, email=email)))
+        if retro.get("eric"):
+            extra.append(("ERIC", "eric", [(g, q) for g, q in all_terms if eric_query_ok(q)],
+                          lambda q: search_eric(session, q, since_year=since.year if since else None,
+                                                limit=RETRO_CROSSREF_LIMIT.get(years, 600))))
+        for name, counter, terms, run in extra:
+            if self.cancel.is_set():
+                break
+            info["sources"].append(name)
+            bucket = {}
+
+            def consider(rec, bucket=bucket, counter=counter):
+                collect([rec], bucket, None)
+
+            def after(query, bucket=bucket, name=name):
+                self._process(session, bucket, found, info, max_downloads, "geçmiş tarama", name)
+                bucket.clear()
+            self._search_source(name, counter, terms, run, consider, info, reached, state=state, after=after)
         session.close()
 
         new = sum(1 for e in found if e["status"] not in ("known", "pdf_found", "thesis_skipped"))
         pdfs = sum(1 for e in found if e["status"] == "pdf")
         later = sum(1 for e in found if e["status"] == "pdf_found")
-        finished = not self.cancel.is_set() and bool(reached)
+        limited = getattr(self, "limited_sources", [])
+        finished = not self.cancel.is_set() and bool(reached) and not limited
         if finished:
             save_retro_state(None)
         folder = Path(self.library_folder or settings_path().parent) / "Tarama Raporları"
@@ -5902,6 +6172,10 @@ class ScanWorker(threading.Thread):
         elif finished:
             self.summary = (f"Geçmişe dönük tarama bitti ({period}): {new} yeni kaynak, {pdfs} PDF"
                             + (f"; PDF'siz duran {later} kaynağın PDF'i de bulundu." if later else "."))
+        elif limited and not self.cancel.is_set():
+            self.summary = (f"Geçmişe dönük tarama şimdilik bitti: {new} yeni kaynak, {pdfs} PDF. "
+                            f"{', '.join(limited)} günlük kullanım sınırına ulaştı; yarın 'Geçmişe Dönük Tara' → "
+                            "'Kaldığı Yerden Devam Et' ile kalan terimler taranır.")
         else:
             self.summary = (f"Geçmişe dönük tarama durduruldu: şimdiye dek {new} yeni kaynak, {pdfs} PDF. "
                             "Aynı seçeneklerle yeniden başlatınca kaldığı yerden sürer.")
@@ -10163,10 +10437,16 @@ class RetroScanDialog(ctk.CTkToplevel):
         self.use_dp = ctk.BooleanVar(value=True)
         self.use_cr = ctk.BooleanVar(value=True)
         self.use_yok = ctk.BooleanVar(value=True)
+        self.use_oa = ctk.BooleanVar(value=load_settings().get("scan_openalex", True))
+        self.use_eric = ctk.BooleanVar(value=load_settings().get("scan_eric", True))
         ctk.CTkCheckBox(self, text="YÖK Ulusal Tez Merkezi (bütün yüksek lisans ve doktora tezleri; izinlilerin PDF'i)",
                         variable=self.use_yok).grid(row=r, column=0, pady=2, **pad); r += 1
         ctk.CTkCheckBox(self, text="Crossref (uluslararası ve DOI'li Türkçe yayınlar, en eskisine kadar)",
                         variable=self.use_cr).grid(row=r, column=0, pady=2, **pad); r += 1
+        ctk.CTkCheckBox(self, text="OpenAlex (makale, kitap, bölüm, dünya tezleri ve kurum arşivleri; özetleriyle)",
+                        variable=self.use_oa, command=self._update_estimate).grid(row=r, column=0, pady=2, **pad); r += 1
+        ctk.CTkCheckBox(self, text="ERIC (eğitim araştırmaları: dans, müzik ve beden eğitimi; çoğunun PDF'i açık)",
+                        variable=self.use_eric, command=self._update_estimate).grid(row=r, column=0, pady=2, **pad); r += 1
         dp = ctk.CTkFrame(self, fg_color="transparent")
         dp.grid(row=r, column=0, pady=2, **pad); r += 1
         ctk.CTkCheckBox(dp, text="DergiPark:", variable=self.use_dp).pack(side="left")
@@ -10178,7 +10458,7 @@ class RetroScanDialog(ctk.CTkToplevel):
         self.downloads.set(next(iter(RETRO_DOWNLOADS)))
         self.downloads.grid(row=r, column=0, padx=20, sticky="w"); r += 1
         label("Konu grupları")
-        box = ctk.CTkScrollableFrame(self, height=170)
+        box = ctk.CTkScrollableFrame(self, height=120)
         box.grid(row=r, column=0, **pad); r += 1
         self.group_vars = {}
         for g in parse_keyword_groups(load_keywords_text()):
@@ -10210,6 +10490,7 @@ class RetroScanDialog(ctk.CTkToplevel):
         groups = [n for n, v in self.group_vars.items() if v.get()]
         return {"years": RETRO_PERIODS[self.period.get()], "scope": RETRO_SCOPES[self.scope.get()],
                 "dergipark": self.use_dp.get(), "crossref": self.use_cr.get(), "yok": self.use_yok.get(),
+                "openalex": self.use_oa.get(), "eric": self.use_eric.get(),
                 "groups": groups if len(groups) < len(self.group_vars) else [],
                 "max_downloads": RETRO_DOWNLOADS[self.downloads.get()]}
 
@@ -10220,15 +10501,20 @@ class RetroScanDialog(ctk.CTkToplevel):
                 "sosyal": "Alan dergilerine ek olarak sosyal bilimler, edebiyat, eğitim ve spor dergileri de "
                           "taranır (birkaç saat).",
                 "tum": "Bütün DergiPark yıl yıl taranır; tüm zamanlar için bir gece sürebilir."}[o["scope"]]
-        cr = f" Crossref'te her terim için en ilgili {RETRO_CROSSREF_LIMIT.get(o['years'], 2000)} kayıt incelenir."
+        cr = (f" Crossref'te her terim için en ilgili {RETRO_CROSSREF_LIMIT.get(o['years'], 2000)} kayıt incelenir."
+              if o["crossref"] else "")
         if o["yok"]:
             cr += " YÖK'te her terim için bulunan bütün tezler incelenir; eşleşen tezlerin PDF'i iner."
-        self.estimate.configure(text=(text if o["dergipark"] else "") + (cr if o["crossref"] else "") +
+        if o["openalex"]:
+            cr += (" OpenAlex'te her terim için en ilgili kayıtlar incelenir"
+                   + ("." if openalex_params().get("api_key") else
+                      " (anahtarsız günlük sınır düşüktür; dolarsa kalan terimler sonraki çalıştırmada sürer)."))
+        self.estimate.configure(text=(text if o["dergipark"] else "") + cr +
                                 " Program açık kaldığı sürece arka planda çalışır.")
 
     def _start_new(self):
         o = self._collect_options()
-        if not o["dergipark"] and not o["crossref"] and not o["yok"]:
+        if not any(o[k] for k in ("dergipark", "crossref", "yok", "openalex", "eric")):
             messagebox.showwarning(APP_NAME, "En az bir kaynak seçin.", parent=self)
             return
         self._start(o)
@@ -11548,6 +11834,24 @@ class ScanTab:
                         command=self.app.save_all_settings).grid(row=r, column=0, sticky="w", padx=10, pady=3); r += 1
         ctk.CTkCheckBox(side, text="Crossref (uluslararası, DOI'li yayınlar)", variable=self.src_cr,
                         command=self.app.save_all_settings).grid(row=r, column=0, sticky="w", padx=10, pady=3); r += 1
+        self.src_oa = ctk.BooleanVar(value=s.get("scan_openalex", True))
+        ctk.CTkCheckBox(side, text="OpenAlex (kitap, bölüm, tez, kurum arşivleri)",
+                        variable=self.src_oa, command=self.app.save_all_settings).grid(
+            row=r, column=0, sticky="w", padx=10, pady=3); r += 1
+        oak = ctk.CTkFrame(side, fg_color="transparent")
+        oak.grid(row=r, column=0, sticky="w", padx=34, pady=(0, 3)); r += 1
+        ctk.CTkLabel(oak, text="Ücretsiz anahtar:", text_color=MUTED, font=ctk.CTkFont(size=12)).pack(side="left")
+        self.oa_key = ctk.CTkEntry(oak, width=130, height=26, show="•", placeholder_text="isteğe bağlı")
+        self.oa_key.pack(side="left", padx=6)
+        if s.get("openalex_api_key"):
+            self.oa_key.insert(0, s["openalex_api_key"])
+        for ev in ("<FocusOut>", "<Return>"):
+            self.oa_key.bind(ev, lambda _e: self.app.save_all_settings())
+        ctk.CTkButton(oak, text="Al", width=40, height=26, fg_color="transparent", border_width=1, text_color=TEXT,
+                      command=lambda: webbrowser.open_new_tab(OPENALEX_KEY_PAGE)).pack(side="left")
+        self.src_eric = ctk.BooleanVar(value=s.get("scan_eric", True))
+        ctk.CTkCheckBox(side, text="ERIC (eğitim araştırmaları; çoğunun PDF'i açık)", variable=self.src_eric,
+                        command=self.app.save_all_settings).grid(row=r, column=0, sticky="w", padx=10, pady=3); r += 1
         self.src_yok = ctk.BooleanVar(value=s.get("scan_yok", True))
         ctk.CTkCheckBox(side, text="YÖK Ulusal Tez Merkezi (yeni tezler, izinli olanların PDF'i)",
                         variable=self.src_yok, command=self.app.save_all_settings).grid(
@@ -12649,6 +12953,8 @@ class App(ctk.CTk):
             current.update({
                 "auto_scan": scan.auto_var.get(), "open_report": scan.open_report_var.get(),
                 "scan_dergipark": scan.src_dp.get(), "scan_crossref": scan.src_cr.get(),
+                "scan_openalex": scan.src_oa.get(), "scan_eric": scan.src_eric.get(),
+                "openalex_api_key": scan.oa_key.get().strip(),
                 "scan_yok": scan.src_yok.get(), "yok_skip_closed": scan.yok_skip_closed.get(),
                 "watch_downloads": scan.watch_var.get(), "scan_day": scan.day_menu.get(),
                 "auto_tag": scan.autotag_var.get(), "auto_update": scan.update_var.get(),
