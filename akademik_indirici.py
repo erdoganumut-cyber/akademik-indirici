@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.38"
+APP_VERSION = "2.39"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -9729,6 +9729,9 @@ class CitationWindow(ctk.CTkToplevel):
         bar.grid(row=1, column=0, sticky="ew", pady=(6, 0))
         self.add_btn = ctk.CTkButton(bar, text="Seçilenleri İndir Sekmesine Ekle", width=230, command=self.add_selected)
         self.add_btn.pack(side="left")
+        self.all_btn = ctk.CTkButton(bar, text="Tümünü İndir", width=130, fg_color="#1F8F4E", hover_color="#18723E",
+                                     command=self.download_all)
+        self.all_btn.pack(side="left", padx=(8, 0))
         ctk.CTkLabel(bar, text="DOI'si olmayanlar için Crossref'te aranır; bulunanlar İndir sekmesine yazılır.",
                      text_color=MUTED, font=ctk.CTkFont(size=12)).pack(side="left", padx=10)
         self.t_in.bind("<Double-1>", lambda _: self.show_in_library())
@@ -9803,19 +9806,40 @@ class CitationWindow(ctk.CTkToplevel):
             tab.refresh()
             tab.select(int(sel[0]))
 
+    def download_all(self):
+        chosen = list((self.data or {}).get("missing") or [])
+        if not chosen:
+            messagebox.showinfo(APP_NAME, "Listede kütüphanede olmayan eser yok.", parent=self)
+            return
+        need = sum(1 for m in chosen if not m.get("doi"))
+        if not messagebox.askyesno(APP_NAME, f"Listedeki {len(chosen)} eserin hepsi indirilsin mi?\n\n"
+                                   + (f"DOI'si olmayan {need} eser için önce Crossref'te arama yapılır "
+                                      f"(birkaç dakika sürebilir). " if need else "")
+                                   + "Bulunanlar İndir sekmesine yazılıp indirme kendiliğinden başlar; "
+                                     "açık erişimli olanların PDF'i iner, kütüphanede olanlar atlanır.",
+                                   parent=self):
+            return
+        self._resolve(chosen, start=True)
+
     def add_selected(self):
         chosen = [self.data["missing"][int(i[1:])] for i in self.t_out.selection()]
         if not chosen:
             messagebox.showinfo(APP_NAME, "Önce listeden eser seçin (Ctrl ya da Shift ile birden çok).", parent=self)
             return
+        self._resolve(chosen, start=False)
+
+    def _resolve(self, chosen, start):
         self.add_btn.configure(state="disabled", text="DOI'ler aranıyor…")
+        self.all_btn.configure(state="disabled")
         events = self.app.events
 
         def work():
             links, unresolved = [], []
             session = make_session()
             try:
-                for m in chosen:
+                for n, m in enumerate(chosen, start=1):
+                    if n % 5 == 0 or n == len(chosen):
+                        events.put(("cite_prog", n, len(chosen)))
                     doi = m.get("doi")
                     if not doi:
                         msg = crossref_search(session, {"title": m["title"], "year": m["year"],
@@ -9824,18 +9848,32 @@ class CitationWindow(ctk.CTkToplevel):
                     (links.append("https://doi.org/" + doi) if doi else unresolved.append(m["raw"]))
             finally:
                 session.close()
-            events.put(("cite_links", links, unresolved))
+            events.put(("cite_links", list(dict.fromkeys(links)), unresolved, start))
         threading.Thread(target=work, daemon=True).start()
 
-    def on_links(self, links, unresolved):
+    def on_progress(self, n, total):
+        if self.winfo_exists():
+            self.add_btn.configure(text=f"DOI'ler aranıyor… {n}/{total}")
+
+    def on_links(self, links, unresolved, start=False):
         if not self.winfo_exists():
             return
         self.add_btn.configure(state="normal", text="Seçilenleri İndir Sekmesine Ekle")
+        self.all_btn.configure(state="normal")
         if links:
             box = self.app.input_box
             box.insert("end", ("\n" if box.get("1.0", "end-1c").strip() else "") +
                        "──── Eksik temel kaynaklar ────\n" + "\n".join(links) + "\n")
-        msg = f"{len(links)} eser İndir sekmesine eklendi; oradan 'İndirmeyi Başlat' ile indirebilirsiniz."
+        busy = bool(self.app.worker and self.app.worker.is_alive())
+        if start and links and not busy:
+            self.app.tabs.set("İndir")
+            self.app._start()
+            msg = f"{len(links)} eserin indirmesi başladı; ilerlemeyi İndir sekmesinden izleyebilirsiniz."
+        elif start and links:
+            msg = (f"{len(links)} eser İndir sekmesine eklendi. Şu an başka bir indirme sürdüğü için o bitince "
+                   "'İndirmeyi Başlat'a basın.")
+        else:
+            msg = f"{len(links)} eser İndir sekmesine eklendi; oradan 'İndirmeyi Başlat' ile indirebilirsiniz."
         if unresolved:
             self.clipboard_clear()
             self.clipboard_append("\n".join(unresolved))
@@ -13333,6 +13371,14 @@ class App(ctk.CTk):
             win = getattr(self.library_tab, "cite_win", None)
             if win is not None and win.winfo_exists():
                 win.on_links(*message[1:])
+            elif len(message) > 3 and message[3] and message[1] and not (self.worker and self.worker.is_alive()):
+                self.input_box.insert("end", "\n──── Eksik temel kaynaklar ────\n" + "\n".join(message[1]) + "\n")
+                self.tabs.set("İndir")
+                self._start()
+        elif kind == "cite_prog":
+            win = getattr(self.library_tab, "cite_win", None)
+            if win is not None and win.winfo_exists():
+                win.on_progress(*message[1:])
         elif kind == "hl":
             n, total = message[1:]
             self.library_tab.count_label.configure(text=f"PDF işaretlemeleri okunuyor {n}/{total}…")
