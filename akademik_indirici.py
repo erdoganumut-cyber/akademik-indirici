@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.39"
+APP_VERSION = "2.40"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -3446,6 +3446,13 @@ class Library:
         with self.lock:
             row = self.db.execute("SELECT content FROM fulltext WHERE item_id=?", (item_id,)).fetchone()
         return row[0] if row and row[0] else ""
+
+    def fulltext_heads(self, ids, chars=5000) -> dict:
+        """Kayıtların saklı (katlanmış) metninin başı: {kimlik: metin}. Mükerrer tespiti için."""
+        wanted = set(ids)
+        with self.lock:
+            rows = self.db.execute("SELECT item_id, substr(content, 1, ?) FROM fulltext", (int(chars),)).fetchall()
+        return {i: t for i, t in rows if i in wanted and t}
 
     def merge_items(self, keeper_id, other_ids, library_folder=None) -> int:
         """Mükerrer kayıtları birleştirir: etiketler, kartlar, boş alanlar, Claude özeti ve (gerekirse) PDF
@@ -7711,7 +7718,111 @@ class HighlightWorker(threading.Thread):
         self.events.put(("hl_done", added, len(sources), self.cancel.is_set()))
 
 
-def find_duplicates(items) -> list:
+TWIN_HEAD_CHARS = 5000
+
+
+def _title_words(title) -> list:
+    main = re.split(r"[:.?!]\s", title or "")[0]
+    return re.findall(r"\w+", fold(main))
+
+
+def _title_pattern(title):
+    words = _title_words(title)
+    if len(words) < 3 or sum(len(w) >= 4 for w in words) < 2:
+        return None
+    return re.compile(r"\b" + r"\W+".join(re.escape(w) for w in words[:8]) + r"\b")
+
+
+def title_position(title, folded_head, pattern=None) -> int:
+    """Başlık (ilk 8 kelimesi, sırasıyla) belgenin başında nerede geçiyor? Yoksa -1.
+    'Türkiye'de' / 'TÜRKİYE’DE' gibi yazım farkları katlanarak yok sayılır."""
+    pattern = pattern or _title_pattern(title)
+    m = pattern.search(folded_head or "") if pattern else None
+    return m.start() if m else -1
+
+
+def _twin_compatible(a, b, folded_head) -> bool:
+    """Başlığı b'nin PDF'inde geçen a, gerçekten aynı yayın mı? (kitap ↔ bölüm, farklı DOI, uzak yıl elenir)"""
+    da, db = (normalize_doi(a.get("doi") or "") or "").lower(), (normalize_doi(b.get("doi") or "") or "").lower()
+    if da and db and da != db:
+        return False
+    ta, tb = a.get("type") or "other", b.get("type") or "other"
+    if ta != tb and "other" not in (ta, tb) and {ta, tb} != {"phd", "masters"}:
+        return False
+    ya, yb = str(a.get("year") or "")[:4], str(b.get("year") or "")[:4]
+    if ya.isdigit() and yb.isdigit() and abs(int(ya) - int(yb)) > 2:
+        return False
+    fam = fold(((a.get("authors") or [{}])[0] or {}).get("family", "")) if a.get("authors") else ""
+    if fam and len(fam) >= 3:
+        other = fold(((b.get("authors") or [{}])[0] or {}).get("family", "")) if b.get("authors") else ""
+        if fam != other and not re.search(r"\b" + re.escape(fam) + r"\b", folded_head or ""):
+            return False
+    return True
+
+
+def preferred_keeper(a, b, folded_head):
+    """İkizden hangisi tutulsun? PDF'te başlığı önce geçen (yayının asıl dilindeki) kayıt."""
+    pa, pb = title_position(a["title"], folded_head), title_position(b["title"], folded_head)
+    if pa >= 0 and (pb < 0 or pa < pb):
+        return a
+    return b
+
+
+def find_pdf_twins(library, items=None) -> dict:
+    """PDF'i olmayan ama aynı yayını başka bir kaydın PDF'i taşıyan kayıtlar (ör. Türkçe başlıklı kayıt PDF'siz,
+    İngilizce başlıklı ikizi PDF'li): {pdfsiz_kimlik: {"holder": kimlik, "keeper": kimlik}}.
+    Ölçüt: aynı DOI, ya da PDF'siz kaydın başlığı öbürünün PDF'inin ilk sayfalarında + yıl/yazar/tür uyumu."""
+    items = items if items is not None else library.all_items()
+    holders = {i["id"]: i for i in items if i.get("file_path")}
+    nopdf = [i for i in items if not i.get("file_path")]
+    if not holders or not nopdf:
+        return {}
+    out = {}
+    by_doi = {}
+    for h in holders.values():
+        if h.get("doi"):
+            by_doi.setdefault((normalize_doi(h["doi"]) or "").lower(), h)
+    heads = library.fulltext_heads(holders.keys(), TWIN_HEAD_CHARS)
+    for it in nopdf:
+        h = by_doi.get((normalize_doi(it["doi"]) or "").lower() or "-") if it.get("doi") else None
+        if h is not None:
+            keeper = preferred_keeper(it, h, heads.get(h["id"], ""))
+            out[it["id"]] = {"holder": h["id"], "keeper": keeper["id"]}
+    wanted = {}
+    for it in nopdf:
+        if it["id"] not in out:
+            words = [w for w in _title_words(it.get("title")) if len(w) >= 5]
+            if len(words) >= 2:
+                wanted[it["id"]] = words
+    needed = {w for words in wanted.values() for w in words}
+    inverted = {}
+    for hid, head in heads.items():
+        for w in needed.intersection(re.findall(r"\w{5,}", head)):
+            inverted.setdefault(w, set()).add(hid)
+    for it in nopdf:
+        words = wanted.get(it["id"])
+        if not words:
+            continue
+        pattern = _title_pattern(it.get("title"))
+        if pattern is None:
+            continue
+        cands = None
+        for w in sorted(set(words), key=lambda w: len(inverted.get(w, ())))[:3]:
+            hits = inverted.get(w, set())
+            cands = hits if cands is None else cands & hits
+            if not cands:
+                break
+        for hid in sorted(cands or ()):
+            head = heads[hid]
+            if title_position(it["title"], head, pattern) < 0 or not _twin_compatible(it, holders[hid], head):
+                continue
+            keeper = preferred_keeper(it, holders[hid], head)
+            out[it["id"]] = {"holder": hid, "keeper": keeper["id"]}
+            break
+    return out
+
+
+def find_duplicates(items, twins=None) -> list:
     """Aynı yayının birden çok kaydı: aynı DOI, ya da aynı başlık (ön baskı/yayımlanmış hâli dahil) + aynı ilk
     yazar ya da yakın yıl. Dönüş: [[kayıt, …], …] — her grubun ilki tutulması önerilen kayıt."""
     parent = {i["id"]: i["id"] for i in items}
@@ -7749,13 +7860,19 @@ def find_duplicates(items) -> list:
             unknown_author = not fa or not fb
             if close_year and (same_author or (unknown_author and same_title(a["title"], b["title"]))):
                 union(b["id"], a["id"])
+    preferred = set()
+    for nid, t in (twins or {}).items():
+        if nid in parent and t["holder"] in parent:
+            union(t["holder"], nid)
+            preferred.add(t["keeper"])
     groups = {}
     for i in items:
         groups.setdefault(find(i["id"]), []).append(i)
 
     def score(i):
         has_file = bool(i.get("file_path")) and os.path.isfile(i["file_path"])
-        return (has_file, bool(i.get("doi")), sum(1 for k in RECORD_FIELDS if i.get(k)), -(i.get("no") or 0))
+        return (i["id"] in preferred, has_file, bool(i.get("doi")), sum(1 for k in RECORD_FIELDS if i.get(k)),
+                -(i.get("no") or 0))
     return [sorted(g, key=score, reverse=True) for g in groups.values() if len(g) > 1]
 
 
@@ -9893,9 +10010,11 @@ class DuplicatesWindow(ctk.CTkToplevel):
         self.geometry("900x600")
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
-        self.groups = find_duplicates(app.library.all_items())
+        items = app.library.all_items()
+        self.groups = find_duplicates(items, find_pdf_twins(app.library, items))
         head = ("Mükerrer kayıt bulunamadı." if not self.groups else
-                f"{len(self.groups)} grup bulundu. Her grupta ★ işaretli kayıt tutulur; öbürlerinin etiketleri, alıntı "
+                f"{len(self.groups)} grup bulundu (başka dilde başlıklı ikizler PDF'in ilk sayfasından tanınır). Her "
+                "grupta ★ işaretli kayıt tutulur; öbürlerinin PDF'i (kendisinde yoksa), etiketleri, alıntı "
                 "kartları, boş künye alanları ve Claude özeti ona aktarılıp silinir. Fazla PDF kopyaları silinmez, "
                 "kütüphane klasöründeki 'Mükerrer PDF'ler (silinebilir)' klasörüne taşınır.")
         ctk.CTkLabel(self, text=head, anchor="w", justify="left", wraplength=860).grid(
@@ -10021,6 +10140,7 @@ class RangeDialog(ctk.CTkToplevel):
         super().__init__(app)
         self.app, self.purpose, self.nopdf, self.visible_ids = app, purpose, nopdf, visible_ids
         self.chosen, self.on_start = chosen, on_start
+        self.twins = set(app.pdf_twins()) & {i["id"] for i in nopdf}
         retry = purpose == "retry"
         self.title("PDF'leri yeniden ara" if retry else "PDF'sizleri sırayla aç")
         set_window_icon(self, delay=260)
@@ -10094,8 +10214,16 @@ class RangeDialog(ctk.CTkToplevel):
                                value="page").pack(anchor="w", padx=(8, 0), pady=(4, 0))
             ctk.CTkRadioButton(extra, text="Google Akademik'te başlıkla arama (başka yerlerdeki kopyalar)",
                                variable=self.open_mode, value="scholar").pack(anchor="w", padx=(8, 0), pady=(4, 0))
+        if self.twins:
+            tw = ctk.CTkFrame(self, fg_color="transparent")
+            tw.grid(row=6, column=0, pady=(12, 0), **pad)
+            ctk.CTkLabel(tw, text=f"{len(self.twins)} kaydın PDF'i başka dilde başlıklı ikizinde duruyor; bunlar "
+                                  "aranmaz. Birleştirince listeden çıkarlar.", text_color=LOG_COLORS["warn"],
+                         font=ctk.CTkFont(size=12), wraplength=300, justify="left", anchor="w").pack(side="left")
+            ctk.CTkButton(tw, text="Mükerrerleri Birleştir…", width=150, height=26, fg_color="transparent",
+                          border_width=1, text_color=TEXT, command=self._open_duplicates).pack(side="right")
         btns = ctk.CTkFrame(self, fg_color="transparent")
-        btns.grid(row=6, column=0, pady=16, padx=18, sticky="e")
+        btns.grid(row=7, column=0, pady=16, padx=18, sticky="e")
         ctk.CTkButton(btns, text="Vazgeç", width=90, fg_color="transparent", border_width=1, text_color=TEXT,
                       command=self.destroy).pack(side="left", padx=(0, 8))
         self.ok_btn = ctk.CTkButton(btns, text="Başlat", width=110, command=self._ok)
@@ -10115,10 +10243,14 @@ class RangeDialog(ctk.CTkToplevel):
         except Exception:
             pass
 
+    def _open_duplicates(self):
+        self.destroy()
+        DuplicatesWindow(self.app)
+
     def _base(self):
-        """Filtrelerden geçen PDF'siz kaynaklar (numara aralığı hariç)."""
+        """Filtrelerden geçen PDF'siz kaynaklar (numara aralığı hariç; PDF'i ikizinde olanlar hariç)."""
         today = datetime.now().strftime("%Y-%m-%d")
-        out = self.nopdf
+        out = [i for i in self.nopdf if i["id"] not in self.twins]
         if self.filtered and self.visible_var.get():
             out = [i for i in out if i["id"] in self.visible_ids]
         if self.skip_var.get():
@@ -10165,7 +10297,8 @@ class RangeDialog(ctk.CTkToplevel):
         """(kaynaklar, etiket, aralık)"""
         if self.mode.get() == "selected" and self.chosen:
             today = datetime.now().strftime("%Y-%m-%d")
-            items = [i for i in self.chosen if not (self.skip_var.get() and (i.get("pdf_tried") or "") == today)]
+            items = [i for i in self.chosen if i["id"] not in self.twins
+                     and not (self.skip_var.get() and (i.get("pdf_tried") or "") == today)]
             return items, f"seçilen {len(items)} kaynak (No {no_ranges_text([i.get('no') for i in items], 4)})", None
         rng = self.range()
         if not rng:
@@ -10204,7 +10337,10 @@ class RangeDialog(ctk.CTkToplevel):
                         f"{hi} arasında; 'Tümü'ne basabilirsiniz.")
             return "Bu seçimde PDF'i olmayan kaynak yok."
         reasons = []
-        today_n = sum(1 for i in pool if (i.get("pdf_tried") or "") == today)
+        twin_n = sum(1 for i in pool if i["id"] in self.twins)
+        if twin_n:
+            reasons.append(f"{twin_n} tanesinin PDF'i ikiz kayıtta duruyor — 'Mükerrerleri Birleştir…' ile birleştirin")
+        today_n = sum(1 for i in pool if (i.get("pdf_tried") or "") == today and i["id"] not in self.twins)
         hidden_n = sum(1 for i in pool if i["id"] not in self.visible_ids) \
             if self.filtered and self.visible_var.get() and self.mode.get() != "selected" else 0
         if self.skip_var.get() and today_n:
@@ -10236,7 +10372,7 @@ class PdfQueuePanel(ctk.CTkToplevel):
         super().__init__(app)
         self.app, self.items, self.label = app, sorted(items, key=lambda i: i.get("no") or 0), label
         self.open_mode = open_mode
-        self.index, self.attached, self.skipped = -1, 0, 0
+        self.index, self.attached, self.skipped, self.merged = -1, 0, 0, 0
         self.pending = None                        # eşleşmeyen PDF: kullanıcıya soruluyor
         self.folders = downloads_folders()
         self.seen = self._snapshot()
@@ -10319,9 +10455,13 @@ class PdfQueuePanel(ctk.CTkToplevel):
             if self.items:
                 remember_setting("queue_next_no", (self.items[-1].get("no") or 0) + 1)
             self.counter.configure(text="Bitti" + (f" · {self.label}" if self.label else ""))
-            self.item_label.configure(text=f"{self.attached} kaynağın PDF'i bağlandı, {self.skipped} kaynak atlandı.")
+            self.item_label.configure(text=f"{self.attached} kaynağın PDF'i bağlandı, {self.skipped} kaynak atlandı."
+                                           + (f" {self.merged} mükerrer kayıt birleştirildi." if self.merged else ""))
             self.status.configure(text="Pencereyi kapatabilirsiniz.")
             return
+        cur = self.current
+        if cur and self.app.library.get(cur["id"]) is None:         # bu arada birleştirilip silinmiş
+            return self.next_item()
         self.open_current()
 
     def open_current(self):
@@ -10402,8 +10542,20 @@ class PdfQueuePanel(ctk.CTkToplevel):
 
     def _handle(self, path):
         item = self.current
-        if self.app.library.find_by_sha(file_sha256(path)):
-            self.status.configure(text=f"{path.name} zaten kütüphanede; yok sayıldı.", text_color=LOG_COLORS["warn"])
+        owner = self.app.library.find_by_sha(file_sha256(path))
+        if owner:
+            holder = self.app.library.get(owner) if owner != item["id"] else None
+            if holder is None:
+                self.status.configure(text=f"{path.name} zaten kütüphanede; yok sayıldı.", text_color=LOG_COLORS["warn"])
+                return
+            head = fold(doc_head(path))
+            same_doi = item.get("doi") and holder.get("doi") and \
+                (normalize_doi(item["doi"]) or "x").lower() == (normalize_doi(holder["doi"]) or "y").lower()
+            if same_doi or (title_position(item["title"], head) >= 0 and _twin_compatible(item, holder, head)):
+                return self._offer_merge(path, item, holder, head)
+            self.status.configure(text=f"{path.name} zaten No {holder.get('no')} kaydına bağlı "
+                                       f"(“{shorten(holder['title'], 60)}”) ve bu kaynağın başlığını içermiyor; "
+                                       "yok sayıldı.", text_color=LOG_COLORS["warn"])
             return
         if self._matches(item, path):
             self._attach(path)
@@ -10415,6 +10567,34 @@ class PdfQueuePanel(ctk.CTkToplevel):
                       command=lambda: self._attach(path)).pack(side="left")
         ctk.CTkButton(self.ask, text="Bu dosyayı yok say", width=140, fg_color="transparent", border_width=1,
                       text_color=TEXT, command=self._ignore).pack(side="left", padx=6)
+
+    def _offer_merge(self, path, item, holder, head):
+        """İnen PDF başka bir kayıtta zaten var ve o kayıt bu kaynağın ikizi (başka dilde başlıklı aynı yayın)."""
+        self.pending = path
+        keeper = preferred_keeper(item, holder, head)
+        self.status.configure(
+            text=f"Bu PDF zaten No {holder.get('no')} kaydında (“{shorten(holder['title'], 70)}”) ve bu kaynağın "
+                 f"başlığını da içeriyor: iki kayıt aynı yayın. Birleştirilsin mi? (No {keeper.get('no')} tutulur, "
+                 "etiketler, kartlar ve notlar ona geçer)", text_color=LOG_COLORS["warn"])
+        ctk.CTkButton(self.ask, text="Birleştir", width=110,
+                      command=lambda: self._merge(item, holder, keeper)).pack(side="left")
+        ctk.CTkButton(self.ask, text="Yok say", width=100, fg_color="transparent", border_width=1,
+                      text_color=TEXT, command=self._ignore).pack(side="left", padx=6)
+
+    def _merge(self, item, holder, keeper):
+        other = holder if keeper["id"] == item["id"] else item
+        try:
+            self.app.library.merge_items(keeper["id"], [other["id"]], self.app.library_folder())
+        except Exception as exc:
+            diag_exception("sırayla açma: birleştirme")
+            self.status.configure(text=f"Birleştirilemedi: {describe_error(exc)}", text_color=LOG_COLORS["error"])
+            return
+        self.merged += 1
+        self.app.library_tab.refresh()
+        self.status.configure(text=f"✓ No {item.get('no')} ve No {holder.get('no')} birleştirildi; PDF No "
+                                   f"{keeper.get('no')} kaydında.", text_color=LOG_COLORS["success"])
+        self._clear_ask()
+        self.after(1200, self.next_item)
 
     def _ignore(self):
         self._clear_ask()
@@ -12553,11 +12733,39 @@ class App(ctk.CTk):
         self.after(600, self._first_run)
         self.index_worker = None
         self.after(45_000, self._index_tick)
+        self.after(25_000, self._warm_twins)
         self.after(15_000, self._watch_downloads)
         self._db_stamp = self._library_stamp()
         self.bind("<FocusIn>", self._on_focus, add="+")
         self.after(5 * 60_000, self._sync_tick)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _warm_twins(self):
+        """İkiz kayıt listesini arka planda önceden hesaplar (PDF arama pencereleri beklemeden açılsın)."""
+        def work():
+            try:
+                key = self.library.change_no()
+                self._twins_cache = (key, find_pdf_twins(self.library))
+            except Exception:
+                diag_exception("ikiz kayıt ön hesabı")
+        threading.Thread(target=work, daemon=True).start()
+
+    def pdf_twins(self) -> dict:
+        """PDF'i ikiz bir kayıtta duran PDF'siz kayıtlar (kütüphane değişmedikçe önbellekten)."""
+        try:
+            key = self.library.change_no()
+        except Exception:
+            key = None
+        cache = getattr(self, "_twins_cache", None)
+        if cache and key is not None and cache[0] == key:
+            return cache[1]
+        try:
+            twins = find_pdf_twins(self.library)
+        except Exception:
+            diag_exception("ikiz kayıt tespiti")
+            twins = {}
+        self._twins_cache = (key, twins)
+        return twins
 
     def _rebuild_citations_quietly(self):
         """Dizin güncellenince atıf ağını arka planda yeniden hesaplar (PDF açmaz, birkaç saniye)."""
