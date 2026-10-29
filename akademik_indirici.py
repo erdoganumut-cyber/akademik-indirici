@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.40"
+APP_VERSION = "2.41"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -2256,6 +2256,221 @@ def book_record_by_isbn(session, isbn: str) -> dict:
     return {}
 
 
+# ── Kitap boyutundaki PDF'ler: bildiri kitapları ve ISBN'li kitaplar ───────────────────────
+
+_PROC_RE = re.compile(r"bildiri(ler)?\s+kitab|tam\s+metin(ler)?\s+kitab|ozet(ler)?\s+kitab|bildiri\s+ozetleri|"
+                      r"proceedings?|book\s+of\s+(abstracts|papers|full\s+texts)|kongres[i]?\b|congress|"
+                      r"sempozyum|symposium|konferans|conference|calistay|workshop")
+_PROC_BOOK_RE = re.compile(r"bildiri(ler)?\s+kitab|tam\s+metin(ler)?\s+kitab|ozet(ler)?\s+kitab|bildiri\s+ozetleri|"
+                           r"proceedings?|book\s+of\s+(abstracts|papers|full\s+texts)")
+_EDITOR_RE = re.compile(r"^(editor(ler)?|editors?|eds?\.|yayina\s+hazirlayan(lar)?|hazirlayan(lar)?|edited\s+by)"
+                        r"\s*:?\s*(.*)$")
+_ACADEMIC_TITLES = {"prof", "prof.", "doc", "doc.", "dr", "dr.", "ogr", "ogr.", "uyesi", "gor", "gor.", "ars",
+                    "ars.", "assoc", "assoc.", "assist", "assist.", "asst", "asst.", "professor", "dr.ogr.",
+                    "ogr.gor.", "ars.gor.", "doç.dr.", "prof.dr.", "doc.dr.", "uzm.", "uzm"}
+_SMALL_WORDS = {"ve", "ile", "icin", "da", "de", "and", "of", "the", "on", "in", "for", "to", "a", "an", "et", "und"}
+_ROMAN_RE = re.compile(r"^[IVXLC]+\.?$")
+_PUBLISHER_RE = re.compile(r"(yayinlari|yayinevi|yayincilik|kitabevi|publishing|publications|publishers|press)\s*$")
+
+
+def heading_case(text: str) -> str:
+    """Büyük harfle yazılmış kongre/kitap adını özel ad gibi yazar:
+    '8. ULUSLARARASI MÜZİK VE DANS KONGRESİ' → '8. Uluslararası Müzik ve Dans Kongresi'"""
+    words = text.split()
+    out = []
+    for k, w in enumerate(words):
+        if _ROMAN_RE.match(w) or any(c.isdigit() for c in w):
+            out.append(w)
+        elif k and fold(w).strip(".,:;") in _SMALL_WORDS:
+            out.append(tr_lower(w))
+        elif w.isupper() or w.islower():
+            out.append("-".join(title_case_word(part) for part in w.split("-")))
+        else:
+            out.append(w)
+    return " ".join(out)
+
+
+def _clean_line(line: str) -> str:
+    return re.sub(r"\s+", " ", line or "").strip()
+
+
+def _people_from_line(text: str) -> list:
+    """'Prof. Dr. Kürşad GÜLBEYAZ & Doç. Dr. Tarkan YAZICI' → kişiler (unvanlar atılır)."""
+    people = []
+    text = "".join(c for c in text or "" if c.isprintable() and not ("\ue000" <= c <= "\uf8ff")).replace("*", " ")
+    for part in re.split(r"\s*(?:&|;|,|\bve\b|\band\b)\s*", text):
+        words = [w for w in part.split() if fold(w) not in _ACADEMIC_TITLES and not re.fullmatch(r"[\W\d]+", w)]
+        if 2 <= len(words) <= 5 and not any(c.isdigit() for c in "".join(words)):
+            caps = 0
+            while caps < len(words) - 1 and words[-1 - caps].isupper() and len(words[-1 - caps]) > 1:
+                caps += 1
+            if caps >= 2 and not words[0].isupper():            # 'Alev TÜRKAN ÖZCAN': iki soyadlı
+                person = parse_person(" ".join(words[-caps:]) + ", " + " ".join(words[:-caps]))
+            else:
+                person = parse_person(" ".join(words))
+            if person and person.get("family"):
+                people.append(person)
+    return people
+
+
+def proceedings_record(pages: list, require_repeat=False) -> dict:
+    """Bildiri kitabının ilk sayfalarından künye: kongre/kitap adı, editörler, yıl, yayınevi.
+    pages: ilk sayfaların metinleri. Bildiri kitabı değilse {}.
+    require_repeat: kısa PDF'lerde 'bildiriler kitabı' satırı en az iki sayfada (sayfa başlığı olarak) geçmeli;
+    yoksa kaynakçada 'Proceedings of…' geçen sıradan bir makale bildiri sanılmasın."""
+    pages = pages[:6]
+    per_page = [[_clean_line(line) for line in (page or "").splitlines()] for page in pages]
+    book_lines = {}
+    for k, page_lines in enumerate(per_page):
+        for line in page_lines:
+            if line and len(line) < 140 and _PROC_BOOK_RE.search(fold(line)):
+                book_lines.setdefault(fold(line), set()).add(k)
+    if not book_lines or (require_repeat and max(len(v) for v in book_lines.values()) < 2):
+        return {}
+    lines = [line for page_lines in per_page for line in page_lines]
+    hit = next((k for k, line in enumerate(lines) if line and len(line) < 140 and _PROC_RE.search(fold(line))), None)
+    if hit is None:
+        return {}
+
+    def stop(line):
+        f = fold(line)
+        return (not line or len(line) > 120 or "www." in f or "http" in f or "@" in line
+                or _EDITOR_RE.match(f) or re.search(r"\b\d{1,2}\s*[-–]\s*\d{1,2}\b", line))
+    start = hit
+    while start > 0 and not stop(lines[start - 1]):
+        start -= 1
+    end = hit
+    while end + 1 < len(lines) and not stop(lines[end + 1]) and end - start < 5:
+        end += 1
+    title = " ".join(lines[start:end + 1]).strip(" .")
+    if is_shouting(title):
+        title = heading_case(title)
+    rec = {"type": "book", "title": title[:220]}
+
+    editors = []
+    for k, line in enumerate(lines):
+        m = _EDITOR_RE.match(fold(line))
+        if not m:
+            continue
+        rest = line[len(line) - len(m.group(4)):] if m.group(4) else ""
+        found = _people_from_line(rest) if rest else []
+        j = k + 1
+        while not found and j < len(lines) and j <= k + 2 and not lines[j]:
+            j += 1
+        while j < len(lines) and lines[j] and len(lines[j]) <= 80 and len(found) < 8 and not rest:
+            more = _people_from_line(lines[j])
+            if not more:
+                break
+            found.extend(more)
+            j += 1
+        if found:
+            editors = found
+            break
+    if editors:
+        rec["editors"] = editors
+
+    text = fold("\n".join(lines))
+    m = re.search(r"(?:yayin|basim|baski)\s+tarihi\s*:?\s*[^\n]{0,20}?\b((?:19|20)\d{2})\b", text) or \
+        re.search(r"(?:publication\s+date|published)\s*:?\s*[^\n]{0,20}?\b((?:19|20)\d{2})\b", text) or \
+        re.search(r"\b((?:19|20)\d{2})\b", "\n".join(fold(x) for x in lines[hit:hit + 40]))
+    if m:
+        rec["year"] = m.group(1)
+    for line in lines:
+        f = fold(line).lstrip("© ").strip()
+        if line and len(line) < 80 and _PUBLISHER_RE.search(f) and not f.startswith("©"):
+            pub = line.lstrip("© ").strip()
+            rec["publisher"] = heading_case(pub) if is_shouting(pub) else pub
+            break
+    rec["keywords"] = "Bildiri kitabı"
+    return rec
+
+
+def pdf_pages_text(path, first=8, last=0) -> tuple:
+    """(sayfa sayısı, [ilk sayfaların metni], [son sayfaların metni])"""
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(str(path))
+        n = len(reader.pages)
+
+        def text(k):
+            try:
+                return reader.pages[k].extract_text() or ""
+            except Exception:
+                return ""
+        head = [text(k) for k in range(min(first, n))]
+        tail = [text(k) for k in range(max(min(first, n), n - last), n)] if last else []
+        return n, head, tail
+    except Exception:
+        return 0, [], []
+
+
+BOOK_MIN_PAGES = 40
+
+
+def paper_in_proceedings(pages: list) -> dict:
+    """Bildiri kitabından ayrılmış tek bildirinin ilk sayfasından başlık ve yazarlar. Her sayfada yinelenen
+    sayfa başlığı (kongre adı, tarih, web adresi) ve sayfa numarası atlanır."""
+    if len(pages) < 2:
+        return {}
+    counts = {}
+    for page in pages[:6]:
+        for line in {fold(_clean_line(x)) for x in (page or "").splitlines()}:
+            if line:
+                counts[line] = counts.get(line, 0) + 1
+    repeated = {line for line, c in counts.items() if c >= 2}
+    lines = [_clean_line(x) for x in (pages[0] or "").splitlines()]
+    k = 0
+    while k < len(lines) and (not lines[k] or fold(lines[k]) in repeated or re.fullmatch(r"[\divxlc]+", fold(lines[k]))):
+        k += 1
+    block = []
+    while k < len(lines) and lines[k] and len(block) < 4:
+        block.append(lines[k])
+        k += 1
+    while k < len(lines) and not lines[k]:
+        k += 1
+    title = " ".join(block).replace("- ", "-").strip()
+    people = _people_from_line(lines[k]) if k < len(lines) else []
+    if len(title) < 12 or len(title) > 300 or not people:
+        return {}
+    return {"title": sentence_case(title, looks_turkish(title, "")) if is_shouting(title) else title,
+            "authors": people}
+
+
+def book_like_record(session, path) -> dict:
+    """DOI'si olmayan kitap boyutundaki PDF'in künyesi: bildiri kitabıysa kapak ve künye sayfasından, ISBN
+    varsa Crossref/Google Books'tan. Kısa bir bildiri PDF'iyse yalnızca içinde yer aldığı kitabın bilgisi
+    (tür 'Bildiri', kitap adı, editörler) döner; başlığa dokunulmaz."""
+    if not str(path).lower().endswith(".pdf"):
+        return {}
+    n, head, tail = pdf_pages_text(path, first=8, last=2)
+    if not n:
+        return {}
+    proc = proceedings_record(head, require_repeat=n < BOOK_MIN_PAGES)
+    if n < BOOK_MIN_PAGES:
+        if not proc:
+            return {}
+        out = {"type": "conference", "container": proc.get("title", ""), "editors": proc.get("editors") or [],
+               "publisher": proc.get("publisher", ""), "year": proc.get("year", "")}
+        out.update(paper_in_proceedings(head))
+        return {k: v for k, v in out.items() if v}
+    isbns = find_isbns(re.sub(r"https?://\S+", " ", "\n".join(head + tail)))
+    looked = {}
+    if isbns and session is not None:
+        try:
+            looked = book_record_by_isbn(session, isbns[0]) or {}
+        except Exception:
+            looked = {}
+    if not proc and not looked:
+        return {}
+    rec = merge_records(proc, looked) if proc else merge_records(looked, {})
+    if proc and not proc.get("editors") and looked.get("authors"):
+        rec["editors"], rec["authors"] = looked["authors"], []        # bildiri kitabında yazar değil editör
+    rec["type"] = "book"
+    if proc:
+        rec["keywords"] = rec.get("keywords") or "Bildiri kitabı"
+    return {k: v for k, v in rec.items() if v}
+
+
 ARCHIVE_META_API = "https://archive.org/metadata/"
 _LOGIN_RE = re.compile(r"(login|signin|sign-in|shibboleth|/idp/|ezproxy|openathens|/sso|wayf|/auth/|"
                        r"cas/login|myathens|giris)", re.I)
@@ -2720,6 +2935,9 @@ def apa_segments(rec: dict, lang: str = "tr") -> list:
     title_dot = title + ("" if title[-1:] in "?!" else ".") if title else ""
     italic_title = kind in ("book", "phd", "masters", "other")
     authors = apa_people(rec.get("authors"))
+    if not authors and kind == "book" and rec.get("editors"):         # derleme / bildiri kitabı: Editör (Ed.).
+        eds = rec["editors"]
+        authors = apa_people(eds) + f" ({w['eds'] if len(eds) > 1 else w['ed']})."
     year = f"({rec.get('year') or w['nd']})."
     container = (rec.get("container") or "").strip().rstrip(".")
     pages = (rec.get("pages") or "").strip()
@@ -2946,7 +3164,7 @@ def to_ris(records) -> str:
 
 def library_filename(rec: dict, ext: str = ".pdf") -> str:
     """Kütüphane klasöründeki standart ad: 'Soyad (Yıl) - Başlık.pdf'"""
-    people = rec.get("authors") or []
+    people = rec.get("authors") or (rec.get("editors") if rec.get("type") == "book" else None) or []
     who = people[0].get("family", "") if people else ""
     if len(people) > 2:
         who += " vd."
@@ -3611,12 +3829,15 @@ def catalog_pdf(library, session, path: Path, sha: str, meta=None, url="", doi=N
         cr = None                                    # PDF'teki DOI başka bir yayına ait
         doi = None
     file_rec = record_from_filename(path.stem)
-    info = pdf_info(path) if not (cr or page_rec.get("title")) else {}
+    book = book_like_record(session, path) if not (cr or page_rec.get("title") or (known or {}).get("title")) else {}
+    if book.get("title"):
+        file_rec = {}                                  # 'bildiri-kitabi_96567' gibi dosya adları başlık olmasın
+    info = pdf_info(path) if not (cr or page_rec.get("title") or book.get("title")) else {}
     info_rec = {}
     if info.get("title") and len(info["title"]) > 10 and not re.search(r"\.docx?$|untitled|microsoft", info["title"], re.I):
         info_rec = {"title": info["title"], "authors": text_to_people(info.get("author", ""))}
     record = merge_records(cr or {}, merge_records(known or {}, merge_records(page_rec, merge_records(
-        file_rec if " - " in path.stem else {}, merge_records(info_rec, file_rec)))))
+        book, merge_records(file_rec if " - " in path.stem else {}, merge_records(info_rec, file_rec))))))
     if doi and not record.get("doi"):
         record["doi"] = doi
     if url and not record.get("url") and not is_doi_host(url):
@@ -7661,6 +7882,83 @@ def pdf_highlights(path) -> list:
     return out
 
 
+def title_looks_bad(item) -> bool:
+    """Başlık dosya adından ya da PDF'in iç bilgisinden kalmış gibi mi? ('bildiri-kitabi_96567', 'Microsoft Word - x')"""
+    t = (item.get("title") or "").strip()
+    if not t:
+        return True
+    f = fold(t)
+    if re.search(r"\.(pdf|docx?|epub)$", f) or f.startswith(("microsoft word", "untitled", "adsiz", "kapak")):
+        return True
+    if " " not in t and re.search(r"[-_]", t):
+        return True
+    if re.search(r"_\d{3,}$", t) or re.fullmatch(r"(indir|download|document|retrieve|fulltext|tam ?metin)\W*\d*", f):
+        return True
+    if t.count("-") + t.count("_") >= 3 and t.count(" ") <= 1:
+        return True
+    return bool(re.fullmatch(r"[\d\W_]+", t))
+
+
+def reextract_record(session, item) -> dict:
+    """Kayıtlı PDF'ten künyeyi baştan çıkarır (DOI → Crossref; bildiri kitabı / ISBN; PDF iç bilgisi).
+    Daha iyi bir künye bulunamazsa {}."""
+    path = item.get("file_path") or ""
+    if not path.lower().endswith(".pdf") or not os.path.isfile(path):
+        return {}
+    head = pdf_text(path, max_pages=2, max_chars=20_000)
+    rec = {}
+    m = DOI_RE.search(head)
+    if m and session is not None:
+        doi = clean_url(m.group(1))
+        cr = crossref_record(session, doi)
+        if cr and title_matches_text(cr.get("title", ""), head):
+            rec = dict(cr, doi=doi)
+    if not rec.get("title"):
+        book = book_like_record(session, path)
+        if book.get("title"):
+            rec = book
+    if not rec.get("title"):
+        info = pdf_info(path)
+        title = info.get("title") or ""
+        if len(title) > 10 and not title_looks_bad({"title": title}):
+            rec = {"title": title, "authors": text_to_people(info.get("author", ""))}
+    if not rec.get("title"):
+        return {}
+    new = finalize_record(rec)
+    if fold(new["title"]) == fold(item.get("title") or "") and new.get("type") == item.get("type"):
+        return {}
+    return new
+
+
+class ReextractWorker(threading.Thread):
+    """Seçilen kayıtların künyesini PDF'ten yeniden çıkarır (önizleme için; kütüphaneye yazmaz).
+    Mesajlar: ("rx", sıra, toplam) · ("rx_done", [(kayıt, yeni_künye)], durduruldu)"""
+
+    def __init__(self, items, events):
+        super().__init__(name="künye-yeniden", daemon=True)
+        self.items, self.events = items, events
+        self.cancel = threading.Event()
+
+    def run(self):
+        found = []
+        session = make_session()
+        try:
+            for n, item in enumerate(self.items, start=1):
+                if self.cancel.is_set():
+                    break
+                self.events.put(("rx", n, len(self.items)))
+                try:
+                    new = reextract_record(session, item)
+                except Exception as exc:
+                    diag(f"künye yeniden çıkarma: {describe_error(exc)}")
+                    new = {}
+                if new:
+                    found.append((item, new))
+        finally:
+            session.close()
+            self.events.put(("rx_done", found, self.cancel.is_set()))
+
+
 class HighlightWorker(threading.Thread):
     """PDF'lerdeki vurguları alıntı kartlarına aktarır; değişmeyen dosyalar bir dahaki sefere atlanır.
     Mesajlar: ("hl", sıra, toplam) · ("hl_done", eklenen_kart, kaynak_sayısı, durduruldu)"""
@@ -10056,6 +10354,80 @@ class DuplicatesWindow(ctk.CTkToplevel):
         self.destroy()
 
 
+class ReextractWindow(ctk.CTkToplevel):
+    """PDF'ten yeniden çıkarılan künyelerin önizlemesi: eski → yeni; seçilenler uygulanır, dosya yeniden adlanır."""
+
+    FIELDS = ("title", "authors", "editors", "year", "type", "container", "volume", "issue", "pages", "publisher",
+              "doi", "issn")
+
+    def __init__(self, app, results):
+        super().__init__(app)
+        self.app, self.results = app, results
+        self.title("Künyeleri PDF'ten yeniden çıkar")
+        set_window_icon(self, delay=260)
+        self.geometry("980x620")
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(self, text=f"{len(results)} kaydın PDF'inden farklı bir künye çıktı. Uygulanacakları işaretleyin; "
+                                "PDF dosyası da yeni künyeye göre yeniden adlandırılır. Etiketler, kartlar ve notlar "
+                                "değişmez.", anchor="w", justify="left", wraplength=940).grid(
+            row=0, column=0, sticky="ew", padx=14, pady=(12, 6))
+        body = ctk.CTkScrollableFrame(self)
+        body.grid(row=1, column=0, sticky="nsew", padx=10)
+        body.grid_columnconfigure(0, weight=1)
+        self.vars = []
+        for k, (item, new) in enumerate(results):
+            var = ctk.BooleanVar(value=True)
+            self.vars.append(var)
+            box = ctk.CTkFrame(body)
+            box.grid(row=k, column=0, sticky="ew", pady=4)
+            ctk.CTkCheckBox(box, text=f"No {item.get('no')}", variable=var).pack(anchor="w", padx=8, pady=(6, 2))
+            ctk.CTkLabel(box, text="Eski:  " + apa_text(item), anchor="w", justify="left", wraplength=880,
+                         text_color=MUTED, font=ctk.CTkFont(size=12)).pack(anchor="w", padx=24)
+            ctk.CTkLabel(box, text="Yeni:  " + apa_text(new) + f"   [{ITEM_TYPES.get(new.get('type'), '')}]",
+                         anchor="w", justify="left", wraplength=880, font=ctk.CTkFont(size=12)).pack(
+                anchor="w", padx=24, pady=(0, 6))
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.grid(row=2, column=0, sticky="e", padx=14, pady=10)
+        ctk.CTkButton(btns, text="Kapat", width=90, fg_color="transparent", border_width=1, text_color=TEXT,
+                      command=self.destroy).pack(side="left", padx=8)
+        if results:
+            ctk.CTkButton(btns, text="Seçilenleri Uygula", width=170, command=self.apply).pack(side="left")
+        self.after(80, self.lift)
+
+    def apply(self):
+        lib, folder = self.app.library, self.app.library_folder()
+        done, renamed = 0, 0
+        for (item, new), var in zip(self.results, self.vars):
+            if not var.get() or not lib.get(item["id"]):
+                continue
+            fields = {k: new.get(k) for k in self.FIELDS if new.get(k)}
+            if new.get("type") == "book" and new.get("editors") and not new.get("authors"):
+                fields["authors"] = []                    # bildiri kitabı: ilk bildirinin yazarı kitabın yazarı değil
+            if new.get("type") != "conference" and item.get("type") == "conference" and not new.get("container"):
+                fields["container"] = ""
+            for k in ("keywords", "language"):
+                if new.get(k) and not item.get(k):
+                    fields[k] = new[k]
+            if fields.get("doi") and lib.find_by_doi(fields["doi"]) not in (None, item["id"]):
+                fields.pop("doi")
+            lib.update(item["id"], fields)
+            done += 1
+            current = lib.get(item["id"])
+            if current and current["file_path"] and Path(current["file_path"]).is_file():
+                try:
+                    new_path = place_in_library(Path(current["file_path"]), current,
+                                                folder or Path(current["file_path"]).parent)
+                    if str(new_path) != current["file_path"]:
+                        lib.update(item["id"], {"file_path": str(new_path)})
+                        renamed += 1
+                except OSError as exc:
+                    diag(f"yeniden adlandırma: {describe_error(exc)}")
+        self.app.library_tab.refresh()
+        self.app.toast(f"{done} kaydın künyesi güncellendi" + (f", {renamed} dosya yeniden adlandırıldı." if renamed else "."))
+        self.destroy()
+
+
 class ReadingNotes(ctk.CTkToplevel):
     """Kitabı (tarayıcıda, okuma uygulamasında ya da PDF'te) okurken her zaman üstte duran küçük not penceresi:
     sayfa + alıntı + yorum → kaynağın alıntı kartı. Okumayı ve kopyalamayı kullanıcı yapar."""
@@ -10878,7 +11250,8 @@ class LibraryTab:
         self.allseen_btn.pack(side="left", padx=(16, 0))
         self.tools_menu = ctk.CTkOptionMenu(acts, width=120, dynamic_resizing=False, command=self._tool_chosen,
                                             values=["Atıf ağı ve eksik kaynaklar…", "Mükerrer kayıtları bul…",
-                                                    "PDF işaretlemelerini kartlara aktar…"])
+                                                    "PDF işaretlemelerini kartlara aktar…",
+                                                    "Künyeyi PDF'ten yeniden çıkar…"])
         self.tools_menu.set("Araçlar ▾")
         self.tools_menu.pack(side="left", padx=(8, 0))
 
@@ -11530,6 +11903,37 @@ class LibraryTab:
             DuplicatesWindow(self.app)
         elif choice.startswith("PDF"):
             self._import_highlights()
+        elif choice.startswith("Künyeyi"):
+            self._reextract()
+
+    def _reextract(self):
+        worker = getattr(self.app, "rx_worker", None)
+        if worker and worker.is_alive():
+            self.app.toast("Künyeler zaten çıkarılıyor.")
+            return
+        with_pdf = [i for i in self.selected_items() if (i.get("file_path") or "").lower().endswith(".pdf")]
+        if not with_pdf:
+            bad = [i for i in self.items if (i.get("file_path") or "").lower().endswith(".pdf") and title_looks_bad(i)]
+            if not bad:
+                messagebox.showinfo(APP_NAME, "Tabloda PDF'li kayıt seçin; seçtiklerinizin künyesi PDF'ten yeniden "
+                                              "çıkarılıp önizlemede gösterilir.\n\n(Başlığı dosya adı gibi görünen "
+                                              "kayıt bulunamadı.)", parent=self.parent)
+                return
+            if not messagebox.askokcancel(
+                    APP_NAME, f"Seçili kayıt yok. Başlığı dosya adından kalmış gibi görünen {len(bad)} PDF'li kayıt "
+                              f"(No {no_ranges_text([i.get('no') for i in bad], 6)}) yeniden çıkarılsın mı?\n\n"
+                              "Önce önizleme gösterilir; siz onaylamadan hiçbir şey değişmez.", parent=self.parent):
+                return
+            with_pdf = bad
+        self.app.rx_worker = ReextractWorker(with_pdf, self.app.events)
+        self.app.rx_worker.start()
+
+    def on_reextract_done(self, found, stopped):
+        self.refresh()
+        if not found:
+            self.app.toast(("Durduruldu. " if stopped else "") + "PDF'lerden daha iyi bir künye çıkmadı.")
+            return
+        ReextractWindow(self.app, found)
 
     def _import_highlights(self):
         worker = getattr(self.app, "hl_worker", None)
@@ -13590,6 +13994,11 @@ class App(ctk.CTk):
         elif kind == "hl":
             n, total = message[1:]
             self.library_tab.count_label.configure(text=f"PDF işaretlemeleri okunuyor {n}/{total}…")
+        elif kind == "rx":
+            n, total = message[1:]
+            self.library_tab.count_label.configure(text=f"Künyeler PDF'ten çıkarılıyor {n}/{total}…")
+        elif kind == "rx_done":
+            self.library_tab.on_reextract_done(*message[1:])
         elif kind == "hl_done":
             self.library_tab.on_highlights_done(*message[1:])
         elif kind == "isbn_done":
