@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.41"
+APP_VERSION = "2.42"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -4189,7 +4189,7 @@ class PdfRetryWorker(threading.Thread):
 
     def __init__(self, items, library, events, library_folder, email="", label=""):
         super().__init__(daemon=True)
-        self.items = sorted(items, key=lambda i: i.get("no") or 0)
+        self.items = sorted(items, key=lambda i: (not is_thesis(i), i.get("no") or 0))   # önce tezler (YÖK)
         self.library, self.events, self.library_folder, self.email = library, events, library_folder, email
         self.label = label
         self.cancel = threading.Event()
@@ -4203,6 +4203,8 @@ class PdfRetryWorker(threading.Thread):
         row["outcome"] = outcome or "had"
         if outcome == "found":
             row.update(self._via.get(item["id"], {}))
+        elif item["id"] in getattr(self, "_thesis_note", {}):
+            row["thesis"] = self._thesis_note[item["id"]]
 
     def run(self):
         found_nos, tried_nos, deferred = [], [], []
@@ -4274,35 +4276,18 @@ class PdfRetryWorker(threading.Thread):
         THROTTLE.reset_flag()
         self.downloader._tried = set()
         try:
-            tez = yok_tez_no(current)
-            if tez:
-                if self.yses is None:
-                    self.yses = make_session()
-                    yok_open_session(self.yses)
-                hits = [r for r in search_yok(self.yses, tez) if r.get("tez_no") == tez]
-                url = yok_pdf_url(self.yses, hits[0]["yok_keys"]) if hits else None
-                if url:
-                    tmp = Path(self.library_folder) / f".yok_{tez}.part"
-                    with self.yses.get(url, stream=True, timeout=(15, 180)) as r:
-                        r.raise_for_status()
-                        with open(tmp, "wb") as fh:
-                            for block in r.iter_content(1 << 16):
-                                fh.write(block)
-                    if tmp.read_bytes()[:1024].find(b"%PDF-") >= 0:
-                        placed = attach_pdf(self.library, item["id"], tmp, self.library_folder, move=True)
-                        self._via[item["id"]] = {"via": "YÖK Tez Merkezi", "file": Path(placed).name}
-                        return "found"
-                    tmp.unlink(missing_ok=True)
-                time.sleep(YOK_PAUSE)
-            else:
-                links = (["https://doi.org/" + current["doi"]] if current["doi"] else []) + \
-                        ([current["url"]] if current["url"] else [])
-                self.downloader._tried = set()
-                for link in links:
-                    self.downloader._last_saved = None
-                    result = self.downloader._download_one(self.session, link, n)
-                    if self._take_saved(item, result):
-                        return "found"
+            if is_thesis(current):
+                if self._try_yok(current, item):
+                    return "found"
+            links = (["https://doi.org/" + current["doi"]] if current["doi"] else []) + \
+                    ([current["url"]] if current["url"] else [])
+            self.downloader._tried = set()
+            for link in links:
+                self.downloader._last_saved = None
+                result = self.downloader._download_one(self.session, link, n)
+                if self._take_saved(item, result):
+                    return "found"
+            if links:
                 time.sleep(self.PAUSE)
             if self.cancel.is_set():
                 return "none"
@@ -4312,6 +4297,39 @@ class PdfRetryWorker(threading.Thread):
         except Exception as exc:
             diag(f"PDF yeniden arama: {item['title'][:60]}: {describe_error(exc)}")
         return "limited" if THROTTLE.was_limited() else "none"
+
+    def _try_yok(self, current, item) -> bool:
+        """Tezi YÖK Tez Merkezi'nden dener: Tez No'yla, yoksa başlıkla bulup Tez No'yu kayda yazar."""
+        if not hasattr(self, "_thesis_note"):
+            self._thesis_note = {}
+        try:
+            if self.yses is None:
+                self.yses = make_session()
+                yok_open_session(self.yses)
+            tez = yok_tez_no(current)
+            rec = None
+            if tez:
+                rec = next((r for r in search_yok(self.yses, tez) if r.get("tez_no") == tez), None)
+            else:
+                rec = find_yok_thesis(self.yses, current)
+                if rec and rec.get("tez_no"):
+                    tez = rec["tez_no"]
+                    self.library.update(item["id"], {"notes": "\n".join(filter(None, [
+                        current.get("notes"), f"YÖK Tez No: {tez}"]))})
+            time.sleep(YOK_PAUSE)
+            if not rec:
+                self._thesis_note[item["id"]] = "YÖK Tez Merkezi'nde bulunamadı"
+                return False
+            tmp, kind, reason = yok_download(self.yses, rec["yok_keys"], self.library_folder, tez or item["id"])
+            if tmp:
+                placed = attach_pdf(self.library, item["id"], tmp, self.library_folder, move=True)
+                self._via[item["id"]] = {"via": "YÖK Tez Merkezi", "file": Path(placed).name}
+                return True
+            self._thesis_note[item["id"]] = reason
+        except Exception as exc:
+            self._thesis_note[item["id"]] = "YÖK'e ulaşılamadı: " + describe_error(exc)
+            diag(f"YÖK tez arama: {describe_error(exc)}")
+        return False
 
     def _take_saved(self, item, result) -> bool:
         saved = self.downloader._last_saved
@@ -5179,18 +5197,90 @@ def yok_detail(session, keys) -> dict:
         return {}
 
 
-def yok_pdf_url(session, keys):
-    """Yazarı izin verdiyse PDF adresi, vermediyse None."""
+def yok_pdf_status(session, keys):
+    """(PDF adresi | None, neden). Neden: yazar izin vermemiş / erişim belli bir tarihe kadar kapalı."""
     r = session.get(YOK_BASE + "getTezPdf.jsp", params={"kayitNo": keys[0], "tezNo": keys[1]},
                     timeout=(15, 60))
     r.raise_for_status()
     m = re.search(r"TezGoster\?key=([^'\"\s>]+)", r.text)
-    return YOK_BASE + "TezGoster?key=" + m.group(1) if m else None
+    if m:
+        return YOK_BASE + "TezGoster?key=" + html.unescape(m.group(1)), ""
+    text = _strip_tags(r.text)
+    d = re.search(r"\b(\d{1,2}[./]\d{1,2}[./](?:19|20)\d{2})\b", text)
+    if d:
+        return None, f"erişim {d.group(1)} tarihine kadar kapalı"
+    return None, "yazar PDF izni vermemiş"
+
+
+def yok_pdf_url(session, keys):
+    """Yazarı izin verdiyse PDF adresi, vermediyse None."""
+    return yok_pdf_status(session, keys)[0]
+
+
+def yok_download(session, keys, folder, name):
+    """İzinli tezin PDF'ini indirir. Dönüş: (geçici dosya | None, 'pdf' | 'closed' | 'failed', neden).
+    PDF yerine sayfa ya da hata gelirse oturum tazelenip bir kez daha denenir; neden tanılama kaydına yazılır."""
+    url, reason = yok_pdf_status(session, keys)
+    if not url:
+        return None, "closed", reason
+    tmp = Path(folder) / f".yok_{name}.part"
+    last = ""
+    for attempt in range(2):
+        time.sleep(YOK_PAUSE)
+        try:
+            with session.get(url, stream=True, timeout=(15, 180), headers={"Referer": YOK_BASE}) as r:
+                if r.status_code >= 400:
+                    last = f"HTTP {r.status_code}"
+                else:
+                    with open(tmp, "wb") as fh:
+                        for block in r.iter_content(1 << 16):
+                            fh.write(block)
+                    head = tmp.read_bytes()[:4096]
+                    if head[:1024].find(b"%PDF-") >= 0:
+                        return tmp, "pdf", ""
+                    title = re.search(rb"<title[^>]*>(.*?)</title>", head, re.I | re.S)
+                    last = "PDF yerine sayfa geldi" + (
+                        f" (“{_strip_tags(title.group(1).decode('utf-8', 'replace')).strip()[:60]}”)" if title else "")
+        except requests.RequestException as exc:
+            last = describe_error(exc)
+        tmp.unlink(missing_ok=True)
+        if attempt == 0:
+            try:                                      # oturumu ve indirme anahtarını tazele
+                yok_open_session(session)
+                url, reason = yok_pdf_status(session, keys)
+            except Exception as exc:
+                last = describe_error(exc)
+                break
+            if not url:
+                return None, "closed", reason
+    diag(f"YÖK tez PDF'i indirilemedi ({name}): {last}")
+    return None, "failed", "indirme başarısız: " + (last or "bilinmeyen hata")
+
+
+def find_yok_thesis(session, item):
+    """Tez No'su olmayan tez kaydını Tez Merkezi'nde başlıkla bulur (Türkçe ya da İngilizce başlık + yıl + yazar)."""
+    title = re.split(r"[:.?!]\s", item.get("title") or "")[0].strip()
+    if len(title) < 12:
+        return None
+    year = str(item.get("year") or "")[:4]
+    fam = fold(((item.get("authors") or [{}])[0] or {}).get("family", "")) if item.get("authors") else ""
+    for rec in search_yok(session, title)[:200]:
+        if not any(same_title(item.get("title") or "", t) or same_title(title, t) for t in rec.get("all_titles") or []):
+            continue
+        ry = str(rec.get("year") or "")[:4]
+        if year.isdigit() and ry.isdigit() and abs(int(year) - int(ry)) > 1:
+            continue
+        rf = fold(((rec.get("authors") or [{}])[0] or {}).get("family", "")) if rec.get("authors") else ""
+        if fam and rf and fam != rf:
+            continue
+        return rec
+    return None
 
 
 def yok_open_html(tez_no: str) -> Path:
     """Tezi Tez Merkezi'nde açan küçük sayfa (site tez numarasıyla doğrudan bağlantı vermiyor)."""
-    path = settings_path().parent / "yok_tez_ac.html"
+    safe = re.sub(r"\D", "", tez_no) or "x"
+    path = settings_path().parent / "yok_tezleri" / f"tez_{safe}.html"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"""<!doctype html><meta charset="utf-8"><title>YÖK Tez {html.escape(tez_no)}</title>
 <body onload="document.forms[0].submit()"><form method="post" action="{YOK_BASE}SearchTez">
@@ -5210,6 +5300,10 @@ def yok_keywords(text) -> list:
 def yok_tez_no(item) -> str:
     m = re.search(r"YÖK Tez No:\s*(\d+)", item.get("notes") or "")
     return m.group(1) if m else ""
+
+
+def is_thesis(item) -> bool:
+    return item.get("type") in ("phd", "masters") or bool(yok_tez_no(item))
 
 
 def yok_queries(matcher, include_context: bool = True) -> list:
@@ -5493,7 +5587,10 @@ def write_retry_report(library_folder, label, rows, untouched, seconds, stopped,
                  f'<a href="{_h(search_link(item, "Google Akademik"))}">Google Akademik</a>',
                  f'<a href="{_h(search_link(item, "BASE (kurum arşivleri)"))}">BASE</a>']
         db = database_for_doi(item.get("doi") or "")
-        return line(row, f'<div class="c"><span class="chip {cls}">{label}</span>'
+        if row.get("thesis"):
+            links[0] = f'<a href="{_h(item_open_link(item))}">Tez Merkezi</a>'
+            label = f"Tez · {row['thesis']}"
+        return line(row, f'<div class="c"><span class="chip {cls}">{_h(label)}</span>'
                          + (f'<span class="chip inst">kurum erişimi: {_h(db)}</span>' if db else "")
                          + f'<span class="links">{" · ".join(links)}</span></div>')
 
@@ -5577,7 +5674,9 @@ def write_scan_report(path: Path, info: dict, found: list, added_items: list) ->
     scopus = load_scopus()
     status_label = {"pdf": ("PDF indirildi", "ok"), "nopdf": ("PDF yok", "warn"),
                     "institution": ("Kurum erişimi gerekebilir", "inst"), "known": ("Zaten kütüphanede", "muted"),
-                    "thesis_closed": ("Tez · yazar PDF izni vermemiş", "warn"),
+                    "thesis_closed": ("Tez · PDF'i yayımlanmamış", "warn"),
+                    "thesis_failed": ("Tez · PDF indirilemedi", "warn"),
+                    "thesis_untried": ("Tez · PDF denenmedi", "muted"),
                     "pdf_found": ("Kütüphanedeydi · PDF'i şimdi bulundu", "ok")}
 
     def card(entry, group):
@@ -5596,8 +5695,10 @@ def write_scan_report(path: Path, info: dict, found: list, added_items: list) ->
         sc_chip = f'<span class="chip sc">{_h(sc)}</span>' if sc else ""
         title = _h(rec.get("title") or "(başlıksız)")
         title_html = f'<a href="{_h(link)}">{title}</a>' if link else title
+        note = entry.get("note") or ""
         return (f'<li><div class="t">{title_html}</div><div class="m">{_h(meta)}</div>'
-                f'<div class="c"><span class="chip {cls}">{_h(label)}{" · " + _h(db) if db else ""}</span>'
+                f'<div class="c"><span class="chip {cls}">{_h(label)}{" · " + _h(db) if db else ""}'
+                f'{" · " + _h(note) if note else ""}</span>'
                 f'{sc_chip}<span class="chip">{_h(rec.get("source", ""))}</span>'
                 f'<span class="kw">eşleşen: {_h(terms)}</span></div></li>')
 
@@ -5953,6 +6054,9 @@ class ScanWorker(threading.Thread):
         new = sum(1 for e in found if e["status"] not in ("known", "thesis_skipped"))
         pdfs = sum(1 for e in found if e["status"] == "pdf")
         self.summary = f"{new} yeni yayın bulundu, {pdfs} tanesinin PDF'i indi."
+        failed = len(set(getattr(self, "failed_theses", [])))
+        if failed:
+            self.summary += f" {failed} izinli tezin PDF'i indirilemedi."
         if not self.cancel.is_set():
             self.settings["last_scan"] = now.isoformat()
             self.settings["last_report"] = str(self.report_path)
@@ -6031,13 +6135,16 @@ class ScanWorker(threading.Thread):
                      or (rec.get("tez_no") and self.library.find_by_tez_no(rec["tez_no"])))
             if known:
                 status = "known"
-                if getattr(self, "retry_missing_pdf", False) and max_downloads != 0:
+                if rec.get("source") == "YÖK Tez" and rec.get("yok_keys") and max_downloads != 0:
+                    status = self._retry_known_thesis(rec, known, info) or "known"
+                elif getattr(self, "retry_missing_pdf", False) and max_downloads != 0:
                     status = self._retry_pdf(session, rec, known, n, max_downloads, info) or "known"
                 found.append({"record": rec, "hits": hits, "status": status, "item_id": known})
                 continue
             if rec.get("source") == "YÖK Tez":
-                status, item_id = self._add_thesis(rec, hits, source, max_downloads, info)
-                found.append({"record": rec, "hits": hits, "status": status, "item_id": item_id})
+                status, item_id, *note = self._add_thesis(rec, hits, source, max_downloads, info)
+                found.append({"record": rec, "hits": hits, "status": status, "item_id": item_id,
+                              "note": note[0] if note else ""})
                 continue
             if rec.get("source") in ("Crossref", "OpenAlex") and rec.get("doi"):
                 full = crossref_record(session, rec["doi"])         # cilt, sayı, sayfa, yayınevi
@@ -6075,6 +6182,21 @@ class ScanWorker(threading.Thread):
             else:
                 self.library.update(item_id, {"is_new": 1, "matched": matched})
             found.append({"record": rec, "hits": hits, "status": status, "item_id": item_id})
+
+    def _retry_known_thesis(self, rec, item_id, info):
+        """Kütüphanede PDF'siz duran YÖK tezini (izinliyse) indirir; kotadan sayılmaz, günde bir kez denenir."""
+        item = self.library.get(item_id)
+        if not item or (item["file_path"] and os.path.exists(item["file_path"])) or not self.library_folder:
+            return None
+        today = datetime.now().strftime("%Y-%m-%d")
+        if item.get("pdf_tried") == today:
+            return None
+        self.library.update(item_id, {"pdf_tried": today})
+        if not yok_tez_no(item) and rec.get("tez_no"):
+            self.library.update(item_id, {"notes": "\n".join(filter(None, [item.get("notes"),
+                                                                           f"YÖK Tez No: {rec['tez_no']}"]))})
+        status, _ = self._fetch_thesis(rec, item_id, None, info)
+        return "pdf_found" if status == "pdf" else None
 
     def _retry_pdf(self, session, rec, item_id, n, max_downloads, info):
         """Kütüphanede PDF'siz duran kaynağın PDF'ini yeniden dener (7 günde en fazla bir kez)."""
@@ -6165,29 +6287,27 @@ class ScanWorker(threading.Thread):
         abstract = _strip_tags(detail.get("trOzet") or detail.get("enOzet") or "")
         if abstract:
             self.library.set_fulltext(item_id, abstract)
-        status = "thesis_closed"
-        if self.library_folder and (max_downloads is None or self.attempts < max_downloads):
-            self.attempts += 1
-            try:
-                url = yok_pdf_url(session, rec["yok_keys"])
-                time.sleep(YOK_PAUSE)
-                if url:
-                    status = "nopdf"
-                    tmp = Path(self.library_folder) / f".yok_{rec.get('tez_no') or item_id}.part"
-                    with session.get(url, stream=True, timeout=(15, 180)) as r:
-                        r.raise_for_status()
-                        with open(tmp, "wb") as fh:
-                            for block in r.iter_content(1 << 16):
-                                fh.write(block)
-                    if tmp.read_bytes()[:1024].find(b"%PDF-") >= 0:
-                        attach_pdf(self.library, item_id, tmp, self.library_folder, move=True)
-                        status = "pdf"
-                    else:
-                        tmp.unlink(missing_ok=True)
-                    time.sleep(YOK_PAUSE)
-            except Exception as exc:
-                info["errors"].append(f"YÖK Tez {rec.get('tez_no')}: {describe_error(exc)}")
-        return status, item_id
+        status, note = self._fetch_thesis(rec, item_id, max_downloads, info)
+        return status, item_id, note
+
+    def _fetch_thesis(self, rec, item_id, max_downloads, info):
+        """İzinli tezin PDF'ini indirir. Tezler ortak indirme kotasından sayılmaz (az sayıda ve resmî kaynak);
+        yalnızca 'PDF indirme (yalnızca künye)' seçiliyse denenmez. Dönüş: (durum, açıklama)"""
+        if not self.library_folder or max_downloads == 0:
+            return "thesis_untried", "PDF indirme bu taramada kapalıydı"
+        try:
+            tmp, kind, reason = yok_download(self._yok(), rec["yok_keys"], self.library_folder,
+                                             rec.get("tez_no") or item_id)
+        except Exception as exc:
+            tmp, kind, reason = None, "failed", "indirme başarısız: " + describe_error(exc)
+        if tmp:
+            attach_pdf(self.library, item_id, tmp, self.library_folder, move=True)
+            return "pdf", ""
+        if kind == "closed":
+            return "thesis_closed", reason
+        info["errors"].append(f"YÖK Tez {rec.get('tez_no')}: {reason}")
+        self.failed_theses = getattr(self, "failed_theses", []) + [item_id]
+        return "thesis_failed", reason
 
     def _collect_yok(self, query, candidates, matcher, info, year_ok=None):
         for rec in search_yok(self._yok(), query):
@@ -6400,6 +6520,9 @@ class ScanWorker(threading.Thread):
         elif finished:
             self.summary = (f"Geçmişe dönük tarama bitti ({period}): {new} yeni kaynak, {pdfs} PDF"
                             + (f"; PDF'siz duran {later} kaynağın PDF'i de bulundu." if later else "."))
+            failed = len(set(getattr(self, "failed_theses", [])))
+            if failed:
+                self.summary += f" {failed} izinli tezin PDF'i indirilemedi."
         elif limited and not self.cancel.is_set():
             self.summary = (f"Geçmişe dönük tarama şimdilik bitti: {new} yeni kaynak, {pdfs} PDF. "
                             f"{', '.join(limited)} günlük kullanım sınırına ulaştı; yarın 'Geçmişe Dönük Tara' → "
@@ -9948,13 +10071,13 @@ def search_link(item, site) -> str:
 
 def item_open_link(item) -> str:
     """Kaynağın PDF'ine ulaşılacak sayfa: DOI, link, YÖK tezi ya da başlıkla Google Akademik araması."""
+    tez = yok_tez_no(item)
+    if tez:                                           # tezlerde önce Tez Merkezi'ndeki kaydı
+        return yok_open_html(tez).as_uri()
     if item.get("doi"):
         return "https://doi.org/" + item["doi"]
     if item.get("url"):
         return item["url"]
-    tez = yok_tez_no(item)
-    if tez:
-        return yok_open_html(tez).as_uri()
     return "https://scholar.google.com/scholar?q=" + quote(f'"{item.get("title", "")}"')
 
 
@@ -11188,6 +11311,9 @@ class LibraryTab:
 
     STATUS_FILTERS = ["Tümü", "Yeni (taramadan)", "PDF'i olanlar", "PDF'i olmayanlar", "Kartı olanlar",
                       "Scopus'taki dergiler"]
+    TYPE_FILTERS = {"Tüm türler": None, "Makale": ("article",), "Kitap": ("book",), "Kitap bölümü": ("chapter",),
+                    "Bildiri": ("conference",), "Tez (hepsi)": "thesis", "Doktora tezi": ("phd",),
+                    "Yüksek lisans tezi": ("masters",), "Diğer": ("other",)}
 
     def __init__(self, parent, app):
         self.app = app
@@ -11226,11 +11352,14 @@ class LibraryTab:
         self.tag_menu = ctk.CTkOptionMenu(bar, values=["Tüm etiketler"], width=170,
                                           command=lambda _: self.refresh(), dynamic_resizing=False)
         self.tag_menu.grid(row=0, column=2, padx=(0, 8))
+        self.type_menu = ctk.CTkOptionMenu(bar, values=list(self.TYPE_FILTERS), width=140,
+                                           command=lambda _: self.refresh(), dynamic_resizing=False)
+        self.type_menu.grid(row=0, column=3, padx=(0, 8))
         self.status_menu = ctk.CTkOptionMenu(bar, values=self.STATUS_FILTERS, width=160,
                                              command=lambda _: self.refresh(), dynamic_resizing=False)
-        self.status_menu.grid(row=0, column=3, padx=(0, 8))
+        self.status_menu.grid(row=0, column=4, padx=(0, 8))
         acts = ctk.CTkFrame(bar, fg_color="transparent")          # ikinci satır: işlemler
-        acts.grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        acts.grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
         outline = {"fg_color": "transparent", "border_width": 1, "text_color": TEXT}
         ctk.CTkButton(acts, text="Dosya Ekle…", width=100, command=self._add_pdfs).pack(side="left")
         ctk.CTkButton(acts, text="Klasör Tara…", width=110, command=self._scan_folder, **outline).pack(
@@ -11503,9 +11632,19 @@ class LibraryTab:
                 extra |= self.lib.fulltext_ids(words)
         tag = self.tag_menu.get()
         status = self.status_menu.get()
+        kinds = self.TYPE_FILTERS.get(self.type_menu.get())
+
+        def type_ok(item):
+            if kinds is None:
+                return True
+            if kinds == "thesis":
+                return is_thesis(item)
+            return item.get("type") in kinds and not (kinds == ("other",) and is_thesis(item))
 
         def visible(item):
             if no_range and not (no_range[0] <= (item.get("no") or 0) <= no_range[1]):
+                return False
+            if not type_ok(item):
                 return False
             if words and not (all(w in item["_blob"] for w in words) or item["id"] in extra):
                 return False
@@ -11544,7 +11683,13 @@ class LibraryTab:
             self.tree.see(keep[0])
         new = sum(1 for i in self.items if i["is_new"])
         nopdf = sum(1 for i in self.items if not i["has_pdf"])
-        self.count_label.configure(text=f"{len(shown)} / {len(self.items)} kaynak · {new} yeni · {nopdf} PDF'siz")
+        if kinds is not None:
+            typed = [i for i in self.items if type_ok(i)]
+            label = self.type_menu.get().replace(" (hepsi)", "").lower()
+            self.count_label.configure(text=f"{len(shown)} / {len(self.items)} kaynak · {len(typed)} {label} "
+                                            f"(PDF'siz: {sum(1 for i in typed if not i['has_pdf'])})")
+        else:
+            self.count_label.configure(text=f"{len(shown)} / {len(self.items)} kaynak · {new} yeni · {nopdf} PDF'siz")
         shown_new = sum(1 for i in shown if i["is_new"])
         self.allseen_btn.configure(text=f"Yenileri İncelendi Say ({shown_new})" if shown_new else "Yenileri İncelendi Say",
                                    state="normal" if shown_new else "disabled")
@@ -12672,6 +12817,20 @@ class ScanTab:
             self.app.notify_report(report, summary)
             if self.open_report_var.get():
                 webbrowser.open(Path(report).as_uri())
+        failed = list(dict.fromkeys(getattr(self.worker, "failed_theses", []) or []))
+        if failed:
+            self.app.after(800, lambda: self._offer_thesis_retry(failed))
+
+    def _offer_thesis_retry(self, ids):
+        lib_tab = self.app.library_tab
+        items = [i for i in (self.app.library.get(x) for x in ids) if i and not i["file_path"]]
+        running = getattr(lib_tab, "retry_worker", None)
+        if not items or (running and running.is_alive()):
+            return
+        if messagebox.askyesno(APP_NAME, f"Taramada {len(items)} izinli tezin PDF'i YÖK Tez Merkezi'nden "
+                                         "indirilemedi (site o an hata ya da beklenmedik bir sayfa döndürdü). "
+                                         "Şimdi yeniden denensin mi?", parent=self.parent):
+            lib_tab._start_retry(items, f"inmeyen {len(items)} tez", None)
 
     def open_last_report(self):
         report = load_settings().get("last_report")
