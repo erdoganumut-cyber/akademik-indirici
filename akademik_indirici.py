@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.42"
+APP_VERSION = "2.43"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -5086,6 +5086,9 @@ RELEVANT_JOURNAL_WORDS = ["folklor", "folklore", "halkbilim", "halk bilim", "hal
                           "sahne", "sanat", "art$", "arts$", "kultur", "culture", "cultural", "turk dunyasi",
                           "turkiyat", "turkoloji", "turkbilig", "etnograf", "etnoloji", "antropoloji",
                           "anthropolog", "miras", "heritage", "alevilik", "bektasi", "gelenek", "tradition"]
+FISHERY_JOURNAL_WORDS = ["su urun", "balik", "fisher", "fish", "aquatic", "aquacult", "marine", "deniz bilim",
+                         "denizcilik", "deniz", "ocean", "osinograf", "hidrobiyoloj", "hydrobiolog", "limnolog",
+                         "sea$", "seas$", "zoolog", "ihtiyoloj", "ichthyolog"]
 SOCIAL_JOURNAL_WORDS = ["sosyal bilim", "social science", "beseri", "insan bilim", "humanit", "edebiyat",
                         "iletisim", "egitim fakultesi", "spor bilim", "sport"]
 
@@ -5112,8 +5115,11 @@ def dergipark_sets(session) -> list:
     return out
 
 
-def relevant_journal_sets(sets, include_social=False) -> list:
-    words = RELEVANT_JOURNAL_WORDS + (SOCIAL_JOURNAL_WORDS if include_social else [])
+def relevant_journal_sets(sets, include_social=False, field="halk") -> list:
+    """Adı alanla ilgili DergiPark dergileri. field: 'halk' (halk oyunları, folklor, müzik, sanat) ya da
+    'balik' (su ürünleri, balıkçılık, deniz bilimleri)."""
+    words = (FISHERY_JOURNAL_WORDS if field == "balik" else RELEVANT_JOURNAL_WORDS) + \
+        (SOCIAL_JOURNAL_WORDS if include_social else [])
     parts = [re.escape(w[:-1]) + "(?![a-z])" if w.endswith("$") else re.escape(w) for w in words]
     rx = re.compile(r"(?<![a-z])(" + "|".join(parts) + ")")
     return [(spec, name) for spec, name in sets if rx.search(fold(name)) or rx.search(fold(spec))]
@@ -5832,7 +5838,8 @@ RETRO_CROSSREF_LIMIT = {1: 300, 3: 600, 5: 1000, 10: 1500, 0: 2000}   # terim ba
 RETRO_OPENALEX_LIMIT = {1: 200, 3: 400, 5: 400, 10: 600, 0: 600}      # anahtarlı; anahtarsız 200
 OPENALEX_WEEKLY_LOOKBACK = 120     # gün: dergiler sayıları geriye tarihli yayımlayabildiği için
 RETRO_DOWNLOADS = {"Bulunanların hepsini dene": None, "En fazla 200 PDF": 200, "PDF indirme (yalnızca künye)": 0}
-RETRO_SCOPES = {"Alan dergileri (önerilen)": "alan", "Alan + sosyal bilimler dergileri": "sosyal",
+RETRO_SCOPES = {"Alan dergileri · Halk oyunları": "alan", "Alan dergileri · Balıkçılık": "balik",
+                "Alan + sosyal bilimler dergileri": "sosyal",
                 "Bütün DergiPark (saatler sürer)": "tum"}
 
 
@@ -6380,7 +6387,8 @@ class ScanWorker(threading.Thread):
                     chunks = [("yil", str(y), str(y)) for y in range(now.year, first - 1, -1)]
                 else:
                     self.status("DergiPark dergi listesi alınıyor…")
-                    sets = relevant_journal_sets(dergipark_sets(session), retro.get("scope") == "sosyal")
+                    sets = relevant_journal_sets(dergipark_sets(session), retro.get("scope") == "sosyal",
+                                                 "balik" if retro.get("scope") == "balik" else "halk")
                     chunks = [("dergi", spec, name) for spec, name in sets]
                 reached.append("DergiPark")
             except Exception as exc:
@@ -11186,8 +11194,9 @@ class RetroScanDialog(ctk.CTkToplevel):
                       command=self._start_new).pack(side="left")
         ctk.CTkButton(btns, text="Vazgeç", fg_color="transparent", border_width=1, text_color=TEXT,
                       command=self.destroy).pack(side="left", padx=8)
-        for w in (self.period, self.scope, self.downloads):
+        for w in (self.period, self.downloads):
             w.configure(command=lambda _=None: self._update_estimate())
+        self.scope.configure(command=lambda _=None: (self._match_groups(), self._update_estimate()))
         self._update_estimate()
 
         def place():
@@ -11198,6 +11207,21 @@ class RetroScanDialog(ctk.CTkToplevel):
             self.lift()
             self.focus_force()
         self.after(60, place)
+
+    @staticmethod
+    def _is_fishing_group(name) -> bool:
+        f = fold(name)
+        return f.startswith("lrf") or "balik" in f or "fish" in f
+
+    def _match_groups(self):
+        """Alan seçimi değişince konu grupları da ona uysun: Balıkçılık → LRF/balık grupları, Halk oyunları →
+        öbürleri (yalnızca iki tür grup da varsa; kutular elle yine değiştirilebilir)."""
+        scope = RETRO_SCOPES[self.scope.get()]
+        fishing = {n for n in self.group_vars if self._is_fishing_group(n)}
+        if not fishing or len(fishing) == len(self.group_vars) or scope not in ("alan", "balik"):
+            return
+        for name, var in self.group_vars.items():
+            var.set((name in fishing) == (scope == "balik"))
 
     def _collect_options(self) -> dict:
         groups = [n for n, v in self.group_vars.items() if v.get()]
@@ -11213,6 +11237,8 @@ class RetroScanDialog(ctk.CTkToplevel):
                         "dünyası vb. olan dergiler baştan sona taranır (yaklaşık 1 saat).",
                 "sosyal": "Alan dergilerine ek olarak sosyal bilimler, edebiyat, eğitim ve spor dergileri de "
                           "taranır (birkaç saat).",
+                "balik": "DergiPark'ta adı su ürünleri, balıkçılık, deniz bilimleri, hidrobiyoloji, fisheries, "
+                         "aquatic, marine vb. olan dergiler baştan sona taranır.",
                 "tum": "Bütün DergiPark yıl yıl taranır; tüm zamanlar için bir gece sürebilir."}[o["scope"]]
         cr = (f" Crossref'te her terim için en ilgili {RETRO_CROSSREF_LIMIT.get(o['years'], 2000)} kayıt incelenir."
               if o["crossref"] else "")
