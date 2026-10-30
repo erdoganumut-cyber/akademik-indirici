@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.43"
+APP_VERSION = "2.44"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -4659,6 +4659,14 @@ koreografi
 choreograph → choreography
 kültürel performans
 cultural performance
+
+[Halk bilimi ve folklor]
+halk bilim → halk bilimi
+halkbilim → halkbilimi
+folklor
+folklore
+folkloristik
+folkloristics
 
 [Etnokoreoloji ve notasyon]
 etnokoreoloji
