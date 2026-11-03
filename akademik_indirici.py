@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.46"
+APP_VERSION = "2.47"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -10761,10 +10761,13 @@ def push_db_to_shared(db_path, shared_folder, items) -> str:
     return rev
 
 
-def split_library(lib, ids, new_name, new_folder, rest_folder, prefix, progress=lambda text: None) -> dict:
+def split_library(lib, ids, new_name, new_folder, rest_folder, prefix, progress=lambda text: None,
+                  from_copy=False) -> dict:
     """ids kaynaklarını yeni bir kütüphaneye (new_name, new_folder) taşır; kalan kütüphane rest_folder'a
     döner. PDF'ler gerekirse kendi klasörlerine taşınır, iki taraf da ortak kopyasıyla eşitlenir.
-    Hiçbir kaynak silinmez: taşınanlar yeni kütüphanede, kalanlar bu kütüphanede durur."""
+    Hiçbir kaynak silinmez: taşınanlar yeni kütüphanede, kalanlar bu kütüphanede durur.
+    from_copy: lib başka bir kütüphane dosyasının geçici kopyasıdır (ör. LRF klasöründeki karışık kopya);
+    ondan yalnızca okunur, açık kütüphaneye ve onun klasörüne dokunulmaz."""
     ids = sorted(set(int(i) for i in ids))
     current_folder = load_settings().get("library_folder") or ""
     settings = _load_settings_raw()
@@ -10809,8 +10812,8 @@ def split_library(lib, ids, new_name, new_folder, rest_folder, prefix, progress=
             return {e.name for e in os.scandir(folder) if e.is_file()}
         except OSError:
             return set()
-    here = listing(current_folder) if current_folder else set()
-    if current_folder and norm(current_folder) != norm(new_folder):
+    here = listing(current_folder) if current_folder and not from_copy else set()
+    if current_folder and norm(current_folder) != norm(new_folder) and not from_copy:
         for n, (i, path) in enumerate(file_of.items()):
             if Path(path).name in here and os.path.isfile(path):
                 if n % 20 == 0:
@@ -10822,7 +10825,7 @@ def split_library(lib, ids, new_name, new_folder, rest_folder, prefix, progress=
                 except OSError as exc:
                     diag(f"ayırma: {Path(path).name} taşınamadı: {describe_error(exc)}")
     staying = []
-    if current_folder and norm(current_folder) != norm(rest_folder):
+    if current_folder and norm(current_folder) != norm(rest_folder) and not from_copy:
         moved = set(ids)
         with lib.lock:
             rows = lib.db.execute("SELECT id, file_path FROM items WHERE file_path!=''").fetchall()
@@ -10831,11 +10834,15 @@ def split_library(lib, ids, new_name, new_folder, rest_folder, prefix, progress=
     new_change, new_count = new.change_no(), new.count()
     new.close()
 
-    # 3) taşınanları bu kütüphaneden çıkar
-    progress("Taşınan kaynaklar bu kütüphaneden çıkarılıyor…")
+    # 3) taşınanları bu kütüphaneden çıkar (geçici kopyadan okunduysa gerekmez)
+    progress("Taşınan kaynaklar bu kütüphaneden çıkarılıyor…" if not from_copy else "Kaynaklar okundu…")
     with lib.lock, lib.db:
-        for k in range(0, len(ids), 500):
-            part = ids[k:k + 500]
+        if from_copy:
+            ids_to_drop = []
+        else:
+            ids_to_drop = ids
+        for k in range(0, len(ids_to_drop), 500):
+            part = ids_to_drop[k:k + 500]
             marks = ",".join("?" * len(part))
             for table, key in (("items", "id"), ("tags", "item_id"), ("cards", "item_id"), ("fulltext", "item_id")):
                 lib.db.execute(f"DELETE FROM {table} WHERE {key} IN ({marks})", part)
@@ -10853,10 +10860,12 @@ def split_library(lib, ids, new_name, new_folder, rest_folder, prefix, progress=
 
     # 4) anahtar kelimeler: önekli gruplar yeni kütüphaneye; kalan kütüphanenin listesine dokunulmaz
     progress("Anahtar kelimeler ayrılıyor…")
-    text = load_keywords_text()
-    mine, others = split_keyword_text(text, prefix)
     new_kw = (Path(new_folder) / SHARED_DIR_NAME if shared else new_dir) / "anahtar_kelimeler.txt"
-    rest_kw = (Path(rest_folder) / SHARED_DIR_NAME if shared else settings_path().parent) / "anahtar_kelimeler.txt"
+    src_kw = Path(new_folder) / SHARED_DIR_NAME / "anahtar_kelimeler.txt"
+    text = src_kw.read_text(encoding="utf-8") if from_copy and src_kw.is_file() else load_keywords_text()
+    mine, others = split_keyword_text(text, prefix)
+    rest_kw = keywords_path() if from_copy else \
+        (Path(rest_folder) / SHARED_DIR_NAME if shared else settings_path().parent) / "anahtar_kelimeler.txt"
     rest_text = rest_kw.read_text(encoding="utf-8") if rest_kw.is_file() else others
     if norm(rest_kw) != norm(new_kw) or not rest_kw.is_file():
         rest_kw.parent.mkdir(parents=True, exist_ok=True)
@@ -10883,6 +10892,11 @@ def split_library(lib, ids, new_name, new_folder, rest_folder, prefix, progress=
             except OSError:
                 pass
     _write_json(new_dir / "ayarlar.json", new_settings)
+
+    if from_copy:                                   # açık kütüphane olduğu gibi kalır
+        result.update(new_count=new_count, rest_count=None)
+        diag(f"'{new_name}' kütüphanesi {new_folder} klasöründeki kopyadan kuruldu ({new_count} kaynak)")
+        return result
 
     # 6) bu kütüphane eski klasörüne döner ve oradaki ortak kopyayla birleştirilir
     progress("Bu kütüphane eski klasörüyle eşitleniyor (birkaç dakika sürebilir)…")
@@ -10982,6 +10996,12 @@ class SplitWindow(ctk.CTkToplevel):
 
     def _count(self):
         ids = self._chosen()
+        if not ids and self.prefix.get().strip():
+            self.info.configure(text=f"Bu kütüphanede etiketi '{self.prefix.get().strip()}' ile başlayan kaynak yok.\n\n"
+                                     "Kaynaklar başka bir klasördeki kütüphane kopyasında duruyorsa (ör. LRF "
+                                     "Kütüphanesi klasörü): pencerenin üstündeki Kütüphane menüsünden '+ Yeni "
+                                     "kütüphane…' seçip o klasörü gösterin; program yalnızca o önekli kaynakları alır.")
+            return
         self.info.configure(text=f"Taşınacak: {len(ids)} kaynak · bu kütüphanede kalacak: {len(self.items) - len(ids)} "
                                  "kaynak.\n\nAyırınca: taşınan kaynaklar 1'den başlayarak yeniden numaralanır, PDF'leri "
                                  "yeni kütüphanenin klasörüne geçer; önekli anahtar kelime grupları da oraya taşınır. "
@@ -14375,6 +14395,8 @@ class App(ctk.CTk):
             messagebox.showwarning(APP_NAME, "Bu klasörü başka bir kütüphane kullanıyor; boş ya da yeni bir klasör "
                                              "seçin.", parent=self)
             return
+        if (Path(folder) / SHARED_DIR_NAME / SHARED_DB_NAME).is_file():
+            return self._read_existing(name, folder)
         try:
             add_profile(name, dict(_load_settings_raw(), library_folder=folder))
         except (OSError, ValueError) as exc:
@@ -14392,6 +14414,82 @@ class App(ctk.CTk):
         if messagebox.askyesno(APP_NAME, f"'{name}' kütüphanesi oluşturuldu. Şimdi ona geçilsin mi?\n\n"
                                          "Tarama sekmesinden anahtar kelimelerini yazabilir, Drive'da "
                                          "tutmak için 'Ortak kütüphane' kutusunu işaretleyebilirsiniz.", parent=self):
+            self.switch_library(name)
+
+    def _read_existing(self, name, folder):
+        """Seçilen klasörde zaten kütüphane verisi var (ör. karışık kalmış LRF kopyası): önce bir kopyasını okur,
+        sonra hangi kaynakların alınacağını sorar."""
+        events = self.events
+        self.library_tab.count_label.configure(text="Seçilen klasördeki kütüphane verisi okunuyor…")
+
+        def work():
+            tmp = app_base_dir() / f"okunan_kopya_{os.getpid()}.db"
+            try:
+                shutil.copyfile(Path(folder) / SHARED_DIR_NAME / SHARED_DB_NAME, tmp)
+                src = Library(tmp, root=folder, relative=True)
+                items = src.all_items()
+                src.close()
+                prefixes = {}
+                for it in items:
+                    for t in it["tags"]:
+                        if " · " in t:
+                            prefixes.setdefault(t.split(" · ")[0].strip(), set()).add(it["id"])
+                events.put(("profile_scanned", name, folder, str(tmp), len(items),
+                            {k: len(v) for k, v in prefixes.items()}, ""))
+            except Exception as exc:
+                diag_exception("klasördeki kütüphane okunamadı")
+                tmp.unlink(missing_ok=True)
+                events.put(("profile_scanned", name, folder, "", 0, {}, describe_error(exc)))
+        threading.Thread(target=work, name="kutuphane-oku", daemon=True).start()
+
+    def _profile_scanned(self, name, folder, tmp, total, prefixes, error):
+        self.library_tab.refresh()
+        if error:
+            messagebox.showerror(APP_NAME, f"Klasördeki kütüphane verisi okunamadı:\n{error}", parent=self)
+            return
+        ranked = sorted(prefixes.items(), key=lambda kv: -kv[1])
+        options = [f"Yalnızca '{p} ·' etiketliler ({n})" for p, n in ranked[:2]] + [f"Hepsini al ({total})"]
+        text = (f"Bu klasörde {total} kaynaklık kütüphane verisi var."
+                + (f" Bunlardan {ranked[0][1]} tanesinin etiketi '{ranked[0][0]} ·' ile başlıyor; büyük olasılıkla "
+                   "öbürleri başka bir kütüphaneye ait (ör. klasör değiştirilirken karışmış)." if ranked else "")
+                + "\n\nYeni kütüphaneye hangileri alınsın? Açık olan kütüphanenize dokunulmaz.")
+        choice = choice_dialog(self, f"'{name}' kütüphanesi", text, options)
+        if choice is None:
+            Path(tmp).unlink(missing_ok=True)
+            return
+        prefix = ranked[choice][0] if choice < len(ranked[:2]) else ""
+        events = self.events
+        self.library_tab.count_label.configure(text=f"'{name}' kütüphanesi kuruluyor…")
+
+        def work():
+            try:
+                src = Library(tmp, root=folder, relative=True)
+                try:
+                    pre = fold(prefix)
+                    ids = [i["id"] for i in src.all_items()
+                           if not pre or any(fold(t).startswith(pre + " ·") or fold(t).startswith(pre + " ") for t in i["tags"])]
+                    res = split_library(src, ids, name, folder, self.library_folder() or folder, prefix,
+                                        lambda text: events.put(("split_progress", text)), from_copy=True)
+                finally:
+                    src.close()
+                events.put(("profile_imported", name, res, ""))
+            except Exception as exc:
+                diag_exception("kütüphane kurma")
+                events.put(("profile_imported", name, {}, describe_error(exc)))
+            finally:
+                Path(tmp).unlink(missing_ok=True)
+        threading.Thread(target=work, name="kutuphane-kur", daemon=True).start()
+
+    def _profile_imported(self, name, res, error):
+        self.library_tab.refresh()
+        self.profile_menu.configure(values=load_profiles()["list"] + [self.NEW_PROFILE])
+        if error:
+            messagebox.showerror(APP_NAME, f"Kütüphane kurulamadı:\n{error}\n\nAyrıntı tanılama kaydında; hiçbir "
+                                           "dosya silinmedi.", parent=self)
+            return
+        if messagebox.askyesno(APP_NAME, f"'{name}' kütüphanesi {res.get('new_count')} kaynakla kuruldu. Klasördeki "
+                                         "karışık kopyanın yerine yalnızca bu kaynakları içeren kopya yazıldı.\n\n"
+                                         f"Şimdi '{name}' kütüphanesine geçilsin mi?", parent=self):
             self.switch_library(name)
 
     def _build_header(self):
@@ -15028,6 +15126,10 @@ class App(ctk.CTk):
                                                           if message[2] else "."))
         elif kind == "split_progress":
             self.library_tab.count_label.configure(text=message[1])
+        elif kind == "profile_scanned":
+            self._profile_scanned(*message[1:])
+        elif kind == "profile_imported":
+            self._profile_imported(*message[1:])
         elif kind == "split_done":
             self._split_done(*message[1:])
         elif kind == "names_fixed":
