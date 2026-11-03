@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.49"
+APP_VERSION = "2.50"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -12208,7 +12208,8 @@ class LibraryTab:
     MENUS = {
         "Ekle ▾": {"Dosya Ekle (PDF / EPUB)…": "_add_pdfs", "Klasör Tara…": "_scan_folder",
                    "Kitap Ekle (ISBN / Bağlantı)…": "_add_isbn", "İçe Aktar (Piri / RIS / BibTeX)…": "_import_refs"},
-        "PDF ▾": {"PDF'sizleri Sırayla Aç": "_open_queue", "PDF işaretlemelerini kartlara aktar…": "_import_highlights"},
+        "PDF ▾": {"PDF'sizleri Sırayla Aç": "_open_queue", "İndirilenler'i yeniden eşleştir…": "_rematch",
+                  "PDF işaretlemelerini kartlara aktar…": "_import_highlights"},
         "Düzenle ▾": {"Otomatik Etiketle": "_autotag", "Eksik Künyeleri Tamamla": "_complete",
                       "Künyeyi PDF'ten yeniden çıkar…": "_reextract", "Mükerrer kayıtları bul…": "_duplicates",
                       "Anahtar kelimelere uymayanları ayıkla…": "_prune", "Yenileri İncelendi Say": "_mark_all_reviewed"},
@@ -12236,6 +12237,17 @@ class LibraryTab:
 
     def _duplicates(self):
         DuplicatesWindow(self.app)
+
+    def _rematch(self):
+        win = getattr(self.app, "rematch_win", None)
+        if win is not None and win.winfo_exists():
+            win.lift()
+            return
+        if not self.app.library_folder():
+            self.app.choose_library_folder()
+            if not self.app.library_folder():
+                return
+        self.app.rematch_win = RematchWindow(self.app)
 
     def _citations(self):
         win = getattr(self, "cite_win", None)
@@ -14147,6 +14159,707 @@ class DownloadsWatcher(threading.Thread):
         self.events.put(("watch_done", self.newest))
 
 
+# ── İndirilenler'i yeniden eşleştir: eşleşmemiş kalmış indirmeleri sıkı kurallarla yeniden dener ──────
+#    Dosya yalnızca (a) PDF'i eksik bir kaynağa kesin kanıtla ya da (b) DOI'si doğrulanmış yeni bir kayıt
+#    olarak önerilir; hiçbir şey kullanıcı onaylamadan yapılmaz, yapılan her şey geri alınabilir.
+
+_ACADEMIC_MARKS = (
+    ("özet", r"\b(abstract|ozet|ozce|resume|resumen|resumo|riassunto|zusammenfassung|аннотация)\b"),
+    ("anahtar kelimeler", r"\b(keywords|key words|anahtar (kelime|sozcuk)ler|palabras clave|palavras.chave|mots.cles|"
+                          r"parole chiave|schlusselworter|stichworter)\b"),
+    ("kaynakça", r"\b(references|kaynakca|kaynaklar|bibliography|bibliyografya|bibliografia|bibliographie|"
+                 r"referencias|referencias bibliograficas|literatur|literaturverzeichnis)\b"),
+    ("tez", r"\b(tez|tezi|thesis|dissertation|yuksek lisans|doktora|sanatta yeterlik|tesis|tese|these|tesi|"
+            r"doktorarbeit|masterarbeit)\b"),
+    ("dergi", r"\b(journal|dergi|dergisi|proceedings|bildiri|bildiriler|kongre|sempozyum|symposium|conference|"
+              r"revista|revue|rivista|zeitschrift)\b"),
+    ("cilt/sayı", r"\b(cilt|volume|vol|sayi|issue|numero|heft|band)\b\W{0,3}\d"),
+    ("üniversite", r"\b(universite|universitesi|university|universitat|universidad|universidade|universita|"
+                   r"enstitusu|institute|instituto|fakultesi|faculty|facultad|posgrado|maestria)\b"),
+)
+_ACADEMIC_RX = [(name, re.compile(rx)) for name, rx in _ACADEMIC_MARKS]
+_THESIS_RX = re.compile(r"\b(tez|tezi|thesis|dissertation|yuksek lisans|doktora|sanatta yeterlik|tesis|tese|these|"
+                        r"tesi|doktorarbeit|masterarbeit)\b")
+_YEAR_RX = re.compile(r"\b(19[0-9]\d|20[0-3]\d)\b")
+
+
+def academic_signs(head: str) -> list:
+    """Belgenin başında bilimsel yayın olduğunu gösteren işaretler (fatura, bilet, form gibi dosyaları eler)."""
+    folded = fold(head or "")
+    signs = []
+    if DOI_RE.search(head or ""):
+        signs.append("DOI")
+    if find_isbns(head or "") and re.search(r"\bisbn\b", folded):
+        signs.append("ISBN")
+    if any(issn_valid(a + b.upper()) for a, b in _ISSN_RE.findall(head or "")) and re.search(r"\bissn\b", folded):
+        signs.append("ISSN")
+    signs += [name for name, rx in _ACADEMIC_RX if rx.search(folded)]
+    return signs
+
+
+def is_academic(signs) -> bool:
+    """DOI/ISBN/ISSN tek başına yeter; yoksa en az iki ayrı işaret gerekir."""
+    return any(s in ("DOI", "ISBN", "ISSN") for s in signs) or len(set(signs)) >= 2
+
+
+def _all_words(title) -> list:
+    return re.findall(r"\w+", fold(title or ""))
+
+
+def _full_title_rx(title):
+    words = _all_words(title)
+    if len(words) < 4:
+        return None
+    return re.compile(r"\b" + r"\W+".join(re.escape(w) for w in words) + r"\b")
+
+
+def _head_variants(head: str) -> tuple:
+    """Katlanmış metin ve satır sonu tirelemesi birleştirilmiş hâli ('dans-\\nları' → 'dansları')."""
+    folded = fold(head or "")
+    joined = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", folded)
+    # başlığa ve yazar adına yapışık dipnot rakamları: 'identity1', 'demirbag1' → 'identity 1'
+    return folded, re.sub(r"(?<=[^\W\d_])(\d{1,2})\b", r" \1", joined)
+
+
+def _first_family(item) -> str:
+    authors = item.get("authors") or []
+    if isinstance(authors, str):
+        try:
+            authors = json.loads(authors)
+        except ValueError:
+            authors = []
+    first = (authors[0] or {}) if authors else {}
+    return fold(first.get("family") or first.get("literal") or "") if isinstance(first, dict) else ""
+
+
+def _window_coverage(sig, positions, width) -> float:
+    """Başlığın anlamlı kelimelerinden en çoğu, belgede 'width' kelimelik tek bir pencerede kaçı birlikte geçiyor?
+    (Kelimelerin iki sayfaya dağılmış olması yetmez; başlık gibi bir arada durmalılar.)"""
+    if not sig:
+        return 0.0
+    hits = sorted((p, w) for w in set(sig) for p in positions.get(w, ()))
+    best, counts, left = 0, {}, 0
+    for right in range(len(hits)):
+        counts[hits[right][1]] = counts.get(hits[right][1], 0) + 1
+        while hits[right][0] - hits[left][0] >= width:
+            w = hits[left][1]
+            counts[w] -= 1
+            if not counts[w]:
+                del counts[w]
+            left += 1
+        best = max(best, len(counts))
+    return best / len(set(sig))
+
+
+def head_positions(variants) -> dict:
+    positions = {}
+    for k, w in enumerate(re.findall(r"\w+", variants[-1])):
+        positions.setdefault(w, []).append(k)
+    return positions
+
+
+def head_dois(head: str) -> list:
+    out = []
+    for m in DOI_RE.finditer(head or ""):
+        doi = (normalize_doi(clean_url(m.group(1))) or "").lower()
+        if doi and doi not in out:
+            out.append(doi)
+    return out
+
+
+def judge_candidate(item, head, folded_variants, words, dois, stem="", positions=None) -> tuple:
+    """Bir PDF'siz kaynak bu dosya mı? Dönüş: (düzey, gerekçe)
+    düzey: 'kesin' (işaretli gelir), 'olası' (işaretsiz, karar kullanıcının), None (önerilmez)."""
+    reasons = []
+    tez_no = yok_tez_no(item)
+    if tez_no and stem == tez_no:
+        return "kesin", f"YÖK Tez No aynı ({tez_no})"
+    item_doi = (normalize_doi(item.get("doi") or "") or "").lower()
+    sig = _sig_words(item.get("title"))
+    total = len(_all_words(item.get("title")))
+    if positions is None:
+        positions = head_positions(folded_variants)
+    coverage = _window_coverage(sig, positions, max(2 * total, 12))
+    # Çelişkiler: önerilmez (başlığı çok benzeyenlerde gerekçe kullanıcıya gösterilir)
+    alike = coverage >= 0.85
+    if item_doi and dois and item_doi not in dois:
+        return None, "DOI'si farklı" if alike else ""
+    years = {int(y) for y in _YEAR_RX.findall(folded_variants[0][:6000])}
+    top_years = {int(y) for y in _YEAR_RX.findall(folded_variants[0][:2500])}   # künye bölgesi (kaynakça değil)
+    item_year = str(item.get("year") or "")[:4]
+    year_clash = item_year.isdigit() and top_years and min(abs(int(item_year) - y) for y in top_years) > 2
+    if is_thesis(item) and not _THESIS_RX.search(folded_variants[0]):
+        return None, "kaynak tez ama belge tez değil" if alike else ""
+    family = _first_family(item)
+    author_ok = bool(family) and len(family) >= 3 and any(
+        re.search(r"(?<![^\W\d_])" + re.escape(family) + r"(?![^\W\d_])", v) for v in folded_variants)
+    year_ok = item_year.isdigit() and int(item_year) in years
+    if item_doi and item_doi in dois:
+        if coverage >= 0.6:
+            return "kesin", "DOI aynı, başlık da geçiyor"
+        return "olası", "DOI aynı ama başlık ilk sayfalarda bulunamadı"
+    if total < 4 or len(sig) < 2:
+        return None, "başlık eşleştirme için çok kısa"
+    rx = _full_title_rx(item.get("title"))
+    found = [m.start() for m in (rx.search(v) for v in folded_variants) if m] if rx else []
+    full = bool(found)
+    if year_clash and not (full and author_ok and min(found) < 6000):
+        return None, f"yılı uyuşmuyor ({item_year})" if alike else ""
+    if full:
+        reasons.append("tam başlık geçiyor" if min(found) < 6000 else "tam başlık geçiyor (ama sayfa başında değil)")
+    else:
+        if coverage < 0.85:
+            return None, ""
+        if not (author_ok or year_ok):          # benzer başlık tek başına yetmez: yazar ya da yıl da tutmalı
+            return None, ""
+        reasons.append(f"başlık %{round(coverage * 100)} benzer")
+    reasons.append("yazar tutuyor" if author_ok else "yazar doğrulanamadı")
+    if year_clash:
+        reasons.append(f"ama belgenin başındaki yıllar farklı (kaynakta {item_year})")
+    elif item_year.isdigit():
+        reasons.append("yıl tutuyor" if year_ok else "yıl doğrulanamadı")
+    level = "kesin" if full and min(found) < 6000 and (author_ok or year_ok) and not year_clash else "olası"
+    return level, ", ".join(reasons)
+
+
+def _missing_index(missing) -> tuple:
+    """PDF'siz kaynaklar için hızlı aday bulma: her kaynağın en seyrek iki başlık kelimesinden dizin."""
+    freq = {}
+    sigs = []
+    for item in missing:
+        sig = set(_sig_words(item.get("title")))
+        sigs.append(sig)
+        for w in sig:
+            freq[w] = freq.get(w, 0) + 1
+    index, by_doi, by_tez = {}, {}, {}
+    for k, (item, sig) in enumerate(zip(missing, sigs)):
+        for w in sorted(sig, key=lambda w: (freq[w], w))[:2]:
+            index.setdefault(w, []).append(k)
+        doi = (normalize_doi(item.get("doi") or "") or "").lower()
+        if doi:
+            by_doi.setdefault(doi, []).append(k)
+        tez = yok_tez_no(item)
+        if tez:
+            by_tez.setdefault(tez, []).append(k)
+    return index, by_doi, by_tez
+
+
+def verify_doi_record(session, doi, head, email=""):
+    """DOI'nin künyesi (Crossref, olmazsa OpenAlex) ve başlığının belgenin başında gerçekten geçip geçmediği.
+    Dönüş: (kayıt ya da None, gerekçe)"""
+    rec = crossref_record(session, doi, raise_network_errors=True)
+    source = "Crossref"
+    if not rec:
+        try:
+            r = session.get(f"{OPENALEX_API}/doi:{quote(doi, safe='/:;()._-')}", params=openalex_params(email),
+                            timeout=API_TIMEOUT)
+            rec = record_from_openalex(r.json()) if r.ok else None
+            source = "OpenAlex"
+        except (requests.RequestException, ValueError):
+            rec = None
+    if not rec or not rec.get("title"):
+        return None, "DOI'nin künyesi bulunamadı"
+    words = set(re.findall(r"\w+", " ".join(_head_variants(head))))
+    sig = _sig_words(rec["title"])
+    rx = _full_title_rx(rec["title"])
+    if rx and any(rx.search(v) for v in _head_variants(head)):
+        pass
+    elif not sig or sum(w in words for w in sig) / len(sig) < 0.8:
+        return None, "DOI belgenin kendisine ait değil (künyedeki başlık belgede geçmiyor)"
+    if not rec.get("doi"):
+        rec["doi"] = doi
+    return rec, f"DOI {source} ile doğrulandı"
+
+
+def analyze_downloads(library, folders, cancel=None, progress=None, session=None, email="") -> dict:
+    """İndirilenler'deki belgeleri sınıflandırır.
+    Dönüş: {"attach": [{"path", "candidates": [(kimlik, düzey, gerekçe)]}],
+            "new": [{"path", "record", "reason", "fits"}], "skip": [{"path", "reason"}]}"""
+    paths = []
+    for folder in folders:
+        try:
+            paths += [p for p in downloaded_docs(folder) if p.is_file() and p.stat().st_mtime < time.time() - 5]
+        except OSError:
+            continue
+    paths.sort(key=lambda p: p.name.lower())
+    result = {"attach": [], "new": [], "skip": []}
+    if not paths:
+        return result
+    if progress:
+        progress("PDF'i eksik kaynaklar okunuyor…", 0.0)
+    missing = [i for i in library.all_items()
+               if not i.get("file_path") or not file_exists_cached(i["file_path"])]
+    index, by_doi, by_tez = _missing_index(missing)
+    matcher = get_matcher()
+    session = session or make_session()
+    for n, path in enumerate(paths):
+        if cancel is not None and cancel.is_set():
+            break
+        if progress:
+            progress(f"İnceleniyor {n + 1}/{len(paths)}: {path.name}", n / len(paths))
+        try:
+            sha = file_sha256(path)
+            have = library.find_by_sha(sha)
+            if have:
+                no = (library.get(have) or {}).get("no")
+                result["skip"].append({"path": path, "reason": f"Bu dosya zaten kütüphanede (No {no})"})
+                continue
+            head = doc_head(path)
+            if len(head.strip()) < 300:
+                result["skip"].append({"path": path, "reason": "Metni okunamadı (taranmış ya da boş olabilir)"})
+                continue
+            signs = academic_signs(head)
+            if not is_academic(signs):
+                result["skip"].append({"path": path, "reason": "Bilimsel yayın görünmüyor"})
+                continue
+            variants = _head_variants(head)
+            words = set(re.findall(r"\w+", " ".join(variants)))
+            positions = head_positions(variants)
+            dois = head_dois(head)
+            pool = set()
+            for w in words:
+                pool.update(index.get(w, ()))
+            for doi in dois:
+                pool.update(by_doi.get(doi, ()))
+            if path.stem.isdigit():
+                pool.update(by_tez.get(path.stem, ()))
+            cands, near = [], ""
+            for k in pool:
+                level, why = judge_candidate(missing[k], head, variants, words, dois, path.stem, positions)
+                if level:
+                    cands.append((missing[k]["id"], level, why))
+                elif why in ("DOI'si farklı",) or why.startswith(("yılı uyuşmuyor", "kaynak tez")):
+                    near = near or f"Başlığı benzeyen No {missing[k].get('no')} var ama {why}; eşleştirilmedi"
+            if cands:
+                cands.sort(key=lambda c: (c[1] != "kesin", "tam başlık" not in c[2], c[2]))
+                if sum(c[1] == "kesin" for c in cands) > 1:   # iki kaynağa birden "kesin" uyuyorsa kesin değildir
+                    cands = [(i, "olası", why + " (birden çok kaynak uyuyor)") for i, _, why in cands]
+                result["attach"].append({"path": path, "candidates": cands[:3]})
+                continue
+            if not dois:
+                result["skip"].append({"path": path, "reason": near or "Kütüphanede karşılığı yok, DOI'si de yok"})
+                continue
+            reason = ""
+            for doi in dois[:3]:
+                existing = library.find_by_doi(doi)
+                if existing:
+                    no = (library.get(existing) or {}).get("no")
+                    reason = f"Bu DOI kütüphanede zaten var (No {no})"
+                    break
+                try:
+                    rec, reason = verify_doi_record(session, doi, head, email)
+                except requests.RequestException:
+                    reason = "DOI doğrulanamadı (bağlantı hatası)"
+                    continue
+                if rec:
+                    strong = " ".join([rec.get("title") or "", rec.get("keywords") or ""])
+                    fits = bool(matcher.match(head[:6000], strong=strong))
+                    result["new"].append({"path": path, "record": rec, "doi": doi, "reason": reason, "fits": fits})
+                    reason = None
+                    break
+            if reason is not None:
+                result["skip"].append({"path": path, "reason": reason or "DOI doğrulanamadı"})
+        except Exception as exc:
+            diag_exception(f"yeniden eşleştirme: {path.name}")
+            result["skip"].append({"path": path, "reason": f"Okunamadı: {describe_error(exc)}"})
+    return result
+
+
+def apply_rematch(library, attach, new, library_folder, session=None, progress=None) -> tuple:
+    """attach: [(dosya, kimlik)], new: [(dosya, doi, kayıt)]. Dönüş: (yapılanlar, sorunlar)
+    yapılanlar Geri al için saklanır."""
+    done, problems = [], []
+    total = len(attach) + len(new)
+    used = set()
+    for n, (path, item_id) in enumerate(attach):
+        if progress:
+            progress(f"Bağlanıyor {n + 1}/{total}: {Path(path).name}", n / max(total, 1))
+        item = library.get(item_id)
+        if not item or not Path(path).is_file():
+            problems.append(f"{Path(path).name}: dosya ya da kaynak artık yok")
+            continue
+        if item_id in used or (item.get("file_path") and os.path.isfile(item["file_path"])):
+            problems.append(f"{Path(path).name}: No {item.get('no')} kaynağının PDF'i artık var, atlandı")
+            continue
+        try:
+            old = {"file_path": item.get("file_path") or "", "sha256": item.get("sha256") or ""}
+            old_text = library.get_fulltext(item_id)
+            placed = attach_pdf(library, item_id, path, library_folder, move=True)
+            used.add(item_id)
+            done.append({"kind": "attach", "id": item_id, "from": str(path), "to": str(placed),
+                         "old": old, "old_text": old_text})
+        except OSError as exc:
+            problems.append(f"{Path(path).name}: {describe_error(exc)}")
+    session = session or (make_session() if new else None)
+    for n, (path, doi, rec) in enumerate(new, start=len(attach)):
+        if progress:
+            progress(f"Ekleniyor {n + 1}/{total}: {Path(path).name}", n / max(total, 1))
+        if not Path(path).is_file():
+            problems.append(f"{Path(path).name}: dosya artık yok")
+            continue
+        if library.find_by_doi(doi):
+            problems.append(f"{Path(path).name}: bu DOI bu arada kütüphaneye eklenmiş, atlandı")
+            continue
+        try:
+            sha = file_sha256(path)
+            item_id, created = catalog_pdf(library, session, Path(path), sha, doi=doi, library_folder=library_folder,
+                                           move=True, source="indirilenler", is_new=True, known=rec)
+            if created:
+                placed = (library.get(item_id) or {}).get("file_path") or ""
+                done.append({"kind": "new", "id": item_id, "from": str(path), "to": str(placed)})
+        except OSError as exc:
+            problems.append(f"{Path(path).name}: {describe_error(exc)}")
+    return done, problems
+
+
+def undo_rematch(library, done) -> tuple:
+    """Yapılanları tersine çevirir: dosyalar İndirilenler'e geri taşınır; bağlanan kaynak yeniden PDF'siz
+    olur, yeni eklenen kayıt çıkarılır. Hiçbir dosya silinmez. Dönüş: (geri alınan, sorunlar)"""
+    undone, problems = 0, []
+    for act in reversed(done):
+        src, dst = Path(act["to"]), Path(act["from"])
+        try:
+            if src.is_file():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                back = dst if not dst.exists() else unique_path(dst.parent, dst.name)
+                shutil.move(str(src), str(back))
+            if act["kind"] == "attach":
+                library.update(act["id"], {"file_path": act["old"]["file_path"], "sha256": act["old"]["sha256"]})
+                library.set_fulltext(act["id"], act.get("old_text") or "")
+            else:
+                library.delete(act["id"])
+            undone += 1
+        except OSError as exc:
+            problems.append(f"{dst.name}: {describe_error(exc)}")
+    forget_exists_cache()
+    return undone, problems
+
+
+class RematchWindow(ctk.CTkToplevel):
+    """İndirilenler'deki eşleşmemiş belgelerin önizlemesi: Bağlanacaklar · Yeni eklenecekler · Dokunulmayanlar."""
+
+    ON, OFF = "☑", "☐"
+
+    def __init__(self, app):
+        super().__init__(app)
+        from tkinter import ttk
+        self.app = app
+        self.q = queue.Queue()
+        self.cancel = threading.Event()
+        self.rows = {}           # iid → {"kind", "path", "id"|"doi"/"record", "on", "parent"}
+        self.done = []
+        self.busy = False
+        self.phase = "analyze"
+        self.title("İndirilenler'i yeniden eşleştir")
+        set_window_icon(self, delay=260)
+        self.geometry("%dx%d" % fit_window(self, 1100, 680))
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+        ctk.CTkLabel(self, text="İndirilenler klasöründeki PDF ve EPUB dosyaları yeniden inceleniyor. Yalnızca kesin "
+                                "kanıtı olanlar işaretli gelir; işaretsizlere dosyayı açıp bakarak siz karar verin "
+                                "(satırın başındaki kutuya tıklayın ya da boşluk tuşuna basın). Bilimsel olmayan ya da "
+                                "kütüphanede karşılığı bulunmayan dosyalara dokunulmaz; yalnızca DOI'si doğrulanmış "
+                                "yayınlar yeni kayıt olarak önerilir. 'Seçilenleri Uygula' demeden hiçbir şey yapılmaz.",
+                     anchor="w", justify="left", wraplength=1060).grid(row=0, column=0, sticky="ew", padx=14,
+                                                                        pady=(12, 4))
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.grid(row=1, column=0, sticky="ew", padx=14)
+        top.grid_columnconfigure(0, weight=1)
+        self.status = ctk.CTkLabel(top, text="Hazırlanıyor…", anchor="w", text_color=MUTED)
+        self.status.grid(row=0, column=0, sticky="ew")
+        self.bar = ctk.CTkProgressBar(top, mode="determinate")
+        self.bar.set(0)
+        self.bar.grid(row=1, column=0, sticky="ew", pady=(2, 6))
+        box = ctk.CTkFrame(self, fg_color="transparent")
+        box.grid(row=2, column=0, sticky="nsew", padx=10)
+        box.grid_columnconfigure(0, weight=1)
+        box.grid_rowconfigure(0, weight=1)
+        self.tree = ttk.Treeview(box, columns=("target", "why"), show="tree headings", selectmode="browse",
+                                 style="Lib.Treeview")
+        self.tree.heading("#0", text="Dosya / seçim")
+        self.tree.heading("target", text="Kaynak")
+        self.tree.heading("why", text="Gerekçe")
+        self.tree.column("#0", width=330, stretch=False)
+        self.tree.column("target", width=430, stretch=True)
+        self.tree.column("why", width=300, stretch=True)
+        self.tree.tag_configure("section", font=("Segoe UI", 11, "bold"))
+        self.tree.tag_configure("muted", foreground="#8A8F98")
+        bar = ctk.CTkScrollbar(box, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=bar.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        bar.grid(row=0, column=1, sticky="ns")
+        self.tree.bind("<ButtonRelease-1>", self._clicked)
+        self.tree.bind("<space>", lambda _: self._toggle(self.tree.focus()))
+        self.tree.bind("<Double-1>", lambda _: self._open_selected())
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.grid(row=3, column=0, sticky="ew", padx=14, pady=10)
+        self.count = ctk.CTkLabel(btns, text="", anchor="w")
+        self.count.pack(side="left")
+        self.go = ctk.CTkButton(btns, text="Seçilenleri Uygula", width=170, state="disabled", command=self.apply)
+        self.go.pack(side="right")
+        self.undo_btn = ctk.CTkButton(btns, text="Geri Al", width=100, state="disabled", fg_color="transparent",
+                                      border_width=1, text_color=TEXT, command=self.undo)
+        self.undo_btn.pack(side="right", padx=8)
+        ctk.CTkButton(btns, text="Dosyayı Aç", width=110, fg_color="transparent", border_width=1, text_color=TEXT,
+                      command=self._open_selected).pack(side="right")
+        ctk.CTkButton(btns, text="Kapat", width=90, fg_color="transparent", border_width=1, text_color=TEXT,
+                      command=self.close).pack(side="right", padx=8)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<Escape>", lambda _: self.close())
+        self.after(80, self.lift)
+        self._start_analysis()
+        self.after(150, self._poll)
+
+    # ── çalışma ─────────────────────────────────────────────────────────────
+    def _start_analysis(self):
+        folders = [f for f in downloads_folders() if f.is_dir()]
+        if not folders:
+            self.status.configure(text="İndirilenler klasörü bulunamadı (Ayarlar'dan seçebilirsiniz).")
+            return
+        self.busy = True
+        lib, q, cancel = self.app.library, self.q, self.cancel
+        email = self.app.settings.get("email", "")
+        self.folders = folders
+
+        def work():
+            try:
+                res = analyze_downloads(lib, folders, cancel=cancel, email=email,
+                                        progress=lambda text, frac=None: q.put(("progress", text, frac)))
+                q.put(("analyzed", res))
+            except Exception as exc:
+                diag_exception("indirilenleri yeniden eşleştirme")
+                q.put(("error", describe_error(exc)))
+        threading.Thread(target=work, name="yeniden-eslestir", daemon=True).start()
+
+    def _poll(self):
+        if not self.winfo_exists():
+            return
+        try:
+            while True:
+                msg = self.q.get_nowait()
+                kind = msg[0]
+                if kind == "progress":
+                    self.status.configure(text=msg[1])
+                    if msg[2] is not None:
+                        self.bar.set(max(0.0, min(1.0, msg[2])))
+                elif kind == "analyzed":
+                    self.busy = False
+                    self.bar.set(1)
+                    self._fill(msg[1])
+                elif kind == "applied":
+                    self.busy = False
+                    self._applied(*msg[1:])
+                elif kind == "undone":
+                    self.busy = False
+                    self._undone(*msg[1:])
+                elif kind == "error":
+                    self.busy = False
+                    self.status.configure(text=f"Hata: {msg[1]}")
+        except queue.Empty:
+            pass
+        self.after(150, self._poll)
+
+    def _fill(self, res):
+        t = self.tree
+        t.delete(*t.get_children())
+        self.rows.clear()
+        lib = self.app.library
+        att, new, skip = res["attach"], res["new"], res["skip"]
+        s1 = t.insert("", "end", text=f"Bağlanacaklar ({len(att)})", open=True, tags=("section",),
+                      values=("PDF'i eksik kaynağa bağlanır", ""))
+        for k, entry in enumerate(att):
+            f = t.insert(s1, "end", text=f"📄 {entry['path'].name}", open=True,
+                         values=(f"{len(entry['candidates'])} aday", ""))
+            first = True
+            for item_id, level, why in entry["candidates"]:
+                item = lib.get(item_id) or {}
+                on = first and level == "kesin"
+                first = False
+                label = (f"No {item.get('no') or ''} · {shorten(item.get('title') or '', 70)}"
+                         f" ({str(item.get('year') or 't.y.')[:4]})")
+                iid = t.insert(f, "end", text=f"{self.ON if on else self.OFF} {'kesin' if level == 'kesin' else 'olası'}",
+                               values=(label, why))
+                self.rows[iid] = {"kind": "attach", "path": entry["path"], "id": item_id, "on": on, "parent": f}
+        s2 = t.insert("", "end", text=f"Yeni eklenecekler ({len(new)})", open=True, tags=("section",),
+                      values=("Yalnızca DOI'si doğrulanmış yayınlar", ""))
+        for entry in new:
+            rec = entry["record"]
+            on = bool(entry["fits"])
+            why = entry["reason"] + ("; anahtar kelimelere uyuyor" if on else "; anahtar kelimelere uymuyor")
+            iid = t.insert(s2, "end", text=f"{self.ON if on else self.OFF} 📄 {entry['path'].name}",
+                           values=(shorten(apa_text(rec), 110), why))
+            self.rows[iid] = {"kind": "new", "path": entry["path"], "doi": entry["doi"], "record": rec, "on": on,
+                              "parent": None}
+        s3 = t.insert("", "end", text=f"Dokunulmayanlar ({len(skip)})", open=False, tags=("section",),
+                      values=("İndirilenler'de olduğu gibi kalır", ""))
+        for entry in skip:
+            t.insert(s3, "end", text=f"📄 {entry['path'].name}", values=("", entry["reason"]), tags=("muted",))
+        n_all = len(att) + len(new) + len(skip)
+        self.status.configure(text=f"{n_all} dosya incelendi: {len(att)} bağlanabilir, {len(new)} yeni kayıt "
+                                   f"olabilir, {len(skip)} dosyaya dokunulmayacak.")
+        self._update_count()
+
+    def _toggle(self, iid):
+        row = self.rows.get(iid)
+        if not isinstance(row, dict) or self.busy or row.get("applied"):
+            return
+        row["on"] = not row["on"]
+        if row["on"] and row["parent"]:                     # bir dosya tek kaynağa bağlanır
+            for other, r in self.rows.items():
+                if isinstance(r, dict) and other != iid and r.get("parent") == row["parent"] and r["on"]:
+                    r["on"] = False
+                    self._redraw(other)
+        if row["on"] and row["kind"] == "attach":           # bir kaynağa tek dosya bağlanır
+            for other, r in self.rows.items():
+                if (isinstance(r, dict) and other != iid and r["kind"] == "attach" and r["id"] == row["id"]
+                        and r["on"]):
+                    r["on"] = False
+                    self._redraw(other)
+        self._redraw(iid)
+        self._update_count()
+
+    def _redraw(self, iid):
+        row = self.rows[iid]
+        text = self.tree.item(iid, "text")
+        mark = "✔" if row.get("applied") else (self.ON if row["on"] else self.OFF)
+        self.tree.item(iid, text=mark + text[1:])
+
+    def _clicked(self, event):
+        iid = self.tree.identify_row(event.y)
+        if iid and self.tree.identify_column(event.x) == "#0" and iid in self.rows:
+            self._toggle(iid)
+
+    def _selected_path(self):
+        iid = self.tree.focus()
+        if iid in self.rows and isinstance(self.rows[iid], dict):
+            return self.rows[iid]["path"]
+        text = self.tree.item(iid, "text") if iid else ""
+        if text.startswith("📄 "):
+            name = text[2:].strip()
+            for folder in getattr(self, "folders", []):
+                if (Path(folder) / name).is_file():
+                    return Path(folder) / name
+        for child in (self.tree.get_children(iid) if iid else ()):
+            if child in self.rows:
+                return self.rows[child]["path"]
+        return None
+
+    def _open_selected(self):
+        path = self._selected_path()
+        if path and Path(path).is_file():
+            open_file(Path(path))
+
+    def _chosen(self):
+        rows = [r for r in self.rows.values() if isinstance(r, dict) and r["on"] and not r.get("applied")]
+        return [r for r in rows if r["kind"] == "attach"], [r for r in rows if r["kind"] == "new"]
+
+    def _update_count(self):
+        att, new = self._chosen()
+        self.count.configure(text=f"Seçili: {len(att)} bağlama, {len(new)} yeni kayıt")
+        self.go.configure(state="normal" if (att or new) and not self.busy else "disabled")
+        self.undo_btn.configure(state="normal" if self.done and not self.busy else "disabled")
+
+    def apply(self):
+        att, new = self._chosen()
+        if not (att or new) or self.busy:
+            return
+        folder = self.app.library_folder()
+        if not folder:
+            messagebox.showinfo(APP_NAME, "Önce kütüphane klasörünü seçin.", parent=self)
+            return
+        if not messagebox.askyesno(APP_NAME, f"{len(att)} dosya PDF'i eksik kaynağına bağlanacak, {len(new)} dosya "
+                                             "yeni kayıt olarak eklenecek. Dosyalar kütüphane klasörüne taşınır; "
+                                             "bu pencereden 'Geri Al' ile geri alınabilir.\n\nDevam edilsin mi?",
+                                   parent=self):
+            return
+        self.busy, self.phase = True, "apply"
+        self._update_count()
+        lib, q = self.app.library, self.q
+        pending = att + new
+
+        def work():
+            try:
+                done, problems = apply_rematch(lib, [(r["path"], r["id"]) for r in att],
+                                               [(r["path"], r["doi"], r["record"]) for r in new], folder,
+                                               progress=lambda text, frac=None: q.put(("progress", text, frac)))
+                q.put(("applied", done, problems, pending))
+            except Exception as exc:
+                diag_exception("yeniden eşleştirme uygulama")
+                q.put(("applied", [], [describe_error(exc)], []))
+        threading.Thread(target=work, name="yeniden-eslestir-uygula", daemon=True).start()
+
+    def _applied(self, done, problems, pending):
+        self.done += done
+        moved = {d["from"] for d in done}
+        for iid, r in self.rows.items():
+            if isinstance(r, dict) and str(r["path"]) in moved:
+                r["applied"] = True
+                r["on"] = False
+                self._redraw(iid)
+        n_att = sum(d["kind"] == "attach" for d in done)
+        n_new = len(done) - n_att
+        self.bar.set(1)
+        self.status.configure(text=f"{n_att} PDF kaynağına bağlandı, {n_new} yeni kayıt eklendi."
+                                   + (f" {len(problems)} dosyada sorun var." if problems else ""))
+        try:
+            self.app.library_tab.refresh()
+        except Exception:
+            pass
+        diag(f"yeniden eşleştirme: {n_att} bağlandı, {n_new} eklendi" + (f"; sorunlar: {problems}" if problems else ""))
+        if problems:
+            messagebox.showwarning(APP_NAME, "Bazı dosyalar işlenemedi:\n\n" + "\n".join(problems[:12]), parent=self)
+        self._update_count()
+
+    def undo(self):
+        if not self.done or self.busy:
+            return
+        if not messagebox.askyesno(APP_NAME, f"Bu pencerede yapılan {len(self.done)} işlem geri alınsın mı?\n\n"
+                                             "Dosyalar İndirilenler'e geri taşınır; bağlanan kaynaklar yeniden PDF'siz "
+                                             "olur, yeni eklenen kayıtlar çıkarılır.", parent=self):
+            return
+        self.busy, self.phase = True, "undo"
+        self._update_count()
+        lib, q, done = self.app.library, self.q, list(self.done)
+
+        def work():
+            try:
+                q.put(("undone",) + undo_rematch(lib, done) + (done,))
+            except Exception as exc:
+                diag_exception("yeniden eşleştirme geri alma")
+                q.put(("undone", 0, [describe_error(exc)], []))
+        threading.Thread(target=work, name="yeniden-eslestir-geri", daemon=True).start()
+
+    def _undone(self, count, problems, done):
+        back = {d["from"] for d in done}
+        self.done = [d for d in self.done if d not in done]
+        for iid, r in self.rows.items():
+            if isinstance(r, dict) and str(r["path"]) in back:
+                r["applied"] = False
+                self._redraw(iid)
+        self.status.configure(text=f"{count} işlem geri alındı; dosyalar İndirilenler'e döndü."
+                                   + (f" {len(problems)} sorun var." if problems else ""))
+        try:
+            self.app.library_tab.refresh()
+        except Exception:
+            pass
+        diag(f"yeniden eşleştirme geri alındı: {count}" + (f"; sorunlar: {problems}" if problems else ""))
+        if problems:
+            messagebox.showwarning(APP_NAME, "Bazı işlemler geri alınamadı:\n\n" + "\n".join(problems[:12]),
+                                   parent=self)
+        self._update_count()
+
+    def close(self):
+        if self.busy and self.phase in ("apply", "undo"):
+            messagebox.showinfo(APP_NAME, "İşlem sürüyor; bitince pencereyi kapatabilirsiniz.", parent=self)
+            return
+        if self.done and not messagebox.askyesno(
+                APP_NAME, "Pencere kapanınca bu pencerede yapılanlar artık 'Geri Al' ile geri alınamaz. "
+                          "Kapatılsın mı?", parent=self):
+            return
+        self.cancel.set()
+        self.destroy()
+
+
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -15043,6 +15756,8 @@ class App(ctk.CTk):
     def _watch_downloads(self):
         try:
             queue_open = getattr(self, "pdf_queue", None) is not None and self.pdf_queue.winfo_exists()
+            rematch = getattr(self, "rematch_win", None)
+            queue_open = queue_open or (rematch is not None and rematch.winfo_exists())
             if (self.settings.get("watch_downloads", True) and self.library_folder() and not queue_open
                     and not getattr(self, "maintenance", False)
                     and not (self.watcher and self.watcher.is_alive())):
@@ -15427,7 +16142,7 @@ class App(ctk.CTk):
         elif kind == "watch_unmatched":
             name = message[1]
             self.toast(f"İndirilenler'deki “{shorten(name, 40)}” hiçbir PDF'siz kaynakla eşleşmedi — "
-                       "kaynağı seçip 'PDF Bağla…' ile bağlayın.")
+                       "PDF ▾ → 'İndirilenler'i yeniden eşleştir…' ile inceleyebilirsiniz.")
             self._log("warn", f"İndirilen {name} kütüphanedeki bir kaynakla otomatik eşleşmedi. Kütüphanem'de "
                               "kaynağı seçip 'PDF Bağla…' düğmesiyle bu dosyayı gösterin.")
         elif kind == "watch_done":
