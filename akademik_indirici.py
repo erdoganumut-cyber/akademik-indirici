@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.47"
+APP_VERSION = "2.48"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -12063,33 +12063,86 @@ class LibraryTab:
         self.status_menu = ctk.CTkOptionMenu(bar, values=self.STATUS_FILTERS, width=160,
                                              command=lambda _: self.refresh(), dynamic_resizing=False)
         self.status_menu.grid(row=0, column=4, padx=(0, 8))
-        acts = ctk.CTkFrame(bar, fg_color="transparent")          # ikinci satır: işlemler
+        acts = ctk.CTkFrame(bar, fg_color="transparent")          # ikinci satır: işlemler (menülerde toplu)
         acts.grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        self.acts = acts
         outline = {"fg_color": "transparent", "border_width": 1, "text_color": TEXT}
-        ctk.CTkButton(acts, text="Dosya Ekle…", width=100, command=self._add_pdfs).pack(side="left")
-        ctk.CTkButton(acts, text="Klasör Tara…", width=110, command=self._scan_folder, **outline).pack(
-            side="left", padx=(8, 0))
-        self.autotag_btn = ctk.CTkButton(acts, text="Otomatik Etiketle", width=130, command=self._autotag, **outline)
-        self.autotag_btn.pack(side="left", padx=(8, 0))
-        self.complete_btn = ctk.CTkButton(acts, text="Eksik Künyeleri Tamamla", width=170, command=self._complete,
-                                          **outline)
-        self.complete_btn.pack(side="left", padx=(8, 0))
+        menu = {"width": 120, "dynamic_resizing": False, "command": self._menu_action}
+        self.add_menu = ctk.CTkOptionMenu(acts, values=list(self.MENUS["Ekle ▾"]), **menu)
+        self.add_menu.set("Ekle ▾")
+        self.add_menu.pack(side="left")
         self.retry_btn = ctk.CTkButton(acts, text="PDF'leri Yeniden Ara", width=150, fg_color="#1F8F4E",
                                        hover_color="#18723E", command=self._retry_pdfs)
-        self.retry_btn.pack(side="left", padx=(16, 0))
-        ctk.CTkButton(acts, text="PDF'sizleri Sırayla Aç", width=160, fg_color="#1F6F8B", hover_color="#185A71",
-                      command=self._open_queue).pack(side="left", padx=(8, 0))
-        self.allseen_btn = ctk.CTkButton(acts, text="Yenileri İncelendi Say", width=170, command=self._mark_all_reviewed,
-                                         **outline)
-        self.allseen_btn.pack(side="left", padx=(16, 0))
-        self.tools_menu = ctk.CTkOptionMenu(acts, width=120, dynamic_resizing=False, command=self._tool_chosen,
-                                            values=["Atıf ağı ve eksik kaynaklar…", "Mükerrer kayıtları bul…",
-                                                    "PDF işaretlemelerini kartlara aktar…",
-                                                    "Künyeyi PDF'ten yeniden çıkar…",
-                                                    "Anahtar kelimelere uymayanları ayıkla…",
-                                                    "Kütüphaneyi ayır…"])
-        self.tools_menu.set("Araçlar ▾")
-        self.tools_menu.pack(side="left", padx=(8, 0))
+        self.retry_btn.pack(side="left", padx=(12, 0))
+        self.pdf_menu = ctk.CTkOptionMenu(acts, values=list(self.MENUS["PDF ▾"]), fg_color="#1F6F8B",
+                                          button_color="#185A71", button_hover_color="#134a5d", **menu)
+        self.pdf_menu.set("PDF ▾")
+        self.pdf_menu.pack(side="left", padx=(8, 0))
+        self.edit_menu = ctk.CTkOptionMenu(acts, values=list(self.MENUS["Düzenle ▾"]), **menu)
+        self.edit_menu.set("Düzenle ▾")
+        self.edit_menu.pack(side="left", padx=(12, 0))
+        self.bib_menu = ctk.CTkOptionMenu(acts, values=list(self.MENUS["Kaynakça ▾"]), **menu)
+        self.bib_menu.set("Kaynakça ▾")
+        self.bib_menu.pack(side="left", padx=(8, 0))
+        self.tools_menu = self.edit_menu                 # eski adla da erişilsin
+        # süren işler için görünür 'Durdur' düğmeleri (yalnızca iş sürerken gösterilir)
+        self.autotag_btn = ctk.CTkButton(acts, text="Otomatik Etiketle", width=130, command=self._autotag, **outline)
+        self.complete_btn = ctk.CTkButton(acts, text="Eksik Künyeleri Tamamla", width=170, command=self._complete,
+                                          **outline)
+        self.allseen_btn = ctk.CTkButton(acts, text="Yenileri İncelendi Say", width=170,
+                                         command=self._mark_all_reviewed, **outline)
+
+    MENUS = {
+        "Ekle ▾": {"Dosya Ekle (PDF / EPUB)…": "_add_pdfs", "Klasör Tara…": "_scan_folder",
+                   "Kitap Ekle (ISBN / Bağlantı)…": "_add_isbn", "İçe Aktar (Piri / RIS / BibTeX)…": "_import_refs"},
+        "PDF ▾": {"PDF'sizleri Sırayla Aç": "_open_queue", "PDF işaretlemelerini kartlara aktar…": "_import_highlights"},
+        "Düzenle ▾": {"Otomatik Etiketle": "_autotag", "Eksik Künyeleri Tamamla": "_complete",
+                      "Künyeyi PDF'ten yeniden çıkar…": "_reextract", "Mükerrer kayıtları bul…": "_duplicates",
+                      "Anahtar kelimelere uymayanları ayıkla…": "_prune", "Yenileri İncelendi Say": "_mark_all_reviewed"},
+        "Kaynakça ▾": {"Seçilenlerin Kaynakçası": "_bib_selected", "Listedekilerin Kaynakçası": "_bib_listed",
+                       "Dışa Aktar (Jenni / Zotero)…": "_export", "Atıf ağı ve eksik kaynaklar…": "_citations"},
+    }
+
+    def _menu_action(self, choice):
+        for title, entries in self.MENUS.items():
+            if choice in entries:
+                getattr(self, entries[choice])()
+                break
+        for widget, title in ((self.add_menu, "Ekle ▾"), (self.pdf_menu, "PDF ▾"), (self.edit_menu, "Düzenle ▾"),
+                              (self.bib_menu, "Kaynakça ▾")):
+            widget.set(title)
+
+    def _tool_chosen(self, choice):
+        """Eski 'Araçlar' adlarıyla da çalışır."""
+        if choice.startswith("Kütüphaneyi ayır"):
+            return SplitWindow(self.app)
+        for entries in self.MENUS.values():
+            for label, method in entries.items():
+                if label.split("…")[0].split(" (")[0] in choice:
+                    return getattr(self, method)()
+
+    def _duplicates(self):
+        DuplicatesWindow(self.app)
+
+    def _citations(self):
+        win = getattr(self, "cite_win", None)
+        if win is not None and win.winfo_exists():
+            win.lift()
+        else:
+            self.cite_win = CitationWindow(self.app)
+
+    def _bib_selected(self):
+        self._bibliography(selected=True)
+
+    def _bib_listed(self):
+        self._bibliography(selected=False)
+
+    def _show_running(self, button, running):
+        """Uzun süren işin düğmesi iş sürerken satırda görünür (durdurmak için), bitince kalkar."""
+        if running:
+            button.pack(side="left", padx=(12, 0))
+        else:
+            button.pack_forget()
 
     def _build_table(self):
         from tkinter import ttk
@@ -12177,29 +12230,50 @@ class LibraryTab:
         self.show_btn.grid(row=0, column=2, sticky="ew", padx=2, pady=2)
         self.inst_btn = ctk.CTkButton(btns, text="Makaleyi Aç", command=self._open_institution,
                                       **small, **outline)
-        self.inst_btn.grid(row=1, column=0, sticky="ew", padx=2, pady=2)
+        self.inst_btn.grid(row=0, column=2, sticky="ew", padx=2, pady=2)
+        self.show_btn.grid_forget()
+        # sık kullanılmayanlar 'Diğer' menüsünde; düğmeler görünmez ama durumları (etkin/değil) korunur
         self.attach_btn = ctk.CTkButton(btns, text="PDF Bağla…", command=self._attach_pdf, **small, **outline)
-        self.attach_btn.grid(row=1, column=1, sticky="ew", padx=2, pady=2)
         self.crossref_btn = ctk.CTkButton(btns, text="Künyeyi DOI'den Al", command=self._refresh_from_doi,
                                           **small, **outline)
-        self.crossref_btn.grid(row=1, column=2, sticky="ew", padx=2, pady=2)
         self.reviewed_btn = ctk.CTkButton(btns, text="İncelendi ✓", command=self._mark_reviewed,
                                           **small, **outline)
-        self.reviewed_btn.grid(row=2, column=0, sticky="ew", padx=2, pady=2)
+        self.reviewed_btn.grid(row=1, column=0, sticky="ew", padx=2, pady=2)
         self.remove_btn = ctk.CTkButton(btns, text="Kütüphaneden Çıkar", command=self._remove,
                                         fg_color="transparent", border_width=1, text_color="#C9353A",
                                         border_color="#C9353A", **small)
-        self.remove_btn.grid(row=2, column=2, sticky="ew", padx=2, pady=2)
         self.vetis_btn = ctk.CTkButton(btns, text="VETİS (kampüs dışı)", command=self._open_vetis,
                                        **small, **outline)
-        self.vetis_btn.grid(row=2, column=1, sticky="ew", padx=2, pady=2)
         self.search_menu = ctk.CTkOptionMenu(btns, values=SEARCH_SITES, command=self._search_elsewhere,
-                                             height=30, font=ctk.CTkFont(size=12), dynamic_resizing=False,
-                                             fg_color="#5B5F66", button_color="#4A4E54", button_hover_color="#3D4046")
+                                             height=30, font=ctk.CTkFont(size=12), dynamic_resizing=False)
         self.search_menu.set("Başlıkla başka yerde ara ▾")
-        self.search_menu.grid(row=3, column=0, columnspan=2, sticky="ew", padx=2, pady=2)
         self.notes_btn = ctk.CTkButton(btns, text="Okurken Not Al", command=self._reading_notes, **small, **outline)
-        self.notes_btn.grid(row=3, column=2, sticky="ew", padx=2, pady=2)
+        self.more_menu = ctk.CTkOptionMenu(btns, values=self._more_values(), command=self._more_action,
+                                           height=30, font=ctk.CTkFont(size=12), dynamic_resizing=False,
+                                           fg_color="#5B5F66", button_color="#4A4E54", button_hover_color="#3D4046")
+        self.more_menu.set("Diğer ▾")
+        self.more_menu.grid(row=1, column=1, columnspan=2, sticky="ew", padx=2, pady=2)
+
+    def _more_values(self):
+        return (["Klasörde Göster", "PDF Bağla / Değiştir…", "Künyeyi DOI'den Al", "VETİS (kampüs dışı)",
+                 "Okurken Not Al"] + [f"Başka yerde ara: {site}" for site in SEARCH_SITES] + ["Kütüphaneden Çıkar"])
+
+    def _more_action(self, choice):
+        self.more_menu.set("Diğer ▾")
+        buttons = {"Klasörde Göster": self.show_btn, "PDF Bağla / Değiştir…": self.attach_btn,
+                   "Künyeyi DOI'den Al": self.crossref_btn, "VETİS (kampüs dışı)": self.vetis_btn,
+                   "Okurken Not Al": self.notes_btn, "Kütüphaneden Çıkar": self.remove_btn}
+        if choice.startswith("Başka yerde ara: "):
+            if self.current:
+                self._search_elsewhere(choice.split(": ", 1)[1])
+            return
+        btn = buttons.get(choice)
+        if btn is None:
+            return
+        if str(btn.cget("state")) == "disabled":
+            self.app.toast("Bu işlem seçili kaynak için kullanılamıyor" + ("" if self.current else " (önce bir kaynak seçin)") + ".")
+            return
+        btn.invoke()
 
     def _reading_notes(self):
         if not self.current:
@@ -12264,18 +12338,8 @@ class LibraryTab:
         bar.grid_columnconfigure(0, weight=1)
         self.count_label = ctk.CTkLabel(bar, text="", text_color=MUTED, font=ctk.CTkFont(size=12))
         self.count_label.grid(row=0, column=0, sticky="w")
-        ctk.CTkButton(bar, text="Seçilenlerin Kaynakçası", width=170,
-                      command=lambda: self._bibliography(selected=True)).grid(row=0, column=1, padx=4)
-        ctk.CTkButton(bar, text="Listedekilerin Kaynakçası", width=170, fg_color="transparent",
-                      border_width=1, text_color=TEXT,
-                      command=lambda: self._bibliography(selected=False)).grid(row=0, column=2, padx=4)
-        ctk.CTkButton(bar, text="Dışa Aktar (Jenni / Zotero)…", width=190, fg_color="transparent",
-                      border_width=1, text_color=TEXT, command=self._export).grid(row=0, column=3, padx=4)
-        ctk.CTkButton(bar, text="İçe Aktar (Piri / RIS / BibTeX)…", width=210, fg_color="transparent",
-                      border_width=1, text_color=TEXT, command=self._import_refs).grid(row=0, column=4, padx=4)
         self.isbn_btn = ctk.CTkButton(bar, text="Kitap Ekle (ISBN / Bağlantı)…", width=200, fg_color="transparent",
-                                      border_width=1, text_color=TEXT, command=self._add_isbn)
-        self.isbn_btn.grid(row=0, column=5, padx=4)
+                                      border_width=1, text_color=TEXT, command=self._add_isbn)   # Ekle menüsünde
 
     # ── görünüm ─────────────────────────────────────────────────────────────
     def apply_style(self):
@@ -12750,25 +12814,6 @@ class LibraryTab:
         self.lib.mark_reviewed([item["id"] for item in self.selected_items()])
         self.refresh()
 
-    def _tool_chosen(self, choice):
-        self.tools_menu.set("Araçlar ▾")
-        if choice.startswith("Atıf"):
-            win = getattr(self, "cite_win", None)
-            if win is not None and win.winfo_exists():
-                win.lift()
-            else:
-                self.cite_win = CitationWindow(self.app)
-        elif choice.startswith("Mükerrer"):
-            DuplicatesWindow(self.app)
-        elif choice.startswith("PDF"):
-            self._import_highlights()
-        elif choice.startswith("Künyeyi"):
-            self._reextract()
-        elif choice.startswith("Kütüphaneyi ayır"):
-            SplitWindow(self.app)
-        elif choice.startswith("Anahtar kelimelere"):
-            self._prune()
-
     def _prune(self):
         if getattr(self.app, "prune_running", False):
             return
@@ -13130,6 +13175,7 @@ class LibraryTab:
                 parent=self.parent):
             return
         self.autotag_btn.configure(state="disabled", text="Etiketleniyor…")
+        self._show_running(self.autotag_btn, True)
         AutoTagWorker(self.lib, self.app.events, [i["id"] for i in items] if items else None).start()
 
     def _complete(self):
@@ -13162,10 +13208,13 @@ class LibraryTab:
             return
         self.complete_worker = CompleteWorker(items, self.lib, self.app.events)
         self._complete_style = {k: self.complete_btn.cget(k) for k in ("fg_color", "hover_color", "text_color")}
-        self.complete_btn.configure(text="Durdur", fg_color="#C9353A", hover_color="#A42A2E", text_color="#ffffff")
+        self.complete_btn.configure(text="Künye tamamlamayı durdur", fg_color="#C9353A", hover_color="#A42A2E",
+                                    text_color="#ffffff")
+        self._show_running(self.complete_btn, True)
         self.complete_worker.start()
 
     def on_complete_done(self, updated, counts, tried, stopped):
+        self._show_running(self.complete_btn, False)
         self.complete_btn.configure(text="Eksik Künyeleri Tamamla", state="normal",
                                     **getattr(self, "_complete_style", {}))
         self.refresh()
@@ -13183,6 +13232,7 @@ class LibraryTab:
 
     def autotag_finished(self, total, tagged, kw_added):
         self.autotag_btn.configure(state="normal", text="Otomatik Etiketle")
+        self._show_running(self.autotag_btn, False)
         self.refresh()
         self.app.toast(f"{total} kaynak incelendi: {tagged} tanesine grup etiketi, {kw_added} tanesine anahtar kelime eklendi.")
 
@@ -13251,6 +13301,15 @@ class ScanTab:
         self._count_terms()
 
     def _build_side(self):
+        self._build_side_inner()
+        for w in self.app.settings_body.winfo_children():    # Ayarlar sekmesi geniş: açıklamalar da geniş aksın
+            try:
+                if isinstance(w, ctk.CTkLabel) and int(w.cget("wraplength")) == 330:
+                    w.configure(wraplength=760)
+            except Exception:
+                pass
+
+    def _build_side_inner(self):
         side = ctk.CTkScrollableFrame(self.parent, corner_radius=12)
         side.grid(row=0, column=1, sticky="nsew", padx=(6, 8), pady=4)
         side.grid_columnconfigure(0, weight=1)
@@ -13368,6 +13427,20 @@ class ScanTab:
                                 "içindeki makaleler de iner ve kütüphaneye girer.", text_color=MUTED,
                      font=ctk.CTkFont(size=12), wraplength=330, justify="left",
                      anchor="w").grid(row=r, column=0, sticky="ew", padx=10, pady=(2, 0)); r += 1
+
+        # ── bundan sonrası bir kez ayarlanıp unutulanlar: 'Ayarlar' sekmesinde ──
+        side = self.app.settings_body
+        r = 0
+        section("Kütüphaneler")
+        ctk.CTkLabel(side, text=f"Açık kütüphane: {active_profile()}. Kütüphaneler arasında pencerenin üstündeki "
+                                "'Kütüphane' menüsünden geçilir; her kütüphanenin klasörü, anahtar kelimeleri, "
+                                "taraması ve Claude bağlantısı ayrıdır.", text_color=MUTED, font=ctk.CTkFont(size=12),
+                     wraplength=760, justify="left", anchor="w").grid(row=r, column=0, sticky="ew", padx=10); r += 1
+        kb = ctk.CTkFrame(side, fg_color="transparent")
+        kb.grid(row=r, column=0, sticky="w", padx=10, pady=6); r += 1
+        ctk.CTkButton(kb, text="+ Yeni kütüphane…", width=150, command=self.app._new_profile).pack(side="left")
+        ctk.CTkButton(kb, text="Kütüphaneyi ayır…", width=150, fg_color="transparent", border_width=1,
+                      text_color=TEXT, command=lambda: SplitWindow(self.app)).pack(side="left", padx=8)
 
         section("Scopus listesi")
         ctk.CTkLabel(side, text="Elsevier'in Scopus kaynak listesini (Excel) bir kez yükleyin; dergisi Scopus'ta "
@@ -14012,6 +14085,12 @@ class App(ctk.CTk):
         download_tab = self.tabs.add("İndir")
         library_tab = self.tabs.add("Kütüphanem")
         scan_tab = self.tabs.add("Tarama")
+        settings_tab = self.tabs.add("Ayarlar")
+        settings_tab.grid_columnconfigure(0, weight=1)
+        settings_tab.grid_rowconfigure(0, weight=1)
+        self.settings_body = ctk.CTkScrollableFrame(settings_tab, corner_radius=12)
+        self.settings_body.grid(row=0, column=0, sticky="nsew", padx=8, pady=4)
+        self.settings_body.grid_columnconfigure(0, weight=1)
         download_tab.grid_columnconfigure(0, weight=3, uniform="col")
         download_tab.grid_columnconfigure(1, weight=2, uniform="col")
         download_tab.grid_rowconfigure(0, weight=1)
@@ -14513,6 +14592,8 @@ class App(ctk.CTk):
                                               command=self._profile_chosen)
         self.profile_menu.set(active_profile())
         self.profile_menu.pack(side="left")
+        ctk.CTkButton(lib_box, text="⚙ Ayarlar", width=96, fg_color="transparent", border_width=1, text_color=TEXT,
+                      command=lambda: self.tabs.set("Ayarlar")).pack(side="left", padx=(8, 0))
         self.theme_switch = ctk.CTkSwitch(header, text="Koyu tema", command=self._toggle_theme)
         self.theme_switch.grid(row=0, column=3, rowspan=2, sticky="e")
         if ctk.get_appearance_mode().lower() == "dark":
