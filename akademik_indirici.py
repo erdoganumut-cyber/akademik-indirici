@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.44"
+APP_VERSION = "2.45"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -3178,13 +3178,33 @@ def library_filename(rec: dict, ext: str = ".pdf") -> str:
     return sanitize_filename(name + ext)
 
 
+DOC_SUFFIXES = {".pdf", ".epub", ".html", ".htm", ".acsm", ".docx", ".doc"}
+
+
+def doc_suffix(path) -> str:
+    """Dosyanın gerçek uzantısı: indirme sırasındaki '.part' gibi geçici adlar içeriğe bakılarak düzeltilir."""
+    suffix = Path(path).suffix.lower()
+    if suffix in DOC_SUFFIXES:
+        return suffix
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(1024)
+    except OSError:
+        head = b""
+    if head.find(b"%PDF-") >= 0:
+        return ".pdf"
+    if head.startswith(b"PK") and b"epub" in head:
+        return ".epub"
+    return suffix if suffix and suffix not in (".part", ".tmp", ".crdownload") else ".pdf"
+
+
 def place_in_library(path: Path, rec: dict, library_folder, move: bool = True) -> Path:
     """Dosyayı kütüphane klasörüne standart adıyla taşır (ya da kopyalar)."""
     if not library_folder:
         return path
     folder = Path(library_folder)
     folder.mkdir(parents=True, exist_ok=True)
-    wanted = library_filename(rec, path.suffix.lower() or ".pdf")
+    wanted = library_filename(rec, doc_suffix(path))
     if path.parent.resolve() == folder.resolve() and path.name == wanted:
         return path
     target = unique_path(folder, wanted)
@@ -3664,6 +3684,28 @@ class Library:
         with self.lock:
             row = self.db.execute("SELECT content FROM fulltext WHERE item_id=?", (item_id,)).fetchone()
         return row[0] if row and row[0] else ""
+
+    def repair_temp_names(self, library_folder=None) -> int:
+        """Eski bir hatayla '.part' uzantısıyla kaydedilmiş PDF'leri ('Soyad (Yıl) - Başlık.part') doğru adla
+        yeniden adlandırır. Dönüş: düzeltilen dosya sayısı."""
+        with self.lock:
+            rows = self.db.execute("SELECT id FROM items WHERE lower(file_path) LIKE '%.part' "
+                                   "OR lower(file_path) LIKE '%.tmp'").fetchall()
+        fixed = 0
+        for (item_id,) in rows:
+            item = self.get(item_id)
+            path = Path(item["file_path"]) if item and item["file_path"] else None
+            if not path or not path.is_file():
+                continue
+            try:
+                new = place_in_library(path, item, library_folder or path.parent)
+            except OSError as exc:
+                diag(f"uzantı düzeltilemedi: {path.name}: {describe_error(exc)}")
+                continue
+            if str(new) != item["file_path"]:
+                self.update(item_id, {"file_path": str(new)})
+                fixed += 1
+        return fixed
 
     def fulltext_heads(self, ids, chars=5000) -> dict:
         """Kayıtların saklı (katlanmış) metninin başı: {kimlik: metin}. Mükerrer tespiti için."""
@@ -4964,9 +5006,9 @@ _MATCHER_CACHE = {"key": None, "matcher": None}
 def get_matcher():
     """Anahtar kelime gruplarından eşleştirici (dosya değişince yeniden kurulur)."""
     try:
-        key = keywords_path().stat().st_mtime
+        key = (str(keywords_path()), keywords_path().stat().st_mtime)
     except OSError:
-        key = "varsayılan"
+        key = (active_profile(), "varsayılan")
     if _MATCHER_CACHE["key"] != key:
         _MATCHER_CACHE.update(key=key, matcher=KeywordMatcher(parse_keyword_groups(load_keywords_text())))
     return _MATCHER_CACHE["matcher"]
@@ -7013,7 +7055,17 @@ _REL_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}
 
 
 def scopus_path() -> Path:
-    return data_dir() / "scopus_listesi.json"
+    path = data_dir() / "scopus_listesi.json"
+    if path.exists() or active_profile() == DEFAULT_PROFILE:
+        return path
+    # başka kütüphanede liste yüklenmemişse varsayılan kütüphanenin listesi kullanılır
+    base = _read_json(app_base_dir() / "ayarlar.json")
+    for cand in ([Path(base["library_folder"]) / SHARED_DIR_NAME / "scopus_listesi.json"]
+                 if base.get("shared_library") and base.get("library_folder") else []) + \
+            [app_base_dir() / "scopus_listesi.json"]:
+        if cand.exists():
+            return cand
+    return path
 
 
 def journal_key(title: str) -> str:
@@ -9189,9 +9241,12 @@ def run_mcp_server():
         try:
             if method == "initialize":
                 version = (msg.get("params") or {}).get("protocolVersion") or "2025-06-18"
+                which = ("" if active_profile() == DEFAULT_PROFILE else
+                         f"Bu bağlantı kullanıcının '{active_profile()}' adlı ayrı kütüphanesine bağlıdır "
+                         f"(akademik kütüphanesi '{MCP_SERVER_NAME}' bağlantısındadır).\n\n")
                 result = {"protocolVersion": version, "capabilities": {"tools": {"listChanged": False}},
-                          "serverInfo": {"name": MCP_SERVER_NAME, "version": APP_VERSION},
-                          "instructions": MCP_INSTRUCTIONS}
+                          "serverInfo": {"name": mcp_server_name(), "version": APP_VERSION},
+                          "instructions": which + MCP_INSTRUCTIONS}
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
@@ -9264,13 +9319,20 @@ def mcp_exe_path() -> Path:
     return Path(__file__).resolve().with_name(f"{MCP_EXE_NAME}.exe")
 
 
-def mcp_server_entry() -> dict:
-    return {"command": str(mcp_exe_path()), "args": ["--mcp"]}
+def mcp_server_name(profile=None) -> str:
+    profile = profile or active_profile()
+    return MCP_SERVER_NAME if profile == DEFAULT_PROFILE else f"{profile_slug(profile)}-kutuphane"
+
+
+def mcp_server_entry(profile=None) -> dict:
+    profile = profile or active_profile()
+    args = ["--mcp"] + ([] if profile == DEFAULT_PROFILE else ["--kutuphane", profile])
+    return {"command": str(mcp_exe_path()), "args": args}
 
 
 def claude_config_snippet() -> str:
     """Uzantı kurulamazsa elle eklenecek claude_desktop_config.json girdisi."""
-    return json.dumps({"mcpServers": {MCP_SERVER_NAME: mcp_server_entry()}}, ensure_ascii=False, indent=2)
+    return json.dumps({"mcpServers": {mcp_server_name(): mcp_server_entry()}}, ensure_ascii=False, indent=2)
 
 
 def claude_config_paths() -> list:
@@ -9307,7 +9369,7 @@ def connect_claude_desktop() -> list:
         servers = data.get("mcpServers")
         if not isinstance(servers, dict):
             servers = {}
-        servers[MCP_SERVER_NAME] = mcp_server_entry()
+        servers[mcp_server_name()] = mcp_server_entry()
         data["mcpServers"] = servers
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -9320,10 +9382,95 @@ def connect_claude_desktop() -> list:
 #  7) AYARLAR (klasör, e-posta ve seçenekler bir sonraki açılışta hatırlanır)
 # ════════════════════════════════════════════════════════════════════════════
 
-def settings_path() -> Path:
+# ── Birden çok kütüphane: her kütüphanenin ayarları, yerel veritabanı, metin dizini ve tarama durumu
+#    kendi klasöründe durur. İlk (varsayılan) kütüphane eskisi gibi doğrudan uygulama klasöründedir;
+#    güncelleme, tanılama kaydı ve simge ise bütün kütüphaneler için ortaktır.
+DEFAULT_PROFILE = "Akademik"
+_ACTIVE_PROFILE = {"name": None}
+
+
+def app_base_dir() -> Path:
     base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming" if sys.platform == "win32"
                                              else Path.home())
-    return Path(base) / "AkademikIndirici" / "ayarlar.json"
+    return Path(base) / "AkademikIndirici"
+
+
+def profiles_path() -> Path:
+    return app_base_dir() / "kutuphaneler.json"
+
+
+def load_profiles() -> dict:
+    """{"list": [ad, …], "active": ad} — varsayılan kütüphane her zaman ilk sıradadır."""
+    try:
+        with open(profiles_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        data = {}
+    names = [n for n in (data.get("list") or []) if isinstance(n, str) and n.strip()] if isinstance(data, dict) else []
+    names = [DEFAULT_PROFILE] + [n for n in names if n != DEFAULT_PROFILE]
+    active = data.get("active") if isinstance(data, dict) else None
+    return {"list": names, "active": active if active in names else DEFAULT_PROFILE}
+
+
+def save_profiles(data: dict):
+    path = profiles_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def profile_slug(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", fold(name)).strip("-") or "kutuphane"
+
+
+def profile_dir(name: str) -> Path:
+    if not name or name == DEFAULT_PROFILE:
+        return app_base_dir()
+    return app_base_dir() / "Kütüphaneler" / profile_slug(name)
+
+
+def active_profile() -> str:
+    return _ACTIVE_PROFILE["name"] or DEFAULT_PROFILE
+
+
+def set_active_profile(name: str, remember: bool = False):
+    """Bu süreçte hangi kütüphaneyle çalışılacağı. remember: bir sonraki açılış için de hatırla."""
+    data = load_profiles()
+    if name not in data["list"]:
+        name = DEFAULT_PROFILE
+    _ACTIVE_PROFILE["name"] = name
+    _SHARED_STATE.update(path="", data={}, t=None)
+    _DIR_CACHE.clear()
+    _MATCHER_CACHE.update(key=None, matcher=None)
+    _SCOPUS_CACHE.update(key=None, data=None, path=None, checked=-1e9)
+    if remember and data["active"] != name:
+        data["active"] = name
+        save_profiles(data)
+
+
+def add_profile(name: str, base_settings: dict = None) -> str:
+    """Yeni kütüphane kaydı açar; kişisel ayarlar (e-posta, anahtarlar, indirme klasörü…) varsayılandan gelir."""
+    name = re.sub(r"\s+", " ", (name or "").strip())[:40]
+    data = load_profiles()
+    if not name or fold(name) in {fold(n) for n in data["list"]}:
+        raise ValueError("Bu adda bir kütüphane zaten var ya da ad boş.")
+    folder = profile_dir(name)
+    folder.mkdir(parents=True, exist_ok=True)
+    keep_out = {"library_folder", "shared_library", "sync", "last_scan", "last_report", "seen_report",
+                "retry_next_no", "queue_next_no", "watch_since"}
+    personal = {k: v for k, v in (base_settings or {}).items() if k not in keep_out}
+    if not (folder / "ayarlar.json").exists():
+        with open(folder / "ayarlar.json", "w", encoding="utf-8") as fh:
+            json.dump(personal, fh, ensure_ascii=False, indent=2)
+    data["list"].append(name)
+    save_profiles(data)
+    return name
+
+
+def settings_path() -> Path:
+    return profile_dir(active_profile()) / "ayarlar.json"
 
 
 def _load_settings_raw() -> dict:
@@ -9807,7 +9954,7 @@ def icon_png(size: int = 256) -> bytes:
 
 def icon_file() -> str:
     """Pencere simgesi için .ico dosyası (bu bilgisayarda bir kez yazılır)."""
-    path = settings_path().parent / "uygulama.ico"
+    path = app_base_dir() / "uygulama.ico"
     data = app_icon_bytes()
     try:
         if not path.is_file() or path.read_bytes() != data:
@@ -9859,7 +10006,7 @@ def code_constant(text: str, name: str) -> str:
 
 
 def update_dir() -> Path:
-    return settings_path().parent / "guncelleme"
+    return app_base_dir() / "guncelleme"
 
 
 def cached_update():
@@ -9941,7 +10088,7 @@ _FAULT_FILE = None
 
 
 def diag_path() -> Path:
-    return settings_path().parent / "tanilama_kaydi.txt"
+    return app_base_dir() / "tanilama_kaydi.txt"
 
 
 def diag(text: str, throttle: bool = False):
@@ -9983,7 +10130,7 @@ def install_crash_logging():
     sys.excepthook = excepthook
     threading.excepthook = thread_hook
     try:
-        path = settings_path().parent / "cokme_kaydi.txt"
+        path = app_base_dir() / "cokme_kaydi.txt"
         path.parent.mkdir(parents=True, exist_ok=True)
         _FAULT_FILE = open(path, "a", encoding="utf-8")
         faulthandler.enable(file=_FAULT_FILE, all_threads=True)
@@ -10223,6 +10370,9 @@ def remember_setting(key, value):
     update_settings(**{key: value})
 
 
+_WATCHDOG = None
+
+
 class FreezeWatchdog(threading.Thread):
     """Arayüz ('Yanıt vermiyor') donarsa ana iş parçacığının o an ne yaptığını tanılama kaydına yazar."""
 
@@ -10262,7 +10412,7 @@ class CitationWindow(ctk.CTkToplevel):
         self.app = app
         self.title("Atıf ağı ve eksik temel kaynaklar")
         set_window_icon(self, delay=260)
-        self.geometry("980x620")
+        self.geometry("%dx%d" % fit_window(self, 980, 620))
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
         top = ctk.CTkFrame(self, fg_color="transparent")
@@ -10444,7 +10594,7 @@ class DuplicatesWindow(ctk.CTkToplevel):
         self.app = app
         self.title("Mükerrer kayıtlar")
         set_window_icon(self, delay=260)
-        self.geometry("900x600")
+        self.geometry("%dx%d" % fit_window(self, 900, 600))
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
         items = app.library.all_items()
@@ -10493,6 +10643,480 @@ class DuplicatesWindow(ctk.CTkToplevel):
         self.destroy()
 
 
+# ── Kütüphaneyi ikiye ayırma (ör. akademik kütüphaneye karışmış LRF kaynakları ayrı kütüphaneye) ──────────
+
+FOLKLORE_GROUP = """[Halk bilimi ve folklor]
+halk bilim → halk bilimi
+halkbilim → halkbilimi
+folklor
+folklore
+folkloristik
+folkloristics
+"""
+SPLIT_CONTEXT_PATCHES = {     # ilk LRF listesinde bağlamsız kalıp ilgisiz kaynak getiren gruplar
+    "LRF · Zehirli ve tehlikeli türler":
+        "bağlam: sting, sokma, envenom, venom, zehir, toxic, toksik, injury, yaralanma, poisoning, zehirlenme, "
+        "bather, swimmer, yüzücü, fisher, balıkçı, mediterranean, akdeniz, marmara, aegean, black sea, "
+        "karadeniz, turkey, türkiye, turkish, levant, lessepsian",
+    "LRF · Marmara ve boğazlar":
+        "bağlam: balık, fish, fisher, balıkçı, fishing, avcılık, pelagic, pelajik, demersal, plankton, ichthyo, "
+        "ihtiyo, catch, stock, stok, species, migration, göç, larva",
+}
+
+
+def split_keyword_text(text: str, prefix: str) -> tuple:
+    """Anahtar kelime metnini (açıklama başlığı korunarak) önekli gruplar ve öbürleri diye ikiye böler."""
+    head, blocks, current = [], [], None
+    for line in (text or "").splitlines():
+        if re.match(r"^\s*\[.+\]\s*$", line):
+            current = [line]
+            blocks.append(current)
+        elif current is None:
+            head.append(line)
+        else:
+            current.append(line)
+    pre = fold(prefix).strip()
+    mine = [b for b in blocks if fold(b[0].strip()[1:]).startswith(pre)]
+    rest = [b for b in blocks if b not in mine]
+
+    def join(parts):
+        body = "\n\n".join("\n".join(b).rstrip() for b in parts)
+        return ("\n".join(head).rstrip() + "\n\n" + body).strip() + "\n"
+    return join(mine), join(rest)
+
+
+def patch_keyword_groups(text: str) -> str:
+    """Bilinen bağlamsız gruplara bağlam satırı ekler (yalnızca grupta hiç bağlam satırı yoksa)."""
+    lines = (text or "").splitlines()
+    out, i = [], 0
+    while i < len(lines):
+        out.append(lines[i])
+        m = re.match(r"^\s*\[(.+)\]\s*$", lines[i])
+        if m and m.group(1).strip() in SPLIT_CONTEXT_PATCHES:
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            if not re.match(r"^\s*ba[gğ]lam\s*:", nxt, re.I):
+                out.append(SPLIT_CONTEXT_PATCHES[m.group(1).strip()])
+        i += 1
+    return "\n".join(out) + "\n"
+
+
+def fix_folklore_terms(text: str) -> str:
+    """'Halk Bilimi - Folklore' gibi eşleşmeyen satırları kaldırıp ayrı 'Halk bilimi ve folklor' grubu ekler."""
+    lines = [ln for ln in (text or "").splitlines()
+             if not re.fullmatch(r"\s*halk\s*bilimi\s*(-|→|->)\s*folklore?\s*", fold(ln))]
+    text = "\n".join(lines).rstrip() + "\n"
+    if not re.search(r"^\[halk bilimi ve folklor\]", fold(text), re.M):
+        text += "\n" + FOLKLORE_GROUP
+    return text
+
+
+def sibling_libraries(folder) -> list:
+    """Aynı üst klasördeki başka kütüphane klasörleri (içinde '_Kütüphane Verisi' olanlar)."""
+    try:
+        parent = Path(folder).parent
+        return [str(p) for p in sorted(parent.iterdir())
+                if p.is_dir() and os.path.normcase(str(p)) != os.path.normcase(str(folder))
+                and (p / SHARED_DIR_NAME / SHARED_DB_NAME).is_file()]
+    except OSError:
+        return []
+
+
+def _copy_rows(src_db, dest_alias, table, ids, key):
+    cols_dest = [r[1] for r in src_db.execute(f"PRAGMA {dest_alias}.table_info({table})")]
+    cols_src = {r[1] for r in src_db.execute(f"PRAGMA main.table_info({table})")}
+    cols = ", ".join(c for c in cols_dest if c in cols_src)
+    for k in range(0, len(ids), 500):
+        part = ids[k:k + 500]
+        marks = ",".join("?" * len(part))
+        src_db.execute(f"INSERT OR REPLACE INTO {dest_alias}.{table} ({cols}) SELECT {cols} FROM main.{table} "
+                       f"WHERE {key} IN ({marks})", part)
+
+
+def push_db_to_shared(db_path, shared_folder, items) -> str:
+    """Bir kütüphane veritabanını ortak klasöre yazar (LibrarySync.push'un ayarsız hâli). Dönüş: sürüm."""
+    import uuid
+    shared_folder = Path(shared_folder)
+    shared_folder.mkdir(parents=True, exist_ok=True)
+    target = shared_folder / SHARED_DB_NAME
+    tmp = shared_folder / (SHARED_DB_NAME + ".tmp")
+    shutil.copyfile(db_path, tmp)
+    os.replace(tmp, target)
+    rev = uuid.uuid4().hex
+    _write_json(shared_folder / SHARED_META_NAME, {"rev": rev, "machine": machine_name(), "items": items,
+                                                   "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                                   "version": APP_VERSION})
+    return rev
+
+
+def split_library(lib, ids, new_name, new_folder, rest_folder, prefix, progress=lambda text: None) -> dict:
+    """ids kaynaklarını yeni bir kütüphaneye (new_name, new_folder) taşır; kalan kütüphane rest_folder'a
+    döner. PDF'ler gerekirse kendi klasörlerine taşınır, iki taraf da ortak kopyasıyla eşitlenir.
+    Hiçbir kaynak silinmez: taşınanlar yeni kütüphanede, kalanlar bu kütüphanede durur."""
+    ids = sorted(set(int(i) for i in ids))
+    current_folder = load_settings().get("library_folder") or ""
+    settings = _load_settings_raw()
+    shared = bool(settings.get("shared_library"))
+    norm = lambda p: os.path.normcase(os.path.normpath(str(p))) if p else ""
+    if norm(new_folder) == norm(rest_folder):
+        raise ValueError("İki kütüphanenin klasörü aynı olamaz.")
+    if new_name in load_profiles()["list"]:
+        if Library(profile_dir(new_name) / "kutuphane.db").count():
+            raise ValueError(f"'{new_name}' kütüphanesi zaten var ve boş değil.")
+    else:
+        add_profile(new_name, settings)
+    new_dir = profile_dir(new_name)
+    new_db = new_dir / "kutuphane.db"
+    Library(new_db, root=new_folder, relative=shared).close()                 # boş şema
+    result = {"moved": len(ids), "files_moved": 0}
+
+    # 1) kayıtları yeni veritabanına kopyala, yeni kütüphanede 1'den başlayarak numarala
+    progress(f"{len(ids)} kaynak yeni kütüphaneye kopyalanıyor…")
+    file_of = {}
+    for i in ids:
+        item = lib.get(i)
+        if item and item["file_path"]:
+            file_of[i] = item["file_path"]
+    with lib.lock:
+        lib.db.execute("ATTACH DATABASE ? AS yeni", (str(new_db),))
+        try:
+            with lib.db:
+                for table, key in (("items", "id"), ("tags", "item_id"), ("cards", "item_id"), ("fulltext", "item_id")):
+                    _copy_rows(lib.db, "yeni", table, ids, key)
+        finally:
+            lib.db.execute("DETACH DATABASE yeni")
+    new = Library(new_db, root=new_folder, relative=shared)
+    with new.lock, new.db:
+        order = [r[0] for r in new.db.execute("SELECT id FROM items ORDER BY added, id")]
+        new.db.executemany("UPDATE items SET no=? WHERE id=?", [(n, i) for n, i in enumerate(order, start=1)])
+        new.db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('last_no', ?)", (str(len(order)),))
+
+    # 2) dosyaları doğru klasöre: taşınanlar yeni klasöre, kalanlardan şimdiki klasörde duranlar eski klasöre
+    def listing(folder):
+        try:
+            return {e.name for e in os.scandir(folder) if e.is_file()}
+        except OSError:
+            return set()
+    here = listing(current_folder) if current_folder else set()
+    if current_folder and norm(current_folder) != norm(new_folder):
+        for n, (i, path) in enumerate(file_of.items()):
+            if Path(path).name in here and os.path.isfile(path):
+                if n % 20 == 0:
+                    progress(f"PDF'ler yeni kütüphane klasörüne taşınıyor ({n}/{len(file_of)})…")
+                try:
+                    target = place_in_library(Path(path), new.get(i), new_folder)
+                    new.update(i, {"file_path": str(target)})
+                    result["files_moved"] += 1
+                except OSError as exc:
+                    diag(f"ayırma: {Path(path).name} taşınamadı: {describe_error(exc)}")
+    staying = []
+    if current_folder and norm(current_folder) != norm(rest_folder):
+        moved = set(ids)
+        with lib.lock:
+            rows = lib.db.execute("SELECT id, file_path FROM items WHERE file_path!=''").fetchall()
+        staying = [(i, fp) for i, fp in rows if i not in moved and Path(str(fp).replace("\\", "/")).name in here]
+    new.repair_temp_names(new_folder)
+    new_change, new_count = new.change_no(), new.count()
+    new.close()
+
+    # 3) taşınanları bu kütüphaneden çıkar
+    progress("Taşınan kaynaklar bu kütüphaneden çıkarılıyor…")
+    with lib.lock, lib.db:
+        for k in range(0, len(ids), 500):
+            part = ids[k:k + 500]
+            marks = ",".join("?" * len(part))
+            for table, key in (("items", "id"), ("tags", "item_id"), ("cards", "item_id"), ("fulltext", "item_id")):
+                lib.db.execute(f"DELETE FROM {table} WHERE {key} IN ({marks})", part)
+    staying_abs = [(i, lib._abs(fp)) for i, fp in staying]
+    for n, (i, path) in enumerate(staying_abs):
+        if n % 20 == 0:
+            progress(f"Bu kütüphanenin PDF'leri kendi klasörüne taşınıyor ({n}/{len(staying_abs)})…")
+        try:
+            if os.path.isfile(path):
+                target = place_in_library(Path(path), lib.get(i), rest_folder)
+                staying_abs[n] = (i, str(target))
+                result["files_moved"] += 1
+        except OSError as exc:
+            diag(f"ayırma: {Path(path).name} taşınamadı: {describe_error(exc)}")
+
+    # 4) anahtar kelimeler: önekli gruplar yeni kütüphaneye; kalan kütüphanenin listesine dokunulmaz
+    progress("Anahtar kelimeler ayrılıyor…")
+    text = load_keywords_text()
+    mine, others = split_keyword_text(text, prefix)
+    new_kw = (Path(new_folder) / SHARED_DIR_NAME if shared else new_dir) / "anahtar_kelimeler.txt"
+    rest_kw = (Path(rest_folder) / SHARED_DIR_NAME if shared else settings_path().parent) / "anahtar_kelimeler.txt"
+    rest_text = rest_kw.read_text(encoding="utf-8") if rest_kw.is_file() else others
+    if norm(rest_kw) != norm(new_kw) or not rest_kw.is_file():
+        rest_kw.parent.mkdir(parents=True, exist_ok=True)
+        rest_kw.write_text(fix_folklore_terms(rest_text), encoding="utf-8")
+    new_kw.parent.mkdir(parents=True, exist_ok=True)
+    new_kw.write_text(patch_keyword_groups(mine), encoding="utf-8")
+
+    # 5) yeni kütüphanenin ayarları ve ortak kopyası (eski karışık kopyanın yerine)
+    progress("Yeni kütüphane Drive'a yazılıyor…")
+    new_settings = _read_json(new_dir / "ayarlar.json")
+    new_settings.update(library_folder=str(new_folder), shared_library=shared,
+                        last_scan=utc_now().isoformat(), auto_scan=settings.get("auto_scan", True))
+    for k in ("last_report", "seen_report", "retry_next_no", "queue_next_no", "sync"):
+        new_settings.pop(k, None)
+    if shared:
+        remote = Path(new_folder) / SHARED_DIR_NAME
+        rev = push_db_to_shared(new_db, remote, new_count)
+        new_settings["sync"] = {"synced_change": new_change, "shared_rev": rev,
+                                "last_sync": datetime.now().strftime("%d.%m.%Y %H:%M")}
+        stale = remote / "Metin Dizini"                  # karışık kütüphanenin dizin parçaları: baştan kurulacak
+        for f in list(stale.glob("dizin_*.db")) + [stale / "onbellek.json", stale / IndexWorker.LOCK_NAME]:
+            try:
+                f.unlink(missing_ok=True)
+            except OSError:
+                pass
+    _write_json(new_dir / "ayarlar.json", new_settings)
+
+    # 6) bu kütüphane eski klasörüne döner ve oradaki ortak kopyayla birleştirilir
+    progress("Bu kütüphane eski klasörüyle eşitleniyor (birkaç dakika sürebilir)…")
+    update_settings(library_folder=str(rest_folder))
+    _DIR_CACHE.clear()
+    _SHARED_STATE.update(path="", data={}, t=None)
+    lib.configure_paths()
+    for i, path in staying_abs:
+        lib.update(i, {"file_path": path})
+    if shared:
+        sync = LibrarySync(lib)
+        if (Path(rest_folder) / SHARED_DIR_NAME / SHARED_DB_NAME).is_file():
+            result["merged"] = sync.merge()
+        else:
+            sync.push(force=True)
+    result.update(new_count=new_count, rest_count=lib.count())
+    diag(f"kütüphane ayrıldı: {new_count} kaynak → '{new_name}' ({new_folder}); kalan {result['rest_count']} "
+         f"kaynak → {rest_folder}")
+    return result
+
+
+class SplitWindow(ctk.CTkToplevel):
+    """Etiketi belli bir önekle başlayan kaynakları ayrı bir kütüphaneye taşır."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("Kütüphaneyi ayır")
+        set_window_icon(self, delay=260)
+        self.transient(app)
+        self.resizable(False, False)
+        self.grid_columnconfigure(0, weight=1)
+        pad = {"padx": 18, "sticky": "ew"}
+        items = app.library.all_items()
+        self.items = items
+        prefixes = {}
+        for it in items:
+            for t in it["tags"]:
+                if " · " in t:
+                    prefixes.setdefault(t.split(" · ")[0].strip(), set()).add(it["id"])
+        guess = max(prefixes, key=lambda k: len(prefixes[k])) if prefixes else ""
+        current = app.library_folder() or ""
+        ctk.CTkLabel(self, text="Etiketi belli bir önekle başlayan kaynakları (ör. 'LRF · …' gruplarından gelenler) "
+                                "kendi klasörü, anahtar kelimeleri, taraması ve Claude bağlantısı olan ayrı bir "
+                                "kütüphaneye taşır. Hiçbir kaynak silinmez.", wraplength=560, justify="left",
+                     anchor="w").grid(row=0, column=0, pady=(16, 10), **pad)
+        form = ctk.CTkFrame(self, fg_color="transparent")
+        form.grid(row=1, column=0, **pad)
+        form.grid_columnconfigure(1, weight=1)
+
+        def row(r, label, widget, button=None):
+            ctk.CTkLabel(form, text=label, anchor="w").grid(row=r, column=0, sticky="w", pady=4, padx=(0, 8))
+            widget.grid(row=r, column=1, sticky="ew", pady=4)
+            if button:
+                button.grid(row=r, column=2, padx=(6, 0))
+        self.prefix = ctk.CTkEntry(form)
+        self.prefix.insert(0, guess)
+        self.prefix.bind("<KeyRelease>", lambda _: self._count())
+        row(0, "Etiket öneki:", self.prefix)
+        self.name = ctk.CTkEntry(form)
+        self.name.insert(0, guess)
+        row(1, "Yeni kütüphanenin adı:", self.name)
+        self.new_folder = ctk.CTkEntry(form)
+        if guess and fold(guess) in fold(Path(current).name):
+            self.new_folder.insert(0, current)
+        row(2, "Yeni kütüphanenin klasörü:", self.new_folder,
+            ctk.CTkButton(form, text="Seç…", width=60, command=lambda: self._pick(self.new_folder)))
+        self.rest_folder = ctk.CTkEntry(form)
+        others = sibling_libraries(current) if current else []
+        rest_guess = current if not (guess and fold(guess) in fold(Path(current).name)) else (others[0] if others else "")
+        self.rest_folder.insert(0, rest_guess)
+        row(3, "Bu kütüphanenin klasörü:", self.rest_folder,
+            ctk.CTkButton(form, text="Seç…", width=60, command=lambda: self._pick(self.rest_folder)))
+        self.info = ctk.CTkLabel(self, text="", wraplength=560, justify="left", anchor="w", text_color=MUTED)
+        self.info.grid(row=2, column=0, pady=(10, 0), **pad)
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.grid(row=3, column=0, pady=16, padx=18, sticky="e")
+        ctk.CTkButton(btns, text="Vazgeç", width=90, fg_color="transparent", border_width=1, text_color=TEXT,
+                      command=self.destroy).pack(side="left", padx=(0, 8))
+        self.ok = ctk.CTkButton(btns, text="Ayır", width=110, command=self._start)
+        self.ok.pack(side="left")
+        self.bind("<Escape>", lambda _: self.destroy())
+        self._count()
+        self.after(60, lambda: (self.lift(), self.focus_force()))
+
+    def _pick(self, entry):
+        path = filedialog.askdirectory(parent=self, initialdir=entry.get() or None)
+        if path:
+            entry.delete(0, "end")
+            entry.insert(0, os.path.normpath(path))
+
+    def _chosen(self):
+        pre = fold(self.prefix.get()).strip()
+        if not pre:
+            return []
+        return [i["id"] for i in self.items if any(fold(t).startswith(pre) for t in i["tags"])]
+
+    def _count(self):
+        ids = self._chosen()
+        self.info.configure(text=f"Taşınacak: {len(ids)} kaynak · bu kütüphanede kalacak: {len(self.items) - len(ids)} "
+                                 "kaynak.\n\nAyırınca: taşınan kaynaklar 1'den başlayarak yeniden numaralanır, PDF'leri "
+                                 "yeni kütüphanenin klasörüne geçer; önekli anahtar kelime grupları da oraya taşınır. "
+                                 "Bu kütüphane yukarıdaki klasörüne döner ve oradaki ortak kopyayla (öbür "
+                                 "bilgisayarınızla) eşitlenir. Pencerenin üstündeki 'Kütüphane' menüsünden ikisi "
+                                 "arasında geçebilirsiniz.")
+
+    def _start(self):
+        ids, name = self._chosen(), self.name.get().strip()
+        new_folder, rest_folder = self.new_folder.get().strip(), self.rest_folder.get().strip()
+        if not ids or not name or not new_folder or not rest_folder:
+            messagebox.showinfo(APP_NAME, "Etiket önekini, yeni kütüphanenin adını ve iki klasörü de doldurun.",
+                                parent=self)
+            return
+        if not os.path.isdir(rest_folder):
+            messagebox.showinfo(APP_NAME, "Bu kütüphanenin klasörü bulunamadı.", parent=self)
+            return
+        busy = self.app._busy_reason()
+        if busy:
+            messagebox.showinfo(APP_NAME, f"Şu an {busy} sürüyor; önce durdurun.", parent=self)
+            return
+        if not messagebox.askyesno(APP_NAME, f"{len(ids)} kaynak '{name}' kütüphanesine taşınacak.\n\n"
+                                             f"Yeni kütüphane: {new_folder}\nBu kütüphane: {rest_folder}\n\n"
+                                             "Devam edilsin mi?", parent=self):
+            return
+        prefix = self.prefix.get().strip()
+        self.destroy()
+        self.app.run_split(ids, name, new_folder, rest_folder, prefix)
+
+
+PRUNE_DIR = "Ayıklanan PDF'ler (silinebilir)"
+
+
+def find_unmatched(library, items, cancel=None, progress=None) -> list:
+    """Taramadan gelmiş olup güncel anahtar kelimelere artık uymayan kaynaklar (kartı ya da Claude özeti
+    olanlar hariç). Başlık + anahtar kelimeler + saklı metnin başı (özet ya da PDF) yeniden eşleştirilir."""
+    matcher = get_matcher()
+    cards = library.card_counts()
+    out = []
+    pool = [i for i in items if i.get("source") in ("tarama", "geçmiş tarama")
+            and not cards.get(i["id"]) and not i.get("ai_ozet")]
+    for n, item in enumerate(pool):
+        if cancel is not None and cancel.is_set():
+            break
+        if progress and n % 50 == 0:
+            progress(n, len(pool))
+        strong = " ".join([item.get("title") or "", item.get("keywords") or ""])
+        text = library.get_fulltext(item["id"])[:6000]
+        if not matcher.match(text, strong=strong):
+            out.append(item)
+    return out
+
+
+def prune_items(library, ids, library_folder) -> tuple:
+    """Kaynakları kütüphaneden çıkarır; PDF'leri silinmez, kütüphane klasöründeki 'Ayıklanan PDF'ler
+    (silinebilir)' klasörüne taşınır. Dönüş: (çıkarılan, taşınan dosya)"""
+    moved = 0
+    spare = Path(library_folder) / PRUNE_DIR if library_folder else None
+    for item_id in ids:
+        item = library.get(item_id)
+        if not item:
+            continue
+        path = item.get("file_path")
+        if path and spare is not None and os.path.isfile(path):
+            try:
+                spare.mkdir(parents=True, exist_ok=True)
+                shutil.move(path, str(unique_path(spare, Path(path).name)))
+                moved += 1
+            except OSError as exc:
+                diag(f"ayıklama: {Path(path).name} taşınamadı: {describe_error(exc)}")
+        library.delete(item_id)
+    return len(ids), moved
+
+
+class PruneWindow(ctk.CTkToplevel):
+    """Anahtar kelimelere artık uymayan tarama kaynaklarının önizlemesi; seçilenler kütüphaneden çıkarılır."""
+
+    def __init__(self, app, items):
+        super().__init__(app)
+        from tkinter import ttk
+        self.app = app
+        self.title("Anahtar kelimelere uymayanlar")
+        set_window_icon(self, delay=260)
+        w, h = fit_window(self, 980, 640)
+        self.geometry(f"{w}x{h}")
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(self, text=f"Taramadan gelmiş {len(items)} kaynak güncel anahtar kelimelerinize artık uymuyor "
+                                "(ör. bir gruba bağlam eklediğiniz için). Hepsi seçili; tutmak istediklerinizin "
+                                "seçimini kaldırın (Ctrl ile tıklayın). Çıkarılanların PDF'leri silinmez, kütüphane "
+                                f"klasöründeki '{PRUNE_DIR}' klasörüne taşınır.", wraplength=940, justify="left",
+                     anchor="w").grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 6))
+        box = ctk.CTkFrame(self, fg_color="transparent")
+        box.grid(row=1, column=0, sticky="nsew", padx=10)
+        box.grid_columnconfigure(0, weight=1)
+        box.grid_rowconfigure(0, weight=1)
+        cols = (("no", "No", 60), ("year", "Yıl", 60), ("title", "Başlık", 520), ("matched", "Eşleşmişti", 300))
+        self.tree = ttk.Treeview(box, columns=[c[0] for c in cols], show="headings", selectmode="extended",
+                                 style="Lib.Treeview")
+        for key, text, width in cols:
+            self.tree.heading(key, text=text)
+            self.tree.column(key, width=width, stretch=key == "title", anchor="center" if key in ("no", "year") else "w")
+        bar = ctk.CTkScrollbar(box, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=bar.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        bar.grid(row=0, column=1, sticky="ns")
+        for it in sorted(items, key=lambda i: (i.get("matched") or "", i.get("no") or 0)):
+            self.tree.insert("", "end", iid=str(it["id"]), values=(it.get("no") or "", it.get("year") or "",
+                                                                    it["title"], shorten(it.get("matched") or "", 60)))
+        self.tree.selection_set(self.tree.get_children())
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.grid(row=2, column=0, sticky="e", padx=14, pady=10)
+        ctk.CTkButton(btns, text="Kapat", width=90, fg_color="transparent", border_width=1, text_color=TEXT,
+                      command=self.destroy).pack(side="left", padx=8)
+        self.go = ctk.CTkButton(btns, text="Seçilenleri Kütüphaneden Çıkar", width=230, command=self.apply)
+        self.go.pack(side="left")
+        self.bind("<Escape>", lambda _: self.destroy())
+        self.after(80, self.lift)
+
+    def apply(self):
+        ids = [int(i) for i in self.tree.selection()]
+        if not ids or not messagebox.askyesno(APP_NAME, f"{len(ids)} kaynak kütüphaneden çıkarılacak (PDF'leri "
+                                                        f"'{PRUNE_DIR}' klasörüne taşınır). Devam edilsin mi?",
+                                              parent=self):
+            return
+        app, folder, events = self.app, self.app.library_folder(), self.app.events
+        self.destroy()
+
+        def work():
+            try:
+                events.put(("prune_done",) + prune_items(app.library, ids, folder))
+            except Exception:
+                diag_exception("ayıklama")
+                events.put(("prune_done", 0, 0))
+        threading.Thread(target=work, name="ayiklama", daemon=True).start()
+
+
+def fit_window(win, width, height) -> tuple:
+    """Pencere boyunu ekrana sığdırır (görev çubuğu ve ölçeklendirme payıyla)."""
+    try:
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        scale = ctk.ScalingTracker.get_window_scaling(win) if hasattr(ctk, "ScalingTracker") else 1.0
+    except Exception:
+        return width, height
+    scale = scale or 1.0
+    return min(width, int((sw - 40) / scale)), min(height, int((sh - 110) / scale))
+
+
 class ReextractWindow(ctk.CTkToplevel):
     """PDF'ten yeniden çıkarılan künyelerin önizlemesi: eski → yeni; seçilenler uygulanır, dosya yeniden adlanır."""
 
@@ -10504,7 +11128,7 @@ class ReextractWindow(ctk.CTkToplevel):
         self.app, self.results = app, results
         self.title("Künyeleri PDF'ten yeniden çıkar")
         set_window_icon(self, delay=260)
-        self.geometry("980x620")
+        self.geometry("%dx%d" % fit_window(self, 980, 620))
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
         ctk.CTkLabel(self, text=f"{len(results)} kaydın PDF'inden farklı bir künye çıktı. Uygulanacakları işaretleyin; "
@@ -10739,6 +11363,8 @@ class RangeDialog(ctk.CTkToplevel):
                       command=self.destroy).pack(side="left", padx=(0, 8))
         self.ok_btn = ctk.CTkButton(btns, text="Başlat", width=110, command=self._ok)
         self.ok_btn.pack(side="left")
+        self.bind("<Return>", lambda _: self._ok() if str(self.ok_btn.cget("state")) == "normal" else None)
+        self.bind("<Escape>", lambda _: self.destroy())
         self._prefill()
         self._update()
         self.after(60, self._center)
@@ -10748,6 +11374,7 @@ class RangeDialog(ctk.CTkToplevel):
             self.update_idletasks()
             x = self.app.winfo_rootx() + (self.app.winfo_width() - self.winfo_width()) // 2
             y = self.app.winfo_rooty() + (self.app.winfo_height() - self.winfo_height()) // 3
+            y = min(y, self.winfo_screenheight() - self.winfo_height() - 70)      # görev çubuğunun üstünde
             self.geometry(f"+{max(0, x)}+{max(0, y)}")
             self.lift()
             self.focus_force()
@@ -11137,29 +11764,35 @@ class RetroScanDialog(ctk.CTkToplevel):
         self.transient(app)
         pad = {"padx": 20, "sticky": "ew"}
         self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        # seçenekler kaydırılabilir alanda; düğmeler her zaman görünür kalsın diye altta, ayrı satırda
+        _, avail = fit_window(self, 600, 900)
+        body = ctk.CTkScrollableFrame(self, fg_color="transparent", width=560, height=max(300, min(760, avail - 90)))
+        body.grid(row=0, column=0, sticky="nsew")
+        body.grid_columnconfigure(0, weight=1)
         r = 0
-        ctk.CTkLabel(self, text="Geçmişe dönük tarama", font=ctk.CTkFont(size=16, weight="bold"),
+        ctk.CTkLabel(body, text="Geçmişe dönük tarama", font=ctk.CTkFont(size=16, weight="bold"),
                      anchor="w").grid(row=r, column=0, pady=(18, 2), **pad); r += 1
-        ctk.CTkLabel(self, text="Anahtar kelimelerinizle eşleşen eski yayınları da bulur, kütüphaneye ekler ve "
+        ctk.CTkLabel(body, text="Anahtar kelimelerinizle eşleşen eski yayınları da bulur, kütüphaneye ekler ve "
                                 "açık erişimli olanların PDF'ini indirir. Uzun sürebilir; durdurursanız aynı "
                                 "seçeneklerle yeniden başlatınca kaldığı yerden devam eder.",
                      text_color=MUTED, wraplength=520, justify="left", anchor="w").grid(row=r, column=0, **pad); r += 1
         pending = pending_retro()
         if pending:
             pr = pending["retro"]
-            ctk.CTkLabel(self, text=f"Yarım kalan tarama: {retro_period_label(pr.get('years', 0))} · "
+            ctk.CTkLabel(body, text=f"Yarım kalan tarama: {retro_period_label(pr.get('years', 0))} · "
                                     f"{len(pending.get('done', []))} adım tamamlandı · başlangıç {pending.get('started', '')}",
                          text_color=LOG_COLORS["warn"], anchor="w").grid(row=r, column=0, pady=(10, 0), **pad); r += 1
-            ctk.CTkButton(self, text="Kaldığı Yerden Devam Et", command=lambda: self._start(pr)).grid(
+            ctk.CTkButton(body, text="Kaldığı Yerden Devam Et", command=lambda: self._start(pr)).grid(
                 row=r, column=0, pady=(4, 0), padx=20, sticky="w"); r += 1
 
         def label(text):
             nonlocal r
-            ctk.CTkLabel(self, text=text, font=ctk.CTkFont(size=13, weight="bold"), anchor="w").grid(
+            ctk.CTkLabel(body, text=text, font=ctk.CTkFont(size=13, weight="bold"), anchor="w").grid(
                 row=r, column=0, pady=(14, 4), **pad)
             r += 1
         label("Dönem")
-        self.period = ctk.CTkSegmentedButton(self, values=list(RETRO_PERIODS))
+        self.period = ctk.CTkSegmentedButton(body, values=list(RETRO_PERIODS))
         self.period.set("Tüm zamanlar")
         self.period.grid(row=r, column=0, **pad); r += 1
         label("Kaynaklar")
@@ -11168,40 +11801,44 @@ class RetroScanDialog(ctk.CTkToplevel):
         self.use_yok = ctk.BooleanVar(value=True)
         self.use_oa = ctk.BooleanVar(value=load_settings().get("scan_openalex", True))
         self.use_eric = ctk.BooleanVar(value=load_settings().get("scan_eric", True))
-        ctk.CTkCheckBox(self, text="YÖK Ulusal Tez Merkezi (bütün yüksek lisans ve doktora tezleri; izinlilerin PDF'i)",
+        ctk.CTkCheckBox(body, text="YÖK Ulusal Tez Merkezi (bütün yüksek lisans ve doktora tezleri; izinlilerin PDF'i)",
                         variable=self.use_yok).grid(row=r, column=0, pady=2, **pad); r += 1
-        ctk.CTkCheckBox(self, text="Crossref (uluslararası ve DOI'li Türkçe yayınlar, en eskisine kadar)",
+        ctk.CTkCheckBox(body, text="Crossref (uluslararası ve DOI'li Türkçe yayınlar, en eskisine kadar)",
                         variable=self.use_cr).grid(row=r, column=0, pady=2, **pad); r += 1
-        ctk.CTkCheckBox(self, text="OpenAlex (makale, kitap, bölüm, dünya tezleri ve kurum arşivleri; özetleriyle)",
+        ctk.CTkCheckBox(body, text="OpenAlex (makale, kitap, bölüm, dünya tezleri ve kurum arşivleri; özetleriyle)",
                         variable=self.use_oa, command=self._update_estimate).grid(row=r, column=0, pady=2, **pad); r += 1
-        ctk.CTkCheckBox(self, text="ERIC (eğitim araştırmaları: dans, müzik ve beden eğitimi; çoğunun PDF'i açık)",
+        ctk.CTkCheckBox(body, text="ERIC (eğitim araştırmaları: dans, müzik ve beden eğitimi; çoğunun PDF'i açık)",
                         variable=self.use_eric, command=self._update_estimate).grid(row=r, column=0, pady=2, **pad); r += 1
-        dp = ctk.CTkFrame(self, fg_color="transparent")
+        dp = ctk.CTkFrame(body, fg_color="transparent")
         dp.grid(row=r, column=0, pady=2, **pad); r += 1
         ctk.CTkCheckBox(dp, text="DergiPark:", variable=self.use_dp).pack(side="left")
         self.scope = ctk.CTkOptionMenu(dp, values=list(RETRO_SCOPES), width=280)
         self.scope.set(next(iter(RETRO_SCOPES)))
         self.scope.pack(side="left", padx=8)
         label("PDF")
-        self.downloads = ctk.CTkOptionMenu(self, values=list(RETRO_DOWNLOADS), width=280)
+        self.downloads = ctk.CTkOptionMenu(body, values=list(RETRO_DOWNLOADS), width=280)
         self.downloads.set(next(iter(RETRO_DOWNLOADS)))
         self.downloads.grid(row=r, column=0, padx=20, sticky="w"); r += 1
         label("Konu grupları")
-        box = ctk.CTkScrollableFrame(self, height=120)
+        box = ctk.CTkScrollableFrame(body, height=120)
         box.grid(row=r, column=0, **pad); r += 1
         self.group_vars = {}
         for g in parse_keyword_groups(load_keywords_text()):
             var = ctk.BooleanVar(value=True)
             ctk.CTkCheckBox(box, text=f"{g['name']}  ({len(g['terms'])} terim)", variable=var).pack(anchor="w", pady=2)
             self.group_vars[g["name"]] = var
-        self.estimate = ctk.CTkLabel(self, text="", text_color=MUTED, wraplength=520, justify="left", anchor="w")
+        self.estimate = ctk.CTkLabel(body, text="", text_color=MUTED, wraplength=520, justify="left", anchor="w")
         self.estimate.grid(row=r, column=0, pady=(10, 0), **pad); r += 1
         btns = ctk.CTkFrame(self, fg_color="transparent")
-        btns.grid(row=r, column=0, pady=18, **pad); r += 1
+        btns.grid(row=1, column=0, pady=(10, 14), **pad)
         ctk.CTkButton(btns, text="Taramayı Başlat", fg_color="#1F8F4E", hover_color="#18723E",
                       command=self._start_new).pack(side="left")
         ctk.CTkButton(btns, text="Vazgeç", fg_color="transparent", border_width=1, text_color=TEXT,
                       command=self.destroy).pack(side="left", padx=8)
+        ctk.CTkLabel(btns, text="Enter: başlat · Esc: kapat", text_color=MUTED,
+                     font=ctk.CTkFont(size=11)).pack(side="left", padx=8)
+        self.bind("<Return>", lambda _: self._start_new())
+        self.bind("<Escape>", lambda _: self.destroy())
         for w in (self.period, self.downloads):
             w.configure(command=lambda _=None: self._update_estimate())
         self.scope.configure(command=lambda _=None: (self._match_groups(), self._update_estimate()))
@@ -11211,7 +11848,8 @@ class RetroScanDialog(ctk.CTkToplevel):
             self.update_idletasks()
             x = app.winfo_rootx() + max(0, (app.winfo_width() - self.winfo_width()) // 2)
             y = app.winfo_rooty() + max(0, (app.winfo_height() - self.winfo_height()) // 4)
-            self.geometry(f"+{x}+{y}")
+            y = max(0, min(y, self.winfo_screenheight() - self.winfo_height() - 70))   # görev çubuğunun üstünde
+            self.geometry(f"+{max(0, x)}+{y}")
             self.lift()
             self.focus_force()
         self.after(60, place)
@@ -11279,7 +11917,7 @@ class BibliographyDialog(ctk.CTkToplevel):
         super().__init__(master)
         self.title(f"Kaynakça · {len(records)} kaynak")
         set_window_icon(self, delay=260)
-        self.geometry("820x600")
+        self.geometry("%dx%d" % fit_window(self, 820, 600))
         self.records = records
         self.lang = lang
         self.grid_columnconfigure(0, weight=1)
@@ -11414,7 +12052,9 @@ class LibraryTab:
         self.tools_menu = ctk.CTkOptionMenu(acts, width=120, dynamic_resizing=False, command=self._tool_chosen,
                                             values=["Atıf ağı ve eksik kaynaklar…", "Mükerrer kayıtları bul…",
                                                     "PDF işaretlemelerini kartlara aktar…",
-                                                    "Künyeyi PDF'ten yeniden çıkar…"])
+                                                    "Künyeyi PDF'ten yeniden çıkar…",
+                                                    "Anahtar kelimelere uymayanları ayıkla…",
+                                                    "Kütüphaneyi ayır…"])
         self.tools_menu.set("Araçlar ▾")
         self.tools_menu.pack(side="left", padx=(8, 0))
 
@@ -12084,6 +12724,25 @@ class LibraryTab:
             self._import_highlights()
         elif choice.startswith("Künyeyi"):
             self._reextract()
+        elif choice.startswith("Kütüphaneyi ayır"):
+            SplitWindow(self.app)
+        elif choice.startswith("Anahtar kelimelere"):
+            self._prune()
+
+    def _prune(self):
+        if getattr(self.app, "prune_running", False):
+            return
+        self.app.prune_running = True
+        items, lib, events = list(self.items), self.lib, self.app.events
+
+        def work():
+            try:
+                found = find_unmatched(lib, items, progress=lambda n, t: events.put(("prune_progress", n, t)))
+                events.put(("prune_found", found))
+            except Exception:
+                diag_exception("ayıklama taraması")
+                events.put(("prune_found", []))
+        threading.Thread(target=work, name="ayiklama-tara", daemon=True).start()
 
     def _reextract(self):
         worker = getattr(self.app, "rx_worker", None)
@@ -13148,7 +13807,7 @@ class ScanTab:
                                       "1. Claude'u tamamen kapatın: saatin yanındaki simgeye sağ tıklayıp Quit.\n"
                                       "2. Claude'u yeniden açın.\n"
                                       "3. Yazı kutusunun altındaki araçlar (+ ya da ayar simgesi) menüsünde "
-                                      "\"akademik-kutuphane\" görünür.\n\n"
+                                      f"\"{mcp_server_name()}\" görünür.\n\n"
                                       "Deneyin: \"Kütüphanemde PDF'i olmayan kaynakları listele.\"\n\n"
                                       f"Ayar dosyası:\n{written[0]}", parent=self.parent)
 
@@ -13160,7 +13819,7 @@ class ScanTab:
         self.parent.clipboard_append(snippet)
         messagebox.showinfo(APP_NAME, "Ayar panoya kopyalandı.\n\nClaude → Settings → Developer → Edit Config ile "
                                       "açılan dosya boşsa bunu yapıştırın; doluysa \"mcpServers\" içine "
-                                      "yalnızca \"akademik-kutuphane\" bölümünü ekleyin.\n\n" + snippet,
+                                      f"yalnızca \"{mcp_server_name()}\" bölümünü ekleyin.\n\n" + snippet,
                             parent=self.parent)
 
     # ── zamanlama ───────────────────────────────────────────────────────────
@@ -13265,7 +13924,8 @@ class DownloadsWatcher(threading.Thread):
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title(f"{APP_NAME}  v{APP_VERSION}")
+        self.title(f"{APP_NAME}  v{APP_VERSION}" + ("" if active_profile() == DEFAULT_PROFILE
+                                                      else f"  ·  {active_profile()} kütüphanesi"))
         self.geometry("1280x820")
         self.minsize(1080, 700)
 
@@ -13324,18 +13984,36 @@ class App(ctk.CTk):
 
         self._log("info", "Hazır. Metni yapıştırın ya da dosya ekleyin, sonra 'İndirmeyi Başlat'a basın.")
         self.after(80, self._poll_events)
-        self.watchdog = FreezeWatchdog()
+        global _WATCHDOG
+        if _WATCHDOG is None:                  # kütüphane değişince pencere yeniden kurulur; bekçi tek kalır
+            _WATCHDOG = FreezeWatchdog()
+            _WATCHDOG.start()
+        self.watchdog = _WATCHDOG
         self._watchdog_beat()
-        self.watchdog.start()
         self.after(600, self._first_run)
         self.index_worker = None
         self.after(45_000, self._index_tick)
         self.after(25_000, self._warm_twins)
+        self.after(8_000, self._repair_names)
         self.after(15_000, self._watch_downloads)
         self._db_stamp = self._library_stamp()
         self.bind("<FocusIn>", self._on_focus, add="+")
         self.after(5 * 60_000, self._sync_tick)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _repair_names(self):
+        """'.part' adıyla kalmış PDF'leri arka planda düzeltir (bir kez; sonra sorgu boş döner)."""
+        folder = self.library_folder()
+
+        def work():
+            try:
+                n = self.library.repair_temp_names(folder)
+                if n:
+                    diag(f"{n} dosyanın uzantısı düzeltildi (.part → .pdf)")
+                    self.events.put(("names_fixed", n))
+            except Exception:
+                diag_exception("uzantı düzeltme")
+        threading.Thread(target=work, name="uzanti-duzelt", daemon=True).start()
 
     def _warm_twins(self):
         """İkiz kayıt listesini arka planda önceden hesaplar (PDF arama pencereleri beklemeden açılsın)."""
@@ -13385,6 +14063,8 @@ class App(ctk.CTk):
             self.after(10 * 60_000, self._index_tick)
 
     def update_index(self, manual=False):
+        if getattr(self, "maintenance", False):
+            return
         if self.index_worker is not None and self.index_worker.is_alive():
             return False
         self.index_worker = IndexWorker(self.library, self.events)
@@ -13467,7 +14147,7 @@ class App(ctk.CTk):
     def sync_in_background(self, manual=False, startup=False, send=True) -> bool:
         """Ortak kütüphaneyi arayüzü dondurmadan eşitler (bulut klasörü yavaş olabilir).
         Çakışma olursa soru ana pencerede sorulur."""
-        if self.sync.folder() is None:
+        if getattr(self, "maintenance", False) or self.sync.folder() is None:
             return False
         running = getattr(self, "_sync_thread", None)
         if running is not None and running.is_alive():
@@ -13577,6 +14257,123 @@ class App(ctk.CTk):
         ctk.CTkLabel(parent, text=text, font=self.font_section, anchor="w").grid(
             row=row, column=0, sticky="ew", padx=18, pady=pady)
 
+    NEW_PROFILE = "+ Yeni kütüphane…"
+
+    def run_split(self, ids, name, new_folder, rest_folder, prefix):
+        """Kütüphane ayırmayı arka planda yürütür; bu sırada eşitleme, dizin ve izleme bekler."""
+        self.maintenance = True
+        if getattr(self, "index_worker", None) is not None and self.index_worker.is_alive():
+            self.index_worker.cancel.set()
+            self.index_worker.join(timeout=10)
+        running = getattr(self, "_sync_thread", None)
+        if running is not None and running.is_alive():
+            running.join(timeout=120)
+        self.save_all_settings()
+        events = self.events
+
+        def work():
+            try:
+                res = split_library(self.library, ids, name, new_folder, rest_folder, prefix,
+                                    lambda text: events.put(("split_progress", text)))
+                events.put(("split_done", name, res, ""))
+            except Exception as exc:
+                diag_exception("kütüphane ayırma")
+                events.put(("split_done", name, {}, describe_error(exc)))
+        threading.Thread(target=work, name="kutuphane-ayir", daemon=True).start()
+
+    def _split_done(self, name, res, error):
+        self.maintenance = False
+        self.settings = load_settings()
+        self.folder_var.set(self.settings.get("library_folder") or "")
+        self._twins_cache = None
+        self.library_tab.refresh()
+        self.profile_menu.configure(values=load_profiles()["list"] + [self.NEW_PROFILE])
+        if error:
+            messagebox.showerror(APP_NAME, f"Ayırma tamamlanamadı:\n{error}\n\nAyrıntı tanılama kaydında. Hiçbir "
+                                           "kaynak silinmedi.", parent=self)
+            return
+        merged = res.get("merged")
+        if messagebox.askyesno(APP_NAME, f"Ayrıldı.\n\n• '{name}' kütüphanesi: {res.get('new_count')} kaynak\n"
+                                         f"• Bu kütüphane: {res.get('rest_count')} kaynak"
+                                         + (f" (öbür bilgisayardaki kopyayla birleştirildi: {merged[0]} eklendi, "
+                                            f"{merged[1]} güncellendi)" if merged else "")
+                                         + (f"\n• {res.get('files_moved')} PDF kendi klasörüne taşındı"
+                                            if res.get("files_moved") else "")
+                                         + f"\n\nŞimdi '{name}' kütüphanesine geçilsin mi?", parent=self):
+            self.switch_library(name)
+
+    def _busy_reason(self):
+        """Kütüphane değiştirmeden önce bitmesi gereken iş varsa adı."""
+        if self.worker and self.worker.is_alive():
+            return "indirme"
+        if self.scan_tab.worker and self.scan_tab.worker.is_alive():
+            return "tarama"
+        for attr, name in (("retry_worker", "PDF arama"), ("import_worker", "içe aktarma")):
+            w = getattr(self.library_tab, attr, None) or getattr(self, attr, None)
+            if w is not None and w.is_alive():
+                return name
+        for attr, name in (("rx_worker", "künye çıkarma"), ("hl_worker", "işaretleme aktarımı")):
+            w = getattr(self, attr, None)
+            if w is not None and w.is_alive():
+                return name
+        return ""
+
+    def _profile_chosen(self, choice):
+        current = active_profile()
+        self.profile_menu.set(current)
+        if choice == self.NEW_PROFILE:
+            return self._new_profile()
+        if choice != current:
+            self.switch_library(choice)
+
+    def switch_library(self, name):
+        busy = self._busy_reason()
+        if busy:
+            messagebox.showinfo(APP_NAME, f"Şu an {busy} sürüyor. Bitmesini bekleyin ya da durdurun, sonra "
+                                          "kütüphaneyi değiştirin.", parent=self)
+            return
+        self.switch_to = name
+        self._on_close()
+
+    def _new_profile(self):
+        dialog = ctk.CTkInputDialog(title="Yeni kütüphane", text="Yeni kütüphanenin adı (ör. LRF):")
+        set_window_icon(dialog, delay=260)
+        name = (dialog.get_input() or "").strip()
+        if not name:
+            return
+        if fold(name) in {fold(n) for n in load_profiles()["list"]}:
+            messagebox.showinfo(APP_NAME, "Bu adda bir kütüphane zaten var.", parent=self)
+            return
+        folder = filedialog.askdirectory(parent=self, title=f"'{name}' kütüphanesinin klasörünü seçin "
+                                                             "(her kütüphanenin klasörü ayrı olmalı)")
+        if not folder:
+            return
+        folder = os.path.normpath(folder)
+        used = {os.path.normcase(os.path.normpath(_read_json(profile_dir(n) / "ayarlar.json").get("library_folder") or ""))
+                for n in load_profiles()["list"]}
+        if os.path.normcase(folder) in used:
+            messagebox.showwarning(APP_NAME, "Bu klasörü başka bir kütüphane kullanıyor; boş ya da yeni bir klasör "
+                                             "seçin.", parent=self)
+            return
+        try:
+            add_profile(name, dict(_load_settings_raw(), library_folder=folder))
+        except (OSError, ValueError) as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self)
+            return
+        new_settings = profile_dir(name) / "ayarlar.json"
+        data = _read_json(new_settings)
+        data["library_folder"] = folder
+        _write_json(new_settings, data)
+        if not (profile_dir(name) / "anahtar_kelimeler.txt").exists():
+            (profile_dir(name) / "anahtar_kelimeler.txt").write_text(
+                DEFAULT_KEYWORDS.split("\n\n[", 1)[0] + "\n\n[İlk konu grubu]\n# bu satırın yerine arama terimlerinizi "
+                "yazın\n", encoding="utf-8")
+        self.profile_menu.configure(values=load_profiles()["list"] + [self.NEW_PROFILE])
+        if messagebox.askyesno(APP_NAME, f"'{name}' kütüphanesi oluşturuldu. Şimdi ona geçilsin mi?\n\n"
+                                         "Tarama sekmesinden anahtar kelimelerini yazabilir, Drive'da "
+                                         "tutmak için 'Ortak kütüphane' kutusunu işaretleyebilirsiniz.", parent=self):
+            self.switch_library(name)
+
     def _build_header(self):
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.grid(row=0, column=0, columnspan=2, sticky="ew", padx=22, pady=(18, 8))
@@ -13590,8 +14387,16 @@ class App(ctk.CTk):
         self.notice_btn = ctk.CTkButton(header, text="", height=30, fg_color="#1F8F4E", hover_color="#18723E",
                                         command=self._open_notice)
         self.notice_target = None
+        lib_box = ctk.CTkFrame(header, fg_color="transparent")
+        lib_box.grid(row=0, column=2, rowspan=2, sticky="e", padx=(0, 18))
+        ctk.CTkLabel(lib_box, text="Kütüphane:", font=self.font_small, text_color=MUTED).pack(side="left", padx=(0, 6))
+        self.profile_menu = ctk.CTkOptionMenu(lib_box, width=150, dynamic_resizing=False,
+                                              values=load_profiles()["list"] + [self.NEW_PROFILE],
+                                              command=self._profile_chosen)
+        self.profile_menu.set(active_profile())
+        self.profile_menu.pack(side="left")
         self.theme_switch = ctk.CTkSwitch(header, text="Koyu tema", command=self._toggle_theme)
-        self.theme_switch.grid(row=0, column=2, rowspan=2, sticky="e")
+        self.theme_switch.grid(row=0, column=3, rowspan=2, sticky="e")
         if ctk.get_appearance_mode().lower() == "dark":
             self.theme_switch.select()
 
@@ -13883,6 +14688,7 @@ class App(ctk.CTk):
         try:
             queue_open = getattr(self, "pdf_queue", None) is not None and self.pdf_queue.winfo_exists()
             if (self.settings.get("watch_downloads", True) and self.library_folder() and not queue_open
+                    and not getattr(self, "maintenance", False)
                     and not (self.watcher and self.watcher.is_alive())):
                 folders = [f for f in downloads_folders() if f.is_dir()]
                 if folders:
@@ -14187,6 +14993,26 @@ class App(ctk.CTk):
         elif kind == "hl":
             n, total = message[1:]
             self.library_tab.count_label.configure(text=f"PDF işaretlemeleri okunuyor {n}/{total}…")
+        elif kind == "prune_progress":
+            self.library_tab.count_label.configure(text=f"Anahtar kelimelerle yeniden eşleştiriliyor {message[1]}/{message[2]}…")
+        elif kind == "prune_found":
+            self.prune_running = False
+            self.library_tab.refresh()
+            if message[1]:
+                PruneWindow(self, message[1])
+            else:
+                self.toast("Bütün tarama kaynakları güncel anahtar kelimelerinize uyuyor.")
+        elif kind == "prune_done":
+            self.library_tab.refresh()
+            self.toast(f"{message[1]} kaynak çıkarıldı" + (f"; {message[2]} PDF '{PRUNE_DIR}' klasörüne taşındı."
+                                                          if message[2] else "."))
+        elif kind == "split_progress":
+            self.library_tab.count_label.configure(text=message[1])
+        elif kind == "split_done":
+            self._split_done(*message[1:])
+        elif kind == "names_fixed":
+            self.library_tab.refresh()
+            self.toast(f"{message[1]} PDF '.part' uzantısıyla kalmıştı; adları düzeltildi.")
         elif kind == "rx":
             n, total = message[1:]
             self.library_tab.count_label.configure(text=f"Künyeler PDF'ten çıkarılıyor {n}/{total}…")
@@ -14282,7 +15108,8 @@ class App(ctk.CTk):
             self.library.close()
         except Exception:
             pass
-        diag("uygulama kullanıcı tarafından kapatıldı")
+        diag("uygulama kullanıcı tarafından kapatıldı" if not getattr(self, "switch_to", None)
+             else f"kütüphane değiştiriliyor: {self.switch_to}")
         self.destroy()
 
     def report_callback_exception(self, exc_type, exc, tb):
@@ -14318,19 +15145,35 @@ def main():
                 diag_exception("güncelleme denetimi")
         if run_updated_code():
             return
+    if "--kutuphane" in sys.argv:            # Claude bağlantısı: hangi kütüphane
+        i = sys.argv.index("--kutuphane")
+        set_active_profile(sys.argv[i + 1] if i + 1 < len(sys.argv) else DEFAULT_PROFILE)
+    else:
+        set_active_profile(load_profiles()["active"])
     if "--mcp" in sys.argv:                  # Claude masaüstü uygulaması bağlantısı
         run_mcp_server()
         return
-    if "--tara" in sys.argv:              # Windows görev zamanlayıcısından: arayüzsüz tarama
-        try:
-            run_headless_scan()
-        except Exception:
-            diag_exception("arayüzsüz tarama")
+    if "--tara" in sys.argv:              # Windows görev zamanlayıcısından: arayüzsüz tarama (her kütüphane)
+        names = load_profiles()["list"] if "--kutuphane" not in sys.argv else [active_profile()]
+        for name in names:
+            set_active_profile(name)
+            if not load_settings().get("library_folder"):
+                continue
+            try:
+                run_headless_scan()
+            except Exception:
+                diag_exception(f"arayüzsüz tarama ({name})")
         return
     ctk.set_appearance_mode("system")
     ctk.set_default_color_theme("blue")
-    app = App()
-    app.mainloop()
+    while True:                              # kütüphane değiştirilince pencere o kütüphaneyle yeniden kurulur
+        app = App()
+        app.mainloop()
+        target = getattr(app, "switch_to", None)
+        if not target:
+            break
+        set_active_profile(target, remember=True)
+        diag(f"kütüphane değiştirildi: {target}")
 
 
 if __name__ == "__main__":
