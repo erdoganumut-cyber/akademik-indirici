@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.45"
+APP_VERSION = "2.46"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -3455,6 +3455,15 @@ class Library:
             return str(alt)
         return stored
 
+    def _mark_present(self, path):
+        """Yeni bağlanan dosya var sayılır: liste, arka plandaki yoklamayı beklemeden 📄 göstersin."""
+        if path:
+            try:
+                _EXISTS_CACHE[str(self._abs(self._stored(path)))] = (True, time.monotonic())
+                _EXISTS_CACHE[str(path)] = (True, time.monotonic())
+            except Exception:
+                pass
+
     def _stored(self, path) -> str:
         if not path:
             return ""
@@ -3645,6 +3654,8 @@ class Library:
         """Kaynağı ekler. Aynı dosya (sha256) ya da aynı DOI zaten varsa onu günceller.
         Dönüş: (kimlik, yeni_mi)"""
         rec = finalize_record(record)
+        if file_path:
+            self._mark_present(file_path)
         with self.lock, self.db:
             existing = (self.find_by_sha(sha) if sha else None) or self.find_by_doi(rec["doi"])
             if existing:
@@ -3768,6 +3779,8 @@ class Library:
             values[key] = json.dumps(value, ensure_ascii=False) if key in ("authors", "editors") else value
             if key == "file_path":
                 values[key] = self._stored(value)
+                if value:
+                    self._mark_present(value)
         if not values:
             return
         with self.lock, self.db:
@@ -12375,6 +12388,9 @@ class LibraryTab:
     def _check_files(self, pairs):
         """PDF'lerin gerçekten yerinde olup olmadığını arka planda yoklar (Drive yavaşken arayüz donmasın);
         gösterilenden farklı çıkan olursa listeyi tazeler."""
+        pending = self.__dict__.setdefault("_pending_checks", {})
+        for path, shown in pairs:                       # yoklama sürerken gelenler sıraya alınır, atlanmaz
+            pending[str(path)] = shown
         running = getattr(self, "_file_checker", None)
         if running is not None and running.is_alive():
             return
@@ -12382,12 +12398,16 @@ class LibraryTab:
 
         def work():
             differs = False
-            for path, shown in pairs:
+            while pending:
+                path, shown = pending.popitem()
+                hit = _EXISTS_CACHE.get(path)
+                if hit and hit[0] and time.monotonic() - hit[1] < 5:
+                    continue                            # az önce bağlandı: var
                 try:
                     ok = os.path.isfile(path)
                 except OSError:
                     ok = False
-                _EXISTS_CACHE[str(path)] = (ok, time.monotonic())
+                _EXISTS_CACHE[path] = (ok, time.monotonic())
                 differs = differs or ok != shown
             if differs:
                 events.put(("files_checked",))
