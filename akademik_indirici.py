@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.48"
+APP_VERSION = "2.49"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -10745,14 +10745,45 @@ def _copy_rows(src_db, dest_alias, table, ids, key):
                        f"WHERE {key} IN ({marks})", part)
 
 
-def push_db_to_shared(db_path, shared_folder, items) -> str:
+def copy_with_progress(src, dst, report=None, chunk=4 << 20):
+    """Büyük dosyayı (Drive'dan/Drive'a) parça parça kopyalar; report(kopyalanan_MB, toplam_MB)."""
+    total = max(1, os.path.getsize(src))
+    done = 0
+    with open(src, "rb") as fin, open(dst, "wb") as fout:
+        while True:
+            block = fin.read(chunk)
+            if not block:
+                break
+            fout.write(block)
+            done += len(block)
+            if report:
+                report(done // (1 << 20), total // (1 << 20))
+    return dst
+
+
+def profile_finished(name) -> bool:
+    """Kütüphanenin kurulumu tamamlanmış mı? (yarım kalan bir ayırma/kurma denemesi değil)"""
+    if name == DEFAULT_PROFILE:
+        return True
+    data = _read_json(profile_dir(name) / "ayarlar.json")
+    if data.get("kurulum") == "yarim":
+        return False
+    return bool(data.get("library_folder"))
+
+
+def visible_profiles() -> list:
+    """Kütüphane menüsünde gösterilecekler: kurulumu yarım kalanlar gizlenir."""
+    return [n for n in load_profiles()["list"] if profile_finished(n)]
+
+
+def push_db_to_shared(db_path, shared_folder, items, report=None) -> str:
     """Bir kütüphane veritabanını ortak klasöre yazar (LibrarySync.push'un ayarsız hâli). Dönüş: sürüm."""
     import uuid
     shared_folder = Path(shared_folder)
     shared_folder.mkdir(parents=True, exist_ok=True)
     target = shared_folder / SHARED_DB_NAME
     tmp = shared_folder / (SHARED_DB_NAME + ".tmp")
-    shutil.copyfile(db_path, tmp)
+    copy_with_progress(db_path, tmp, report)
     os.replace(tmp, target)
     rev = uuid.uuid4().hex
     _write_json(shared_folder / SHARED_META_NAME, {"rev": rev, "machine": machine_name(), "items": items,
@@ -10761,7 +10792,7 @@ def push_db_to_shared(db_path, shared_folder, items) -> str:
     return rev
 
 
-def split_library(lib, ids, new_name, new_folder, rest_folder, prefix, progress=lambda text: None,
+def split_library(lib, ids, new_name, new_folder, rest_folder, prefix, progress=lambda text, frac=None: None,
                   from_copy=False) -> dict:
     """ids kaynaklarını yeni bir kütüphaneye (new_name, new_folder) taşır; kalan kütüphane rest_folder'a
     döner. PDF'ler gerekirse kendi klasörlerine taşınır, iki taraf da ortak kopyasıyla eşitlenir.
@@ -10776,17 +10807,23 @@ def split_library(lib, ids, new_name, new_folder, rest_folder, prefix, progress=
     if norm(new_folder) == norm(rest_folder):
         raise ValueError("İki kütüphanenin klasörü aynı olamaz.")
     if new_name in load_profiles()["list"]:
-        if Library(profile_dir(new_name) / "kutuphane.db").count():
-            raise ValueError(f"'{new_name}' kütüphanesi zaten var ve boş değil.")
+        if profile_finished(new_name):
+            raise ValueError(f"'{new_name}' adında kurulu bir kütüphane zaten var; başka bir ad seçin.")
+        old_db = profile_dir(new_name) / "kutuphane.db"           # yarım kalmış deneme: kenara alınır, baştan kurulur
+        if old_db.exists():
+            os.replace(old_db, old_db.with_name(f"kutuphane.yarim_{datetime.now():%Y%m%d_%H%M%S}.db"))
+        diag(f"'{new_name}' kütüphanesinin yarım kalan kurulumu baştan yapılıyor")
     else:
         add_profile(new_name, settings)
     new_dir = profile_dir(new_name)
+    _write_json(new_dir / "ayarlar.json", dict(_read_json(new_dir / "ayarlar.json"), kurulum="yarim"))
     new_db = new_dir / "kutuphane.db"
     Library(new_db, root=new_folder, relative=shared).close()                 # boş şema
     result = {"moved": len(ids), "files_moved": 0}
+    diag(f"kütüphane kurulumu başladı: '{new_name}' · {len(ids)} kaynak · {new_folder}")
 
     # 1) kayıtları yeni veritabanına kopyala, yeni kütüphanede 1'den başlayarak numarala
-    progress(f"{len(ids)} kaynak yeni kütüphaneye kopyalanıyor…")
+    progress(f"{len(ids)} kaynak yeni kütüphaneye kopyalanıyor…", 0.0)
     file_of = {}
     for i in ids:
         item = lib.get(i)
@@ -10795,9 +10832,12 @@ def split_library(lib, ids, new_name, new_folder, rest_folder, prefix, progress=
     with lib.lock:
         lib.db.execute("ATTACH DATABASE ? AS yeni", (str(new_db),))
         try:
-            with lib.db:
-                for table, key in (("items", "id"), ("tags", "item_id"), ("cards", "item_id"), ("fulltext", "item_id")):
+            tables = (("items", "id"), ("tags", "item_id"), ("cards", "item_id"), ("fulltext", "item_id"))
+            for t, (table, key) in enumerate(tables):
+                with lib.db:
                     _copy_rows(lib.db, "yeni", table, ids, key)
+                progress(f"{len(ids)} kaynak kopyalanıyor ({['künyeler', 'etiketler', 'kartlar', 'metinler'][t]} "
+                         "tamam)…", (t + 1) / len(tables))
         finally:
             lib.db.execute("DETACH DATABASE yeni")
     new = Library(new_db, root=new_folder, relative=shared)
@@ -10830,7 +10870,10 @@ def split_library(lib, ids, new_name, new_folder, rest_folder, prefix, progress=
         with lib.lock:
             rows = lib.db.execute("SELECT id, file_path FROM items WHERE file_path!=''").fetchall()
         staying = [(i, fp) for i, fp in rows if i not in moved and Path(str(fp).replace("\\", "/")).name in here]
-    new.repair_temp_names(new_folder)
+    progress("'.part' adıyla kalmış PDF'lerin adları düzeltiliyor…", None)
+    fixed = new.repair_temp_names(new_folder)
+    if fixed:
+        diag(f"kurulum: {fixed} dosyanın uzantısı düzeltildi")
     new_change, new_count = new.change_no(), new.count()
     new.close()
 
@@ -10874,7 +10917,7 @@ def split_library(lib, ids, new_name, new_folder, rest_folder, prefix, progress=
     new_kw.write_text(patch_keyword_groups(mine), encoding="utf-8")
 
     # 5) yeni kütüphanenin ayarları ve ortak kopyası (eski karışık kopyanın yerine)
-    progress("Yeni kütüphane Drive'a yazılıyor…")
+    progress("Yeni kütüphane Drive'a yazılıyor…", 0.0)
     new_settings = _read_json(new_dir / "ayarlar.json")
     new_settings.update(library_folder=str(new_folder), shared_library=shared,
                         last_scan=utc_now().isoformat(), auto_scan=settings.get("auto_scan", True))
@@ -10882,7 +10925,8 @@ def split_library(lib, ids, new_name, new_folder, rest_folder, prefix, progress=
         new_settings.pop(k, None)
     if shared:
         remote = Path(new_folder) / SHARED_DIR_NAME
-        rev = push_db_to_shared(new_db, remote, new_count)
+        rev = push_db_to_shared(new_db, remote, new_count,
+                                lambda d, t: progress(f"Yeni kütüphane Drive'a yazılıyor ({d} / {t} MB)…", d / max(t, 1)))
         new_settings["sync"] = {"synced_change": new_change, "shared_rev": rev,
                                 "last_sync": datetime.now().strftime("%d.%m.%Y %H:%M")}
         stale = remote / "Metin Dizini"                  # karışık kütüphanenin dizin parçaları: baştan kurulacak
@@ -10891,7 +10935,9 @@ def split_library(lib, ids, new_name, new_folder, rest_folder, prefix, progress=
                 f.unlink(missing_ok=True)
             except OSError:
                 pass
+    new_settings["kurulum"] = "tamam"
     _write_json(new_dir / "ayarlar.json", new_settings)
+    diag(f"kütüphane kurulumu tamamlandı: '{new_name}' ({new_count} kaynak)")
 
     if from_copy:                                   # açık kütüphane olduğu gibi kalır
         result.update(new_count=new_count, rest_count=None)
@@ -10916,6 +10962,73 @@ def split_library(lib, ids, new_name, new_folder, rest_folder, prefix, progress=
     diag(f"kütüphane ayrıldı: {new_count} kaynak → '{new_name}' ({new_folder}); kalan {result['rest_count']} "
          f"kaynak → {rest_folder}")
     return result
+
+
+class ProgressWindow(ctk.CTkToplevel):
+    """Uzun süren kütüphane işleri için her sekmenin üstünde duran ilerleme penceresi."""
+
+    def __init__(self, app, title):
+        super().__init__(app)
+        self.app = app
+        self.title(title)
+        set_window_icon(self, delay=260)
+        self.transient(app)
+        self.resizable(False, False)
+        self.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(self, text=title, font=ctk.CTkFont(size=15, weight="bold"), anchor="w").grid(
+            row=0, column=0, sticky="ew", padx=20, pady=(18, 4))
+        self.stage = ctk.CTkLabel(self, text="Başlıyor…", anchor="w", justify="left", wraplength=460)
+        self.stage.grid(row=1, column=0, sticky="ew", padx=20)
+        self.bar = ctk.CTkProgressBar(self, width=460)
+        self.bar.grid(row=2, column=0, sticky="ew", padx=20, pady=(10, 6))
+        self.bar.set(0)
+        self.started = time.monotonic()
+        self.elapsed = ctk.CTkLabel(self, text="", text_color=MUTED, font=ctk.CTkFont(size=12), anchor="w")
+        self.elapsed.grid(row=3, column=0, sticky="ew", padx=20)
+        ctk.CTkLabel(self, text="Program açık kaldığı sürece sürer; bitince sorulacak. Uygulamayı kapatmayın.",
+                     text_color=MUTED, font=ctk.CTkFont(size=12), wraplength=460, justify="left",
+                     anchor="w").grid(row=4, column=0, sticky="ew", padx=20, pady=(4, 18))
+        self.protocol("WM_DELETE_WINDOW", self.withdraw)          # kapatılırsa iş sürer, pencere gizlenir
+        self._indeterminate = False
+        self.after(60, self._place)
+        self._tick()
+
+    def _place(self):
+        try:
+            self.update_idletasks()
+            x = self.app.winfo_rootx() + (self.app.winfo_width() - self.winfo_width()) // 2
+            y = self.app.winfo_rooty() + (self.app.winfo_height() - self.winfo_height()) // 3
+            self.geometry(f"+{max(0, x)}+{max(0, y)}")
+            self.lift()
+        except Exception:
+            pass
+
+    def _tick(self):
+        if not self.winfo_exists():
+            return
+        sec = int(time.monotonic() - self.started)
+        self.elapsed.configure(text=f"Geçen süre: {sec // 60} dk {sec % 60:02d} sn")
+        self.after(1000, self._tick)
+
+    def update_stage(self, text, frac=None):
+        if not self.winfo_exists():
+            return
+        self.stage.configure(text=text)
+        if frac is None:
+            if not self._indeterminate:
+                self.bar.configure(mode="indeterminate")
+                self.bar.start()
+                self._indeterminate = True
+        else:
+            if self._indeterminate:
+                self.bar.stop()
+                self.bar.configure(mode="determinate")
+                self._indeterminate = False
+            self.bar.set(max(0.0, min(1.0, frac)))
+
+    def show(self):
+        self.deiconify()
+        self.lift()
 
 
 class SplitWindow(ctk.CTkToplevel):
@@ -14380,6 +14493,9 @@ class App(ctk.CTk):
 
     def run_split(self, ids, name, new_folder, rest_folder, prefix):
         """Kütüphane ayırmayı arka planda yürütür; bu sırada eşitleme, dizin ve izleme bekler."""
+        if self._job_busy():
+            return
+        self._job_start(f"Kütüphane ayrılıyor: '{name}'")
         self.maintenance = True
         if getattr(self, "index_worker", None) is not None and self.index_worker.is_alive():
             self.index_worker.cancel.set()
@@ -14393,7 +14509,7 @@ class App(ctk.CTk):
         def work():
             try:
                 res = split_library(self.library, ids, name, new_folder, rest_folder, prefix,
-                                    lambda text: events.put(("split_progress", text)))
+                                    lambda text, frac=None: events.put(("split_progress", text, frac)))
                 events.put(("split_done", name, res, ""))
             except Exception as exc:
                 diag_exception("kütüphane ayırma")
@@ -14401,12 +14517,13 @@ class App(ctk.CTk):
         threading.Thread(target=work, name="kutuphane-ayir", daemon=True).start()
 
     def _split_done(self, name, res, error):
+        self._job_end()
         self.maintenance = False
         self.settings = load_settings()
         self.folder_var.set(self.settings.get("library_folder") or "")
         self._twins_cache = None
         self.library_tab.refresh()
-        self.profile_menu.configure(values=load_profiles()["list"] + [self.NEW_PROFILE])
+        self.profile_menu.configure(values=visible_profiles() + [self.NEW_PROFILE])
         if error:
             messagebox.showerror(APP_NAME, f"Ayırma tamamlanamadı:\n{error}\n\nAyrıntı tanılama kaydında. Hiçbir "
                                            "kaynak silinmedi.", parent=self)
@@ -14460,9 +14577,12 @@ class App(ctk.CTk):
         name = (dialog.get_input() or "").strip()
         if not name:
             return
-        if fold(name) in {fold(n) for n in load_profiles()["list"]}:
+        if self._job_busy():
+            return
+        if fold(name) in {fold(n) for n in visible_profiles()}:
             messagebox.showinfo(APP_NAME, "Bu adda bir kütüphane zaten var.", parent=self)
             return
+        name = next((n for n in load_profiles()["list"] if fold(n) == fold(name)), name)   # yarım kalan aynı ad
         folder = filedialog.askdirectory(parent=self, title=f"'{name}' kütüphanesinin klasörünü seçin "
                                                              "(her kütüphanenin klasörü ayrı olmalı)")
         if not folder:
@@ -14489,22 +14609,49 @@ class App(ctk.CTk):
             (profile_dir(name) / "anahtar_kelimeler.txt").write_text(
                 DEFAULT_KEYWORDS.split("\n\n[", 1)[0] + "\n\n[İlk konu grubu]\n# bu satırın yerine arama terimlerinizi "
                 "yazın\n", encoding="utf-8")
-        self.profile_menu.configure(values=load_profiles()["list"] + [self.NEW_PROFILE])
+        self.profile_menu.configure(values=visible_profiles() + [self.NEW_PROFILE])
         if messagebox.askyesno(APP_NAME, f"'{name}' kütüphanesi oluşturuldu. Şimdi ona geçilsin mi?\n\n"
                                          "Tarama sekmesinden anahtar kelimelerini yazabilir, Drive'da "
                                          "tutmak için 'Ortak kütüphane' kutusunu işaretleyebilirsiniz.", parent=self):
             self.switch_library(name)
 
+    def _job_busy(self) -> bool:
+        win = getattr(self, "job_window", None)
+        if getattr(self, "job_running", False):
+            if win is not None and win.winfo_exists():
+                win.show()
+            messagebox.showinfo(APP_NAME, "Bir kütüphane işlemi zaten sürüyor; bitmesini bekleyin.", parent=self)
+            return True
+        return False
+
+    def _job_start(self, title):
+        self.job_running = True
+        self.job_window = ProgressWindow(self, title)
+
+    def _job_end(self):
+        self.job_running = False
+        win = getattr(self, "job_window", None)
+        if win is not None and win.winfo_exists():
+            win.destroy()
+        self.job_window = None
+
     def _read_existing(self, name, folder):
         """Seçilen klasörde zaten kütüphane verisi var (ör. karışık kalmış LRF kopyası): önce bir kopyasını okur,
         sonra hangi kaynakların alınacağını sorar."""
+        if self._job_busy():
+            return
         events = self.events
-        self.library_tab.count_label.configure(text="Seçilen klasördeki kütüphane verisi okunuyor…")
+        self._job_start(f"'{name}' kütüphanesi hazırlanıyor")
 
         def work():
-            tmp = app_base_dir() / f"okunan_kopya_{os.getpid()}.db"
+            import uuid
+            tmp = app_base_dir() / f"okunan_kopya_{uuid.uuid4().hex[:8]}.db"
             try:
-                shutil.copyfile(Path(folder) / SHARED_DIR_NAME / SHARED_DB_NAME, tmp)
+                diag(f"kütüphane kurulumu: {folder} içindeki kopya okunuyor")
+                copy_with_progress(Path(folder) / SHARED_DIR_NAME / SHARED_DB_NAME, tmp,
+                                   lambda d, t: events.put(("split_progress", f"Klasördeki kütüphane verisi okunuyor "
+                                                                              f"({d} / {t} MB)…", d / max(t, 1))))
+                events.put(("split_progress", "Kaynaklar ve etiketler sayılıyor…", None))
                 src = Library(tmp, root=folder, relative=True)
                 items = src.all_items()
                 src.close()
@@ -14523,7 +14670,11 @@ class App(ctk.CTk):
 
     def _profile_scanned(self, name, folder, tmp, total, prefixes, error):
         self.library_tab.refresh()
+        win = getattr(self, "job_window", None)
+        if win is not None and win.winfo_exists():
+            win.withdraw()                                  # soru penceresinin önünde durmasın
         if error:
+            self._job_end()
             messagebox.showerror(APP_NAME, f"Klasördeki kütüphane verisi okunamadı:\n{error}", parent=self)
             return
         ranked = sorted(prefixes.items(), key=lambda kv: -kv[1])
@@ -14535,10 +14686,13 @@ class App(ctk.CTk):
         choice = choice_dialog(self, f"'{name}' kütüphanesi", text, options)
         if choice is None:
             Path(tmp).unlink(missing_ok=True)
+            self._job_end()
             return
         prefix = ranked[choice][0] if choice < len(ranked[:2]) else ""
         events = self.events
-        self.library_tab.count_label.configure(text=f"'{name}' kütüphanesi kuruluyor…")
+        if win is not None and win.winfo_exists():
+            win.show()
+            win.update_stage("Kurulum başlıyor…", 0.0)
 
         def work():
             try:
@@ -14548,23 +14702,26 @@ class App(ctk.CTk):
                     ids = [i["id"] for i in src.all_items()
                            if not pre or any(fold(t).startswith(pre + " ·") or fold(t).startswith(pre + " ") for t in i["tags"])]
                     res = split_library(src, ids, name, folder, self.library_folder() or folder, prefix,
-                                        lambda text: events.put(("split_progress", text)), from_copy=True)
+                                        lambda text, frac=None: events.put(("split_progress", text, frac)),
+                                        from_copy=True)
                 finally:
                     src.close()
                 events.put(("profile_imported", name, res, ""))
             except Exception as exc:
                 diag_exception("kütüphane kurma")
-                events.put(("profile_imported", name, {}, describe_error(exc)))
+                events.put(("profile_imported", name, {}, f"{getattr(self, '_last_stage', '')}\n{describe_error(exc)}"))
             finally:
                 Path(tmp).unlink(missing_ok=True)
         threading.Thread(target=work, name="kutuphane-kur", daemon=True).start()
 
     def _profile_imported(self, name, res, error):
+        self._job_end()
         self.library_tab.refresh()
-        self.profile_menu.configure(values=load_profiles()["list"] + [self.NEW_PROFILE])
+        self.profile_menu.configure(values=visible_profiles() + [self.NEW_PROFILE])
         if error:
-            messagebox.showerror(APP_NAME, f"Kütüphane kurulamadı:\n{error}\n\nAyrıntı tanılama kaydında; hiçbir "
-                                           "dosya silinmedi.", parent=self)
+            messagebox.showerror(APP_NAME, f"Kütüphane kurulamadı. Takıldığı aşama ve neden:\n{error}\n\nHiçbir dosya "
+                                           "silinmedi. Aynı adımları yeniden izlerseniz yarım kalan kurulum baştan "
+                                           "yapılır.", parent=self)
             return
         if messagebox.askyesno(APP_NAME, f"'{name}' kütüphanesi {res.get('new_count')} kaynakla kuruldu. Klasördeki "
                                          "karışık kopyanın yerine yalnızca bu kaynakları içeren kopya yazıldı.\n\n"
@@ -14588,7 +14745,7 @@ class App(ctk.CTk):
         lib_box.grid(row=0, column=2, rowspan=2, sticky="e", padx=(0, 18))
         ctk.CTkLabel(lib_box, text="Kütüphane:", font=self.font_small, text_color=MUTED).pack(side="left", padx=(0, 6))
         self.profile_menu = ctk.CTkOptionMenu(lib_box, width=150, dynamic_resizing=False,
-                                              values=load_profiles()["list"] + [self.NEW_PROFILE],
+                                              values=visible_profiles() + [self.NEW_PROFILE],
                                               command=self._profile_chosen)
         self.profile_menu.set(active_profile())
         self.profile_menu.pack(side="left")
@@ -15206,7 +15363,12 @@ class App(ctk.CTk):
             self.toast(f"{message[1]} kaynak çıkarıldı" + (f"; {message[2]} PDF '{PRUNE_DIR}' klasörüne taşındı."
                                                           if message[2] else "."))
         elif kind == "split_progress":
-            self.library_tab.count_label.configure(text=message[1])
+            text, frac = message[1], (message[2] if len(message) > 2 else None)
+            self._last_stage = text
+            self.library_tab.count_label.configure(text=text)
+            win = getattr(self, "job_window", None)
+            if win is not None and win.winfo_exists():
+                win.update_stage(text, frac)
         elif kind == "profile_scanned":
             self._profile_scanned(*message[1:])
         elif kind == "profile_imported":
