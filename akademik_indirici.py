@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.51"
+APP_VERSION = "2.52"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -6672,6 +6672,10 @@ PHONE_EXPORT_NAME = "Kütüphane (telefon için).xlsx"
 SESSION_FRESH_MINUTES = 12
 
 
+def _norm_folder(folder) -> str:
+    return os.path.normcase(os.path.normpath(str(folder))) if folder else ""
+
+
 def machine_name() -> str:
     import platform
     return os.environ.get("COMPUTERNAME") or platform.node() or "bilgisayar"
@@ -6717,6 +6721,25 @@ def data_dir() -> Path:
 
 
 _SHARED_STATE = {"path": "", "data": {}, "t": None}
+
+
+def library_owner_check(folder, profile=None, settings=None) -> str:
+    """Klasördeki Drive kütüphanesi bu kütüphanenin mi? Başka bir kütüphaneninse onun adı, değilse "".
+    Eski sürümlerin yazdığı (adsız) bilgi dosyaları kabul edilir; kimlik varsa kimlik, yoksa ad karşılaştırılır."""
+    if not folder:
+        return ""
+    meta = _read_json(Path(folder) / SHARED_DIR_NAME / SHARED_META_NAME)
+    owner = (meta.get("name") or "").strip()
+    if not owner and not meta.get("lib_id"):
+        return ""
+    profile = profile or active_profile()
+    s = settings if settings is not None else _load_settings_raw()
+    mine, theirs = s.get("lib_id"), meta.get("lib_id")
+    if mine and theirs:
+        return "" if mine == theirs else (owner or "başka bir kütüphane")
+    if s.get("owner_ok") and _norm_folder(s.get("owner_ok")) == _norm_folder(folder):
+        return ""
+    return "" if not owner or fold(owner) == fold(profile) else owner
 
 
 def shared_state(shared, max_age=120.0) -> dict:
@@ -6823,10 +6846,27 @@ class LibrarySync:
         meta = self.meta()
         return bool(meta.get("rev")) and meta.get("rev") != self._state().get("shared_rev")
 
+    def owner_mismatch(self) -> str:
+        """Klasördeki ortak kütüphane başka bir kütüphaneye aitse onun adı."""
+        folder = self.folder()
+        return library_owner_check(folder.parent) if folder is not None else ""
+
+    def _ensure_lib_id(self, meta=None) -> str:
+        s = _load_settings_raw()
+        if s.get("lib_id"):
+            return s["lib_id"]
+        import uuid
+        lib_id = (meta or {}).get("lib_id") if not self.owner_mismatch() else None
+        lib_id = lib_id or uuid.uuid4().hex
+        update_settings(lib_id=lib_id)
+        return lib_id
+
     def status(self) -> str:
         folder = self.folder()
         if folder is None:
             return "kapali"
+        if self.owner_mismatch():
+            return "yanlis"
         if not (folder / SHARED_DB_NAME).is_file():
             return "ilk"
         local, shared = self.local_changed(), self.shared_changed()
@@ -6860,8 +6900,11 @@ class LibrarySync:
         folder = self.folder()
         if folder is None:
             return "kapali"
+        if not force and self.owner_mismatch():
+            return "yanlis"
         if not force and self.shared_changed():
             return "cakisma"
+        lib_id = self._ensure_lib_id(self.meta())
         folder.mkdir(parents=True, exist_ok=True)
         snapshot = settings_path().parent / f"gonderilecek_{os.getpid()}_{threading.get_ident()}.db"
         change = self.lib.snapshot_to(snapshot)               # arayüzün kilidini tutmaz
@@ -6884,7 +6927,8 @@ class LibrarySync:
         rev = uuid.uuid4().hex
         _write_json(folder / SHARED_META_NAME, {"rev": rev, "machine": machine_name(), "items": self.lib.count(),
                                                 "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                                                "version": APP_VERSION, "name": active_profile()})
+                                                "version": APP_VERSION, "name": active_profile(),
+                                                "lib_id": lib_id})
         self._mark_synced(rev, change)
         diag(f"ortak kütüphaneye gönderildi ({self.lib.count()} kaynak)")
         return "gonderildi"
@@ -6896,7 +6940,10 @@ class LibrarySync:
         return tmp
 
     def _pull(self) -> str:
+        if self.owner_mismatch():
+            return "yanlis"
         meta = self.meta()
+        self._ensure_lib_id(meta)
         tmp = self._local_copy_of_shared()
         self._backup_local()
         with self.lib.lock:
@@ -10776,7 +10823,7 @@ def visible_profiles() -> list:
     return [n for n in load_profiles()["list"] if profile_finished(n)]
 
 
-def push_db_to_shared(db_path, shared_folder, items, report=None, name="") -> str:
+def push_db_to_shared(db_path, shared_folder, items, report=None, name="", lib_id="") -> str:
     """Bir kütüphane veritabanını ortak klasöre yazar (LibrarySync.push'un ayarsız hâli). Dönüş: sürüm."""
     import uuid
     shared_folder = Path(shared_folder)
@@ -10790,6 +10837,8 @@ def push_db_to_shared(db_path, shared_folder, items, report=None, name="") -> st
             "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "version": APP_VERSION}
     if name:
         meta["name"] = name
+    if lib_id:
+        meta["lib_id"] = lib_id
     _write_json(shared_folder / SHARED_META_NAME, meta)
     return rev
 
@@ -10925,11 +10974,14 @@ def split_library(lib, ids, new_name, new_folder, rest_folder, prefix, progress=
                         last_scan=utc_now().isoformat(), auto_scan=settings.get("auto_scan", True))
     for k in ("last_report", "seen_report", "retry_next_no", "queue_next_no", "sync"):
         new_settings.pop(k, None)
+    import uuid
+    new_settings["lib_id"] = uuid.uuid4().hex
+    new_settings.pop("owner_ok", None)
     if shared:
         remote = Path(new_folder) / SHARED_DIR_NAME
         rev = push_db_to_shared(new_db, remote, new_count,
                                 lambda d, t: progress(f"Yeni kütüphane Drive'a yazılıyor ({d} / {t} MB)…", d / max(t, 1)),
-                                name=new_name)
+                                name=new_name, lib_id=new_settings["lib_id"])
         new_settings["sync"] = {"synced_change": new_change, "shared_rev": rev,
                                 "last_sync": datetime.now().strftime("%d.%m.%Y %H:%M")}
         stale = remote / "Metin Dizini"                  # karışık kütüphanenin dizin parçaları: baştan kurulacak
@@ -10972,10 +11024,6 @@ def split_library(lib, ids, new_name, new_folder, rest_folder, prefix, progress=
 #    yok, Drive'daki kopyanın üzerine yazma yok.
 
 FOUND_LIBS_NAME = "bulunan_kutuphaneler.json"
-
-
-def _norm_folder(folder) -> str:
-    return os.path.normcase(os.path.normpath(str(folder))) if folder else ""
 
 
 def library_folder_of(name) -> str:
@@ -11077,7 +11125,12 @@ def connect_library(name, folder, progress=lambda text, frac=None: None) -> tupl
     settings = _read_json(settings_file)
     for k in ("sync", "last_report", "seen_report", "retry_next_no", "queue_next_no", "watch_since"):
         settings.pop(k, None)
-    settings.update(library_folder=folder, shared_library=True, kurulum="yarim", bagli_kurulum=True)
+    settings.update(library_folder=folder, shared_library=True, kurulum="yarim", bagli_kurulum=True, owner_ok=folder)
+    lib_meta = _read_json(shared / SHARED_META_NAME)
+    if lib_meta.get("lib_id"):
+        settings["lib_id"] = lib_meta["lib_id"]
+    else:
+        settings.pop("lib_id", None)
     _write_json(settings_file, settings)
     diag(f"kütüphane bağlanıyor: '{name}' ← {folder}")
     local = pdir / "kutuphane.db"
@@ -15058,9 +15111,16 @@ class App(ctk.CTk):
         scan_tab = self.tabs.add("Tarama")
         settings_tab = self.tabs.add("Ayarlar")
         settings_tab.grid_columnconfigure(0, weight=1)
-        settings_tab.grid_rowconfigure(0, weight=1)
+        settings_tab.grid_rowconfigure(1, weight=1)
+        head = ctk.CTkFrame(settings_tab, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=14, pady=(6, 0))
+        ctk.CTkLabel(head, text=f"Bu ayarlar: “{active_profile()}” kütüphanesi", anchor="w",
+                     font=ctk.CTkFont(size=15, weight="bold")).pack(anchor="w")
+        ctk.CTkLabel(head, text="Klasör, ortak kütüphane, anahtar kelimeler, tarama ve Claude bağlantısı her "
+                                "kütüphanede ayrıdır; öbür kütüphanenin ayarları için üstteki Kütüphane menüsünden "
+                                "ona geçin.", anchor="w", text_color=MUTED, font=ctk.CTkFont(size=12)).pack(anchor="w")
         self.settings_body = ctk.CTkScrollableFrame(settings_tab, corner_radius=12)
-        self.settings_body.grid(row=0, column=0, sticky="nsew", padx=8, pady=4)
+        self.settings_body.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
         self.settings_body.grid_columnconfigure(0, weight=1)
         download_tab.grid_columnconfigure(0, weight=3, uniform="col")
         download_tab.grid_columnconfigure(1, weight=2, uniform="col")
@@ -15156,6 +15216,8 @@ class App(ctk.CTk):
     def update_index(self, manual=False):
         if getattr(self, "maintenance", False):
             return
+        if self.settings.get("shared_library") and library_owner_check(self.library_folder()):
+            return False                      # klasör başka kütüphanenin: onun dizinine yazılmasın
         if self.index_worker is not None and self.index_worker.is_alive():
             return False
         self.index_worker = IndexWorker(self.library, self.events)
@@ -15214,6 +15276,8 @@ class App(ctk.CTk):
                     self.toast(f"{meta.get('machine', 'Öbür bilgisayar')} bilgisayarındaki değişiklikler alındı.")
             elif state == "cakisma":
                 done = self.resolve_conflict()
+            elif state == "yanlis":
+                self._owner_warning()
             if done in ("gonderildi", "alindi", "birlestirildi") and not closing:
                 self._write_phone_export()
         except Exception as exc:
@@ -15264,6 +15328,8 @@ class App(ctk.CTk):
                     machine = sync.meta().get("machine", "")
                 elif state == "cakisma":
                     result = "cakisma"
+                elif state == "yanlis":
+                    result = "yanlis"
                 else:
                     result = "esit"
             except Exception:
@@ -15284,6 +15350,9 @@ class App(ctk.CTk):
         if result == "cakisma":
             self.sync_now()                                    # hangisinin tutulacağını sorar
             return
+        if result == "yanlis":
+            self._owner_warning()
+            return
         if result == "alindi":
             self.settings = load_settings()
             self.library_tab.refresh()
@@ -15300,6 +15369,45 @@ class App(ctk.CTk):
             self.toast({"gonderildi": "Ortak kütüphaneye gönderildi.", "esit": "Ortak kütüphane zaten güncel.",
                         "birlestirildi": "Birleştirildi.",
                         "hata": "Ortak kütüphane eşitlenemedi; bulut klasörünü kontrol edin."}.get(result, "Tamam."))
+
+    def _owner_warning(self):
+        """Açık kütüphanenin klasörü Drive'da başka bir kütüphaneye ait: eşitleme yapılmaz, kullanıcıya sorulur."""
+        if getattr(self, "_owner_warned", False):
+            return
+        self._owner_warned = True
+        folder = self.library_folder()
+        owner = library_owner_check(folder)
+        if not owner:
+            return
+        diag(f"klasör başka kütüphanenin: '{active_profile()}' → {folder} ('{owner}'); eşitleme durduruldu")
+        choice = choice_dialog(
+            self, "Kütüphane klasörü",
+            f"“{active_profile()}” kütüphanesinin klasörü olarak şu klasör seçili:\n{folder}\n\nAma Drive'daki bilgiye "
+            f"göre bu klasör “{owner}” kütüphanesine ait. İki kütüphane karışmasın diye eşitleme durduruldu; Drive'daki "
+            "kopyaya da bu bilgisayardaki kütüphaneye de dokunulmadı.\n\nGenellikle doğrusu, bu kütüphanenin kendi "
+            "klasörünü seçmektir.",
+            ["Doğru klasörü seç…", "Bu klasör gerçekten bu kütüphanenin"])
+        if choice == 0:
+            self.tabs.set("Ayarlar")
+            self.choose_library_folder()
+        elif choice == 1 and messagebox.askyesno(
+                APP_NAME, f"Emin misiniz? “{active_profile()}” kütüphanesi bu klasördeki “{owner}” verisiyle "
+                          "eşitlenecek; iki kütüphanenin kaynakları karışabilir.", parent=self):
+            update_settings(owner_ok=folder)
+            self._owner_warned = False
+            self.sync_in_background(manual=True)
+
+    def folder_conflict(self, folder) -> str:
+        """Bu klasör açık kütüphane için seçilebilir mi? Seçilemezse nedeni."""
+        if not folder:
+            return ""
+        owner = registered_library_folders().get(_norm_folder(folder))
+        if owner and owner != active_profile():
+            return f"Bu klasör “{owner}” kütüphanesinin klasörü."
+        other = library_owner_check(folder)
+        if other:
+            return f"Bu klasörde Drive'a kaydedilmiş “{other}” kütüphanesi var."
+        return ""
 
     def _write_phone_export(self):
         folder = self.library_folder()
@@ -15944,6 +16052,14 @@ class App(ctk.CTk):
 
     def save_all_settings(self):
         current = load_settings()           # tarama tarihi gibi başka yerde yazılan alanlar korunur
+        typed = self.folder_var.get().strip()
+        if typed and _norm_folder(typed) != _norm_folder(current.get("library_folder") or ""):
+            problem = self.folder_conflict(typed)
+            if problem:                     # elle yazılan klasör başka kütüphanenin: eskisi korunur
+                self.folder_var.set(current.get("library_folder") or "")
+                self.after(10, lambda: messagebox.showwarning(
+                    APP_NAME, f"{problem}\n\nKlasör değiştirilmedi; “{active_profile()}” kütüphanesi için başka bir "
+                              "klasör seçin.", parent=self))
         current.update({
             "library_folder": self.folder_var.get().strip(),
             "email": self.email_entry.get().strip(),
@@ -15987,7 +16103,8 @@ class App(ctk.CTk):
         seen = self.settings.get("seen_report")
         if report and report != seen and Path(report).is_file():
             self.notify_report(report, "Yeni tarama raporu hazır")
-        if self.settings.get("auto_scan", True) and scan_due(self.settings) and self.library_folder():
+        if self.settings.get("auto_scan", True) and scan_due(self.settings) and self.library_folder() \
+                and not (self.settings.get("shared_library") and library_owner_check(self.library_folder())):
             self._log("info", "Son taramanın üzerinden 7 gün geçmiş; haftalık tarama arka planda başlıyor.")
             self.scan_tab.start_scan(automatic=True)
 
@@ -16170,6 +16287,12 @@ class App(ctk.CTk):
         path = filedialog.askdirectory(parent=self, initialdir=initial,
                                        title="Kütüphane klasörünü seçin (tüm PDF'ler burada toplanır)")
         if path:
+            problem = self.folder_conflict(os.path.normpath(path))
+            if problem:
+                messagebox.showwarning(APP_NAME, f"{problem}\n\n“{active_profile()}” kütüphanesi için başka bir klasör "
+                                                 "seçin. Öbür kütüphaneye geçmek için üstteki Kütüphane menüsünü "
+                                                 "kullanın.", parent=self)
+                return
             self.folder_var.set(os.path.normpath(path))
             self._log("info", f"Kütüphane klasörü: {self.folder_var.get()}")
             self.save_all_settings()
