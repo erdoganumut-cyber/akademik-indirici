@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.52"
+APP_VERSION = "2.53"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -1883,8 +1883,41 @@ def record_from_crossref(msg: dict) -> dict:
         "issue": clean_text(msg.get("issue", "")), "pages": clean_text(msg.get("page", "")),
         "publisher": clean_text(msg.get("publisher", "")), "doi": msg.get("DOI", ""),
         "institution": clean_text(institution), "language": msg.get("language", ""),
-        "issn": join_issns(msg.get("ISSN") or []),
+        "issn": join_issns(msg.get("ISSN") or []), "src_type": msg.get("type", ""),
     }
+
+
+# ── Makale olmayan kayıtlar: hakem raporları, düzeltme/geri çekme notları, dergi ek metinleri ─────────
+#    Hangi kütüphane olursa olsun taramaya alınmaz; ayıklama aracı da bunları gösterir.
+
+_NON_ARTICLE_TYPES = {"peer-review": "hakem değerlendirmesi", "erratum": "düzeltme notu",
+                      "retraction": "geri çekme notu", "paratext": "dergi ek metni", "component": "ek dosya",
+                      "supplementary-materials": "ek dosya", "grant": "hibe kaydı"}
+_NON_ARTICLE_TITLE = [
+    ("hakem değerlendirmesi", re.compile(r"^\W*(decision letter|author response|authors'? response|review for\b|"
+                                         r"reviewer report|referee report|peer review report|peer review\s*#?\s*\d*\s*of\b)")),
+    ("ek dosya", re.compile(r"^\W*(figure|fig\.|table|supplementary (material|file|table|figure|data))\s*s?\d*[a-z]?\s*"
+                            r"(from|of)\s*:?")),
+    ("düzeltme notu", re.compile(r"^\W*(erratum|errata|corrigendum|corrigenda|correction to\b|correction\s*:|"
+                                 r"addendum to\b|publisher correction|author correction)")),
+    ("geri çekme notu", re.compile(r"^\W*(retraction\s*(:|note\b|notice\b|statement\b|for\b|to\b)|retracted\s*:|"
+                                   r"notice of retraction|expression of concern|withdrawal notice|withdrawn\s*:)")),
+    ("Faculty Opinions önerisi", re.compile(r"^\W*(faculty opinions recommendation|f1000prime recommendation)")),
+    ("dergi ek metni", re.compile(r"^\W*(top stories|issue information|front matter|back matter|table of contents|"
+                                  r"editorial board|masthead|cover image|cover picture|ifc|ibc)\W*$|"
+                                  r"^\W*(issue information|front matter|back matter|table of contents)\b")),
+]
+
+
+def non_article_reason(title, src_type="") -> str:
+    """Kayıt bir yayın değil de hakem raporu, düzeltme notu, dergi ek metni gibi bir şeyse nedeni, değilse ""."""
+    if src_type in _NON_ARTICLE_TYPES:
+        return _NON_ARTICLE_TYPES[src_type]
+    t = fold(title or "").strip()
+    for reason, rx in _NON_ARTICLE_TITLE:
+        if rx.search(t):
+            return reason
+    return ""
 
 
 # ── Eksik künye bilgilerini tamamlama (bölüm sayfaları, kitap adı, editörler…) ─────────────
@@ -4921,20 +4954,45 @@ def _split_words(text: str) -> list:
     return [w.strip() for w in re.split(r"[,;]", text or "") if w.strip()]
 
 
+_QUOTES = "\"“”„«»"
+
+
+def _is_quoted(word: str) -> bool:
+    w = (word or "").strip()
+    return len(w) >= 3 and w[0] in _QUOTES and w[-1] in _QUOTES
+
+
+def _unquote(word: str) -> str:
+    w = (word or "").strip()
+    return w[1:-1].strip() if _is_quoted(w) else w
+
+
+_EXCLUDE_LINE = re.compile(r"^hari[cç]\s*(\(\s*ba[gğ]lam\s*yoksa\s*\))?\s*:\s*(.*)$", re.I)
+
+
 def parse_keyword_groups(text: str) -> list:
     """[Grup] / bağlam: / terim ; bağlam: biçimindeki metni gruplara ayırır."""
     groups, current = [], None
+    global_ex, global_noctx = [], []
     for raw in (text or "").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         m = re.match(r"^\[(.+)\]$", line)
         if m:
-            current = {"name": m.group(1).strip(), "context": [], "terms": []}
+            current = {"name": m.group(1).strip(), "context": [], "terms": [], "exclude": [], "exclude_noctx": []}
             groups.append(current)
             continue
+        m = _EXCLUDE_LINE.match(line)
+        if m:                         # 'hariç:' başlıkta geçerse kayıt alınmaz; gruptan önce yazılırsa hepsine
+            words = _split_words(m.group(2))
+            if current is None:
+                (global_noctx if m.group(1) else global_ex).extend(words)
+            else:
+                current["exclude_noctx" if m.group(1) else "exclude"].extend(words)
+            continue
         if current is None:
-            current = {"name": "Genel", "context": [], "terms": []}
+            current = {"name": "Genel", "context": [], "terms": [], "exclude": [], "exclude_noctx": []}
             groups.append(current)
         m = re.match(r"^ba[gğ]lam\s*:\s*(.*)$", line, re.I)
         if m:
@@ -4947,20 +5005,38 @@ def parse_keyword_groups(text: str) -> list:
             ctx = _split_words(m.group(1))
         parts = re.split(r"→|->", term, maxsplit=1)
         term, query = (parts[0], parts[1]) if len(parts) == 2 else (term, "")
+        exact = _is_quoted(term)
+        term, query = _unquote(term), _unquote(query)
         if term.strip():
-            current["terms"].append({"term": term.strip(), "context": ctx, "query": query.strip() or None})
+            current["terms"].append({"term": term.strip(), "context": ctx, "query": query.strip() or None,
+                                     "exact": exact})
+    for g in groups:
+        g["exclude"] = global_ex + g.get("exclude", [])
+        g["exclude_noctx"] = global_noctx + g.get("exclude_noctx", [])
     return [g for g in groups if g["terms"]]
 
 
 _SOFTEN = {"k": "[kg]", "p": "[pb]", "t": "[td]"}
+_GAP = r"[\s\-\u2010-\u2015]+"
 
 
-def _word_start(word: str):
-    """Kelime başından eşleşir; Türkçe ünsüz yumuşamasını da tanır (bellek → belleği, kimlik → kimliği)."""
+def _word_start(word: str, exact=None):
+    """Kelime başından eşleşir; Türkçe ünsüz yumuşamasını da tanır (bellek → belleği, kimlik → kimliği).
+    Tırnak içinde yazılan ("sea") ya da exact=True verilen kelime yalnızca tam kelime olarak eşleşir
+    ('sea' → 'search' ya da 'season' değil)."""
+    if exact is None and _is_quoted(word):
+        exact, word = True, _unquote(word)
+    if exact:
+        parts = fold(word).split()
+        return re.compile(r"(?<!\w)" + r"\W+".join(re.escape(x) for x in re.split(r"[\s\-\u2010-\u2015]+", " ".join(parts)) if x)
+                          + r"(?!\w)")
     w = fold(word).strip()
+    # çok kelimeli terimde boşluk yerine tire de olabilir: 'catch and release' = 'catch-and-release'
+    def esc(x):
+        return _GAP.join(re.escape(p) for p in re.split(r"[\s\-\u2010-\u2015]+", x) if p)
     if len(w) >= 4 and w[-1] in _SOFTEN:
-        return re.compile(r"(?<!\w)" + re.escape(w[:-1]) + _SOFTEN[w[-1]])
-    return re.compile(r"(?<!\w)" + re.escape(w))
+        return re.compile(r"(?<!\w)" + esc(w[:-1]) + _SOFTEN[w[-1]])
+    return re.compile(r"(?<!\w)" + esc(w))
 
 
 class KeywordMatcher:
@@ -4969,33 +5045,95 @@ class KeywordMatcher:
     def __init__(self, groups):
         self.groups = []
         self.ctx_words = {}
+        self.group_ctx, self.excl, self.excl_noctx = {}, {}, {}
+        self.stats = {}
         for g in groups:
             group_ctx = [_word_start(w) for w in g.get("context") or []]
+            self.group_ctx[g["name"]] = group_ctx
+            self.excl[g["name"]] = [(_unquote(w), _word_start(w)) for w in g.get("exclude") or []]
+            self.excl_noctx[g["name"]] = [(_unquote(w), _word_start(w)) for w in g.get("exclude_noctx") or []]
             terms = []
             for t in g["terms"]:
                 ctx = [_word_start(w) for w in t["context"]] if t.get("context") is not None else group_ctx
-                self.ctx_words[(g["name"], t["term"])] = (t["context"] if t.get("context") is not None
-                                                          else g.get("context") or [])
-                terms.append((t["term"], _word_start(t["term"]), ctx, t.get("query") or t["term"]))
+                self.ctx_words[(g["name"], t["term"])] = [_unquote(w) for w in (
+                    t["context"] if t.get("context") is not None else g.get("context") or [])]
+                terms.append((t["term"], _word_start(t["term"], t.get("exact")), ctx, t.get("query") or t["term"]))
             self.groups.append((g["name"], terms))
 
-    def match(self, text: str, strong: str = None) -> dict:
-        """{grup adı: [eşleşen terimler]}
+    def _excluded(self, name, head) -> str:
+        for word, rx in self.excl.get(name) or ():
+            if rx.search(head):
+                return f"hariç: {word}"
+        noctx = self.excl_noctx.get(name)
+        if noctx and not any(c.search(head) for c in self.group_ctx.get(name) or ()):
+            for word, rx in noctx:
+                if rx.search(head):
+                    return f"hariç (bağlam yok): {word}"
+        return ""
+
+    def explain(self, text: str, strong: str = None) -> tuple:
+        """(eşleşenler {grup: [terimler]}, elenenler {grup: neden})
         strong: başlık + anahtar kelimeler. Verilirse, terim yalnızca özette (text) geçtiğinde
-        bağlam kelimesi strong içinde aranır (özette bir kez geçen genel terimler gürültü yapmasın)."""
+        bağlam kelimesi strong içinde aranır (özette bir kez geçen genel terimler gürültü yapmasın).
+        'hariç' kelimeleri strong'da (başlık + anahtar kelimeler) aranır."""
         body = fold(text if strong is None else strong + " " + text)
         head = body if strong is None else fold(strong)
-        hits = {}
+        hits, dropped = {}, {}
         for name, terms in self.groups:
+            found, no_ctx = [], ""
             for term, rx, ctx, _ in terms:
                 if not rx.search(body):
                     continue
                 if ctx:
                     where = body if rx.search(head) else head
                     if not any(c.search(where) for c in ctx):
+                        no_ctx = no_ctx or term
                         continue
-                hits.setdefault(name, []).append(term)
+                found.append(term)
+            if not found:
+                if no_ctx:
+                    dropped[name] = f"bağlam yok: {no_ctx}"
+                continue
+            reason = self._excluded(name, head)
+            if reason:
+                dropped[name] = reason
+            else:
+                hits[name] = found
+        return hits, dropped
+
+    def match(self, text: str, strong: str = None) -> dict:
+        """{grup adı: [eşleşen terimler]} (bkz. explain)"""
+        return self.explain(text, strong)[0]
+
+    def match_record(self, rec: dict, text: str, strong: str = None) -> dict:
+        """Taramadaki kayıt için match; makale olmayanları eler ve grup başına kabul/elenme sayısını tutar."""
+        key = (rec.get("doi") or "").lower() or fold(rec.get("title") or "")[:160]
+        why = non_article_reason(rec.get("title"), rec.get("src_type") or "")
+        hits, dropped = self.explain(text, strong)
+        if why:
+            dropped.update({g: f"makale değil: {why}" for g in hits})
+            hits = {}
+        for g in hits:
+            self.stats.setdefault(g, {"kabul": set(), "elenen": {}})["kabul"].add(key)
+        for g, reason in dropped.items():
+            st = self.stats.setdefault(g, {"kabul": set(), "elenen": {}})
+            st["elenen"].setdefault(key, reason)
         return hits
+
+    def stats_summary(self) -> list:
+        """[(grup, kabul, elenen, [(neden, sayı), …])] — raporda süzgecin neyi attığını göstermek için."""
+        out = []
+        for name, _ in self.groups:
+            st = self.stats.get(name)
+            if not st:
+                continue
+            elenen = {k: r for k, r in st["elenen"].items() if k not in st["kabul"]}
+            counts = {}
+            for reason in elenen.values():
+                short = "bağlam kelimesi yok" if reason.startswith("bağlam yok") else reason
+                counts[short] = counts.get(short, 0) + 1
+            out.append((name, len(st["kabul"]), len(elenen), sorted(counts.items(), key=lambda kv: -kv[1])[:6]))
+        return out
 
     def search_terms(self, with_context: bool = False) -> list:
         """Crossref'te aranacak sorgular. with_context: bağlamlı terime bağlamın ilk kelimesi eklenir
@@ -5488,7 +5626,7 @@ def record_from_openalex(w: dict) -> dict:
         rtype = "other"
     return {
         "title": clean_text(w.get("title") or w.get("display_name") or ""), "authors": authors,
-        "year": str(w.get("publication_year") or ""), "type": rtype,
+        "year": str(w.get("publication_year") or ""), "type": rtype, "src_type": w.get("type") or "",
         "container": clean_text(src.get("display_name") or ""), "volume": str(bib.get("volume") or ""),
         "issue": str(bib.get("issue") or ""),
         "pages": f"{first}-{last}" if first and last and first != last else str(first or ""),
@@ -5787,6 +5925,11 @@ def write_scan_report(path: Path, info: dict, found: list, added_items: list) ->
         f'{" · PDF var" if i.get("file_path") else " · PDF yok"}</div></li>'
         for i in added_items)
     errors = "".join(f"<li>{_h(e)}</li>" for e in info.get("errors", []))
+    filt = info.get("filter_stats") or []
+    filter_rows = "".join(
+        f'<li><div class="t">{_h(g)}</div><div class="m">kabul: {acc} · elenen: {rej}'
+        + (" — " + _h("; ".join(f"{r} ({n})" for r, n in reasons)) if reasons else "") + '</div></li>'
+        for g, acc, rej, reasons in filt)
     pdf_count = sum(1 for e in found if e["status"] in ("pdf", "pdf_found"))
     new_count = sum(1 for e in found if e["status"] not in ("known", "pdf_found", "thesis_skipped"))
     doc = f"""<!doctype html><html lang="tr"><head><meta charset="utf-8">
@@ -5828,6 +5971,7 @@ li{{background:var(--card);border:1px solid var(--line);border-radius:10px;paddi
 </div>
 {''.join(sections)}
 {f'<section><h2>Bu dönemde kütüphaneye eklenen tüm kaynaklar <small>{len(added_items)}</small></h2><ul>{added_rows}</ul></section>' if added_items else ''}
+{f'<section><h2>Anahtar kelime süzgeci <small>grup başına kabul / elenen</small></h2><ul>{filter_rows}</ul></section>' if filter_rows else ''}
 {f'<section><h2>Tarama sırasında oluşan sorunlar</h2><ul>{errors}</ul></section>' if errors else ''}
 <footer>{_h(APP_NAME)} v{_h(APP_VERSION)} · {_h(info.get('created', ''))}</footer>
 </main></body></html>"""
@@ -6011,7 +6155,7 @@ class ScanWorker(threading.Thread):
             # dergi adı bilerek dışarıda: 'Millî Folklor'da çıkan her makale 'folklor' bağlamı sayılmasın
             strong = " ".join([rec.get("title", ""), " ".join(rec.get("all_titles", [])),
                                " ".join(rec.get("subjects", [])), rec.get("keywords", "")])
-            hits = matcher.match(rec.get("description", ""), strong=strong)
+            hits = matcher.match_record(rec, rec.get("description", ""), strong=strong)
             if hits:
                 k = key_of(rec)
                 if k in candidates:
@@ -6119,6 +6263,7 @@ class ScanWorker(threading.Thread):
             return
         added_items = self.library.items_added_since(since.strftime("%Y-%m-%d"))
         folder = Path(self.library_folder or settings_path().parent) / "Tarama Raporları"
+        info["filter_stats"] = matcher.stats_summary()
         self.report_path = write_scan_report(folder / f"Tarama_{datetime.now():%Y-%m-%d_%H%M%S}.html",
                                              info, found, added_items)
         new = sum(1 for e in found if e["status"] not in ("known", "thesis_skipped"))
@@ -6385,7 +6530,7 @@ class ScanWorker(threading.Thread):
             if year_ok and not year_ok(rec):
                 continue
             strong = " ".join([rec["title"], " ".join(rec["all_titles"]), " ".join(rec["subjects"])])
-            hits = matcher.match("", strong=strong)
+            hits = matcher.match_record(rec, "", strong=strong)
             if hits:
                 k = "yok:" + (rec.get("tez_no") or fold(rec["title"]))
                 if k in candidates:
@@ -6431,7 +6576,7 @@ class ScanWorker(threading.Thread):
                     continue
                 strong = " ".join([rec.get("title", ""), " ".join(rec.get("all_titles", [])),
                                    " ".join(rec.get("subjects", [])), rec.get("keywords", "")])
-                hits = matcher.match(rec.get("description", ""), strong=strong)
+                hits = matcher.match_record(rec, rec.get("description", ""), strong=strong)
                 if hits:
                     k = (rec.get("doi") or "").lower() or rec.get("url") or fold(rec.get("title", ""))
                     if k in candidates:
@@ -6584,6 +6729,7 @@ class ScanWorker(threading.Thread):
         if finished:
             save_retro_state(None)
         folder = Path(self.library_folder or settings_path().parent) / "Tarama Raporları"
+        info["filter_stats"] = matcher.stats_summary()
         self.report_path = write_scan_report(folder / f"Gecmis_Tarama_{datetime.now():%Y-%m-%d_%H%M%S}.html",
                                              info, found, []) if found else None
         if not reached:
@@ -11351,6 +11497,8 @@ def find_unmatched(library, items, cancel=None, progress=None) -> list:
     olanlar hariç). Başlık + anahtar kelimeler + saklı metnin başı (özet ya da PDF) yeniden eşleştirilir."""
     matcher = get_matcher()
     cards = library.card_counts()
+    current_terms = {name: {fold(t[0]) for t in terms} for name, terms in matcher.groups}
+    known_groups = list(current_terms)          # listeden çıkarılmış grubun kaydı çözülemez: o kayıt tutulur
     out = []
     pool = [i for i in items if i.get("source") in ("tarama", "geçmiş tarama")
             and not cards.get(i["id"]) and not i.get("ai_ozet")]
@@ -11360,9 +11508,44 @@ def find_unmatched(library, items, cancel=None, progress=None) -> list:
         if progress and n % 50 == 0:
             progress(n, len(pool))
         strong = " ".join([item.get("title") or "", item.get("keywords") or ""])
+        why = non_article_reason(item.get("title"))
+        if why:
+            out.append(dict(item, _why=f"makale değil: {why}"))
+            continue
         text = library.get_fulltext(item["id"])[:6000]
-        if not matcher.match(text, strong=strong):
-            out.append(item)
+        hits, dropped = matcher.explain(text, strong=strong)
+        if hits:
+            continue
+        reasons = list(dict.fromkeys(dropped.values()))
+        if reasons:
+            out.append(dict(item, _why=reasons[0]))
+            continue
+        if len(text.strip()) >= 300:
+            out.append(dict(item, _why="hiçbir gruba uymuyor"))
+            continue
+        # Özeti saklanmamış kayıt: terim tarama sırasında özette geçmiş olabilir, başlığa bakarak karar verilmez.
+        # Yalnızca eşleştiği terim(ler) listeden tamamen çıkarıldıysa ayıklanır.
+        old = matched_terms(item.get("matched") or "", known_groups)
+        if old and not any(fold(t) in current_terms.get(g, set()) for g, terms in old.items() for t in terms):
+            out.append(dict(item, _why="eşleştiği terim listeden çıkarıldı: " + ", ".join(
+                t for terms in old.values() for t in terms)[:80]))
+    return out
+
+
+def matched_terms(matched: str, group_names) -> dict:
+    """'Grup A: t1, t2 · Grup B: t3' biçimindeki eşleşme kaydını {grup: [terimler]} olarak çözer
+    (grup adlarında da ' · ' olabildiği için bilinen grup adlarıyla bölünür)."""
+    marks = []
+    for g in sorted(set(group_names), key=len, reverse=True):
+        for m in re.finditer(re.escape(g) + r":\s*", matched):
+            if not any(a <= m.start() < b for a, b, _ in marks):
+                marks.append((m.start(), m.end(), g))
+    marks.sort()
+    out = {}
+    for k, (a, b, g) in enumerate(marks):
+        end = marks[k + 1][0] if k + 1 < len(marks) else len(matched)
+        chunk = re.sub(r"\s*·\s*$", "", matched[b:end].strip())
+        out.setdefault(g, []).extend(t.strip() for t in chunk.split(",") if t.strip())
     return out
 
 
@@ -11409,7 +11592,8 @@ class PruneWindow(ctk.CTkToplevel):
         box.grid(row=1, column=0, sticky="nsew", padx=10)
         box.grid_columnconfigure(0, weight=1)
         box.grid_rowconfigure(0, weight=1)
-        cols = (("no", "No", 60), ("year", "Yıl", 60), ("title", "Başlık", 520), ("matched", "Eşleşmişti", 300))
+        cols = (("no", "No", 60), ("year", "Yıl", 60), ("title", "Başlık", 470), ("why", "Neden", 210),
+                ("matched", "Eşleşmişti", 200))
         self.tree = ttk.Treeview(box, columns=[c[0] for c in cols], show="headings", selectmode="extended",
                                  style="Lib.Treeview")
         for key, text, width in cols:
@@ -11419,9 +11603,10 @@ class PruneWindow(ctk.CTkToplevel):
         self.tree.configure(yscrollcommand=bar.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
         bar.grid(row=0, column=1, sticky="ns")
-        for it in sorted(items, key=lambda i: (i.get("matched") or "", i.get("no") or 0)):
+        for it in sorted(items, key=lambda i: (i.get("_why") or "", i.get("matched") or "", i.get("no") or 0)):
             self.tree.insert("", "end", iid=str(it["id"]), values=(it.get("no") or "", it.get("year") or "",
-                                                                    it["title"], shorten(it.get("matched") or "", 60)))
+                                                                    it["title"], it.get("_why") or "",
+                                                                    shorten(it.get("matched") or "", 60)))
         self.tree.selection_set(self.tree.get_children())
         btns = ctk.CTkFrame(self, fg_color="transparent")
         btns.grid(row=2, column=0, sticky="e", padx=14, pady=10)
@@ -12326,7 +12511,7 @@ class LibraryTab:
     """'Kütüphanem' sekmesi: tablo, arama/filtre, künye düzenleme, alıntı kartları, kaynakça."""
 
     STATUS_FILTERS = ["Tümü", "Yeni (taramadan)", "PDF'i olanlar", "PDF'i olmayanlar", "Kartı olanlar",
-                      "Scopus'taki dergiler"]
+                      "Scopus'taki dergiler", "Künyesi eksik (yazar/yıl)"]
     TYPE_FILTERS = {"Tüm türler": None, "Makale": ("article",), "Kitap": ("book",), "Kitap bölümü": ("chapter",),
                     "Bildiri": ("conference",), "Tez (hepsi)": "thesis", "Doktora tezi": ("phd",),
                     "Yüksek lisans tezi": ("masters",), "Diğer": ("other",)}
@@ -12746,7 +12931,8 @@ class LibraryTab:
                 return False
             return {"Tümü": True, "Yeni (taramadan)": item["is_new"], "PDF'i olanlar": item["has_pdf"],
                     "PDF'i olmayanlar": not item["has_pdf"], "Kartı olanlar": item["cards"] > 0,
-                    "Scopus'taki dergiler": item["_scopus"] in ("aktif", "pasif")}[status]
+                    "Scopus'taki dergiler": item["_scopus"] in ("aktif", "pasif"),
+                    "Künyesi eksik (yazar/yıl)": not item.get("authors") or not str(item.get("year") or "").strip()}[status]
 
         shown = [i for i in self.items if visible(i)]
         keys = {"author": lambda i: tr_sort_key(first_author_label(i)), "year": lambda i: i["year"] or "0",
