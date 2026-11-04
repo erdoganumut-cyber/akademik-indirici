@@ -29,6 +29,7 @@ Gereksinimler:  pip install customtkinter requests pypdf
 """
 
 import csv
+import glob
 import hashlib
 import html
 import json
@@ -67,7 +68,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.54"
+APP_VERSION = "2.55"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -4986,12 +4987,13 @@ def _unquote(word: str) -> str:
 
 
 _EXCLUDE_LINE = re.compile(r"^hari[cç]\s*(\(\s*ba[gğ]lam\s*yoksa\s*\))?\s*:\s*(.*)$", re.I)
+_PROTECT_LINE = re.compile(r"^koru\s*:\s*(.*)$", re.I)
 
 
 def parse_keyword_groups(text: str) -> list:
     """[Grup] / bağlam: / terim ; bağlam: biçimindeki metni gruplara ayırır."""
     groups, current = [], None
-    global_ex, global_noctx = [], []
+    global_ex, global_noctx, protect = [], [], []
     for raw in (text or "").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -5000,6 +5002,10 @@ def parse_keyword_groups(text: str) -> list:
         if m:
             current = {"name": m.group(1).strip(), "context": [], "terms": [], "exclude": [], "exclude_noctx": []}
             groups.append(current)
+            continue
+        m = _PROTECT_LINE.match(line)
+        if m:                         # 'koru:' ayıklamada güvence; taramada tek başına kayıt aldırmaz
+            protect.extend(_split_words(m.group(1)))
             continue
         m = _EXCLUDE_LINE.match(line)
         if m:                         # 'hariç:' başlıkta geçerse kayıt alınmaz; gruptan önce yazılırsa hepsine
@@ -5031,6 +5037,7 @@ def parse_keyword_groups(text: str) -> list:
     for g in groups:
         g["exclude"] = global_ex + g.get("exclude", [])
         g["exclude_noctx"] = global_noctx + g.get("exclude_noctx", [])
+        g["protect"] = list(protect)
     return [g for g in groups if g["terms"]]
 
 
@@ -5065,6 +5072,8 @@ class KeywordMatcher:
         self.ctx_words = {}
         self.group_ctx, self.excl, self.excl_noctx = {}, {}, {}
         self.stats = {}
+        words = list(dict.fromkeys(w for g in groups for w in g.get("protect") or []))
+        self.protect = [(_unquote(w), _word_start(w)) for w in words]
         for g in groups:
             group_ctx = [_word_start(w) for w in g.get("context") or []]
             self.group_ctx[g["name"]] = group_ctx
@@ -5077,6 +5086,11 @@ class KeywordMatcher:
                     t["context"] if t.get("context") is not None else g.get("context") or [])]
                 terms.append((t["term"], _word_start(t["term"], t.get("exact")), ctx, t.get("query") or t["term"]))
             self.groups.append((g["name"], terms))
+
+    def protected(self, strong: str) -> str:
+        """'koru:' kelimelerinden biri başlıkta/anahtar kelimelerde geçiyorsa o kelime (ayıklamada güvence)."""
+        head = fold(strong or "")
+        return next((w for w, rx in self.protect if rx.search(head)), "")
 
     def _excluded(self, name, head) -> str:
         for word, rx in self.excl.get(name) or ():
@@ -11516,6 +11530,7 @@ def find_unmatched(library, items, cancel=None, progress=None) -> list:
     matcher = get_matcher()
     cards = library.card_counts()
     current_terms = {name: {fold(t[0]) for t in terms} for name, terms in matcher.groups}
+    term_info = {(name, fold(t[0])): (t[1], t[2]) for name, terms in matcher.groups for t in terms}
     known_groups = list(current_terms)          # listeden çıkarılmış grubun kaydı çözülemez: o kayıt tutulur
     out = []
     pool = [i for i in items if i.get("source") in ("tarama", "geçmiş tarama")
@@ -11535,18 +11550,34 @@ def find_unmatched(library, items, cancel=None, progress=None) -> list:
         if hits:
             continue
         reasons = list(dict.fromkeys(dropped.values()))
+        hard = [r for r in reasons if r.startswith("hariç")]
+        if hard:
+            out.append(dict(item, _why=hard[0]))
+            continue
+        if matcher.protected(strong):
+            continue                                        # balık/balıkçılık kaynağı: ayıklanmaz
         if reasons:
             out.append(dict(item, _why=reasons[0]))
             continue
         if len(text.strip()) >= 300:
             out.append(dict(item, _why="hiçbir gruba uymuyor"))
             continue
-        # Özeti saklanmamış kayıt: terim tarama sırasında özette geçmiş olabilir, başlığa bakarak karar verilmez.
-        # Yalnızca eşleştiği terim(ler) listeden tamamen çıkarıldıysa ayıklanır.
+        # Özeti saklanmamış kayıt: terim tarama sırasında özette geçmiş. Eşleşme kuralına göre terim yalnızca
+        # özetteyse bağlam kelimesinin başlıkta ya da anahtar kelimelerde olması gerekir; bu da denetlenebilir.
         old = matched_terms(item.get("matched") or "", known_groups)
-        if old and not any(fold(t) in current_terms.get(g, set()) for g, terms in old.items() for t in terms):
+        if not old:
+            continue
+        live = [(g, t) for g, terms in old.items() for t in terms if fold(t) in current_terms.get(g, set())]
+        if not live:
             out.append(dict(item, _why="eşleştiği terim listeden çıkarıldı: " + ", ".join(
                 t for terms in old.values() for t in terms)[:80]))
+            continue
+        head = fold(strong)
+        if any(term_info[(g, fold(t))][0].search(head) for g, t in live):
+            continue                                        # terim başlıkta: bağlamı özette olabilir, tutulur
+        if all(term_info[(g, fold(t))][1] and not any(c.search(head) for c in term_info[(g, fold(t))][1])
+               for g, t in live):
+            out.append(dict(item, _why=f"başlıkta bağlam yok: {live[0][1]}"))
     return out
 
 
@@ -11586,6 +11617,283 @@ def prune_items(library, ids, library_folder) -> tuple:
                 diag(f"ayıklama: {Path(path).name} taşınamadı: {describe_error(exc)}")
         library.delete(item_id)
     return len(ids), moved
+
+
+# ── Ayıklananları geri getir: yedekteki, sonradan silinmiş ama güncel anahtar kelimelere (ya da 'koru:' listesine)
+#    uyan kayıtlar; eski numaraları, etiketleri, kartları ve metinleriyle geri gelir, PDF'leri geri taşınır.
+
+def library_backups(library_folder=None) -> list:
+    """Kütüphanenin yedekleri (yeniden eskiye): [(yol, etiket)] — Drive'daki ortak yedekler ve bu bilgisayardakiler."""
+    found = []
+    if library_folder:
+        for f in (Path(library_folder) / SHARED_DIR_NAME / "Yedekler").glob("ortak_*.db"):
+            found.append((f, "Drive"))
+    for f in (settings_path().parent / "Yedekler").glob("kutuphane_*.db"):
+        found.append((f, "bu bilgisayar"))
+    out = []
+    for f, where in found:
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        m = re.search(r"(\d{8})_(\d{6})", f.name)         # yedeğin alındığı an dosya adında yazar
+        try:
+            when = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S").timestamp() if m else st.st_mtime
+        except ValueError:
+            when = st.st_mtime
+        out.append((when, f, where, st.st_size))
+    out.sort(reverse=True)
+    return [(f, f"{datetime.fromtimestamp(t):%d.%m.%Y %H:%M} · {where} · {size // (1 << 20)} MB") for t, f, where, size in out]
+
+
+def _record_key(item) -> str:
+    doi = (normalize_doi(item.get("doi") or "") or "").lower()
+    return doi or (fold(item.get("title") or "")[:160] + "|" + str(item.get("year") or "")[:4])
+
+
+def find_restorable(library, backup_copy, progress=None) -> list:
+    """Yedekte olup kütüphanede artık olmayan, güncel kurallara ya da 'koru:' listesine uyan kayıtlar.
+    Dönüş: yedekteki kayıtlar (+ "_why")."""
+    src = Library(backup_copy, root=library.root, relative=library.relative)
+    try:
+        present = {_record_key(i) for i in library.all_items()}
+        shas = {i.get("sha256") for i in library.all_items() if i.get("sha256")}
+        matcher = get_matcher()
+        out = []
+        pool = src.all_items()
+        for n, item in enumerate(pool):
+            if progress and n % 200 == 0:
+                progress(n, len(pool))
+            if _record_key(item) in present or (item.get("sha256") and item["sha256"] in shas):
+                continue
+            if non_article_reason(item.get("title")):
+                continue
+            strong = " ".join([item.get("title") or "", item.get("keywords") or ""])
+            hits, dropped = matcher.explain(src.get_fulltext(item["id"])[:6000], strong=strong)
+            if hits:
+                why = "uyuyor: " + ", ".join(g.replace("LRF · ", "") for g in hits)
+            elif any(r.startswith("hariç") for r in dropped.values()):
+                continue
+            elif matcher.protected(strong):
+                why = "korunan: " + matcher.protected(strong)
+            else:
+                continue
+            out.append(dict(item, _why=why))
+        return out
+    finally:
+        src.close()
+
+
+def restore_items(library, backup_copy, ids, library_folder) -> tuple:
+    """Seçilen yedek kayıtlarını kütüphaneye geri ekler. Dönüş: (geri gelen, geri taşınan PDF, sorunlar)"""
+    src = sqlite3.connect(f"file:{Path(backup_copy).as_posix()}?mode=ro", uri=True)
+    src.row_factory = sqlite3.Row
+    restored, moved, problems = 0, 0, []
+    spare = Path(library_folder) / PRUNE_DIR if library_folder else None
+    try:
+        cols_dest = [r[1] for r in library.db.execute("PRAGMA table_info(items)")]
+        card_cols = [r[1] for r in library.db.execute("PRAGMA table_info(cards)") if r[1] not in ("id", "item_id")]
+        used_nos = {r[0] for r in library.db.execute("SELECT no FROM items")}
+        for old_id in ids:
+            row = src.execute("SELECT * FROM items WHERE id=?", (old_id,)).fetchone()
+            if not row:
+                continue
+            rec = {k: row[k] for k in row.keys() if k in cols_dest and k != "id"}
+            stored = rec.get("file_path") or ""
+            if stored:
+                target = Path(library._abs(stored))
+                if not target.is_file() and spare is not None:
+                    name = Path(stored.replace("\\", "/")).name
+                    stem, ext = os.path.splitext(name)
+                    cands = [spare / name] + sorted(spare.glob(glob.escape(stem) + " (*)" + glob.escape(ext)))
+                    hit = next((c for c in cands if c.is_file()), None)
+                    if hit is not None:
+                        try:
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            dest = target if not target.exists() else unique_path(target.parent, target.name)
+                            shutil.move(str(hit), str(dest))
+                            rec["file_path"] = library._stored(str(dest))
+                            moved += 1
+                        except OSError as exc:
+                            problems.append(f"{name}: {describe_error(exc)}")
+            if rec.get("no") in used_nos:
+                rec["no"] = 0                                   # numara başkasındaysa yenisi verilir
+            with library.lock, library.db:
+                cur = library.db.execute(f"INSERT INTO items ({', '.join(rec)}) VALUES ({', '.join('?' * len(rec))})",
+                                         list(rec.values()))
+                new_id = cur.lastrowid
+                for (tag,) in src.execute("SELECT tag FROM tags WHERE item_id=?", (old_id,)):
+                    library.db.execute("INSERT OR IGNORE INTO tags (item_id, tag) VALUES (?, ?)", (new_id, tag))
+                for c in src.execute("SELECT * FROM cards WHERE item_id=?", (old_id,)):
+                    vals = [c[k] for k in card_cols if k in c.keys()]
+                    keys = [k for k in card_cols if k in c.keys()]
+                    library.db.execute(f"INSERT INTO cards (item_id, {', '.join(keys)}) VALUES (?{', ?' * len(keys)})",
+                                       [new_id] + vals)
+                ft = src.execute("SELECT content FROM fulltext WHERE item_id=?", (old_id,)).fetchone()
+                if ft and ft[0]:
+                    library.db.execute("INSERT OR REPLACE INTO fulltext (item_id, content) VALUES (?, ?)", (new_id, ft[0]))
+            if rec.get("no"):
+                used_nos.add(rec["no"])
+            restored += 1
+        with library.lock, library.db:
+            library._number_items()
+    finally:
+        src.close()
+    forget_exists_cache()
+    return restored, moved, problems
+
+
+class RestoreWindow(ctk.CTkToplevel):
+    """Yedekten geri getirilebilecek (ayıklanmış ama güncel kurallara uyan) kayıtlar; seçilenler geri gelir."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        from tkinter import ttk
+        self.app, self.q, self.copy, self.busy = app, queue.Queue(), None, False
+        self.title("Ayıklananları geri getir")
+        set_window_icon(self, delay=260)
+        self.geometry("%dx%d" % fit_window(self, 1040, 660))
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+        ctk.CTkLabel(self, text="Yedekte olup kütüphanede artık bulunmayan, ama güncel anahtar kelimelerinize ya da "
+                                "'koru:' listesine uyan kayıtlar. Hepsi seçili gelir; istemediklerinizin seçimini "
+                                "kaldırın (Ctrl ile tıklayın). Kayıtlar eski numaraları, etiketleri ve kartlarıyla geri "
+                                f"gelir; PDF'leri '{PRUNE_DIR}' klasöründen geri taşınır. Hiçbir şey silinmez.",
+                     wraplength=1000, justify="left", anchor="w").grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 4))
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.grid(row=1, column=0, sticky="ew", padx=14)
+        top.grid_columnconfigure(1, weight=1)
+        self.backups = library_backups(app.library_folder())
+        ctk.CTkLabel(top, text="Yedek:").grid(row=0, column=0, padx=(0, 6))
+        self.pick = ctk.CTkOptionMenu(top, values=[b[1] for b in self.backups] or ["(yedek bulunamadı)"],
+                                      command=lambda _: self._analyze(), width=420, dynamic_resizing=False)
+        self.pick.grid(row=0, column=1, sticky="w")
+        self.status = ctk.CTkLabel(top, text="", anchor="w", text_color=MUTED)
+        self.status.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 4))
+        box = ctk.CTkFrame(self, fg_color="transparent")
+        box.grid(row=2, column=0, sticky="nsew", padx=10)
+        box.grid_columnconfigure(0, weight=1)
+        box.grid_rowconfigure(0, weight=1)
+        cols = (("no", "No", 60), ("year", "Yıl", 60), ("title", "Başlık", 560), ("why", "Neden", 300))
+        self.tree = ttk.Treeview(box, columns=[c[0] for c in cols], show="headings", selectmode="extended",
+                                 style="Lib.Treeview")
+        for key, text, width in cols:
+            self.tree.heading(key, text=text)
+            self.tree.column(key, width=width, stretch=key == "title", anchor="center" if key in ("no", "year") else "w")
+        bar = ctk.CTkScrollbar(box, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=bar.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        bar.grid(row=0, column=1, sticky="ns")
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.grid(row=3, column=0, sticky="e", padx=14, pady=10)
+        ctk.CTkButton(btns, text="Kapat", width=90, fg_color="transparent", border_width=1, text_color=TEXT,
+                      command=self.close).pack(side="left", padx=8)
+        self.go = ctk.CTkButton(btns, text="Seçilenleri Geri Getir", width=200, state="disabled", command=self.apply)
+        self.go.pack(side="left")
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<Escape>", lambda _: self.close())
+        self.after(80, self.lift)
+        self.after(150, self._poll)
+        if self.backups:
+            self._analyze()
+        else:
+            self.status.configure(text="Bu kütüphanenin yedeği bulunamadı (Drive'daki '_Kütüphane Verisi/Yedekler' ya da "
+                                       "bu bilgisayardaki 'Yedekler' klasörü).")
+
+    def _analyze(self):
+        if self.busy:
+            return
+        choice = next((b for b in self.backups if b[1] == self.pick.get()), None)
+        if not choice:
+            return
+        self.busy = True
+        self.go.configure(state="disabled")
+        self.tree.delete(*self.tree.get_children())
+        lib, q, src = self.app.library, self.q, choice[0]
+
+        def work():
+            import uuid
+            tmp = settings_path().parent / f"geri_getirme_{uuid.uuid4().hex[:8]}.db"
+            try:
+                copy_with_progress(src, tmp, lambda d, t: q.put(("progress", f"Yedek okunuyor ({d} / {t} MB)…")))
+                q.put(("progress", "Kayıtlar güncel anahtar kelimelerle karşılaştırılıyor…"))
+                found = find_restorable(lib, tmp, lambda n, t: q.put(("progress", f"Karşılaştırılıyor {n}/{t}…")))
+                q.put(("found", tmp, found))
+            except Exception as exc:
+                diag_exception("geri getirme taraması")
+                Path(tmp).unlink(missing_ok=True)
+                q.put(("error", describe_error(exc)))
+        threading.Thread(target=work, name="geri-getirme", daemon=True).start()
+
+    def _poll(self):
+        if not self.winfo_exists():
+            return
+        try:
+            while True:
+                msg = self.q.get_nowait()
+                if msg[0] == "progress":
+                    self.status.configure(text=msg[1])
+                elif msg[0] == "found":
+                    self.busy = False
+                    self._drop_copy()
+                    self.copy, found = msg[1], msg[2]
+                    for it in sorted(found, key=lambda i: (i["_why"], i.get("no") or 0)):
+                        self.tree.insert("", "end", iid=str(it["id"]), values=(it.get("no") or "", it.get("year") or "",
+                                                                                it["title"], it["_why"]))
+                    self.tree.selection_set(self.tree.get_children())
+                    self.status.configure(text=f"{len(found)} kayıt geri getirilebilir." if found else
+                                          "Bu yedekte geri getirilecek kayıt yok.")
+                    self.go.configure(state="normal" if found else "disabled")
+                elif msg[0] == "restored":
+                    self.busy = False
+                    restored, moved, problems = msg[1:]
+                    for iid in list(self.tree.selection()):
+                        self.tree.delete(iid)
+                    self.status.configure(text=f"{restored} kayıt geri getirildi, {moved} PDF geri taşındı."
+                                               + (f" {len(problems)} sorun var." if problems else ""))
+                    diag(f"geri getirme: {restored} kayıt, {moved} PDF" + (f"; sorunlar: {problems}" if problems else ""))
+                    try:
+                        self.app.library_tab.refresh()
+                    except Exception:
+                        pass
+                    if problems:
+                        messagebox.showwarning(APP_NAME, "Bazı PDF'ler taşınamadı:\n\n" + "\n".join(problems[:12]), parent=self)
+                    self.go.configure(state="normal" if self.tree.get_children() else "disabled")
+                elif msg[0] == "error":
+                    self.busy = False
+                    self.status.configure(text=f"Hata: {msg[1]}")
+        except queue.Empty:
+            pass
+        self.after(150, self._poll)
+
+    def apply(self):
+        ids = [int(i) for i in self.tree.selection()]
+        if not ids or self.busy or not self.copy:
+            return
+        if not messagebox.askyesno(APP_NAME, f"{len(ids)} kayıt kütüphaneye geri getirilsin mi?", parent=self):
+            return
+        self.busy = True
+        self.go.configure(state="disabled")
+        lib, q, copy, folder = self.app.library, self.q, self.copy, self.app.library_folder()
+
+        def work():
+            try:
+                q.put(("restored",) + restore_items(lib, copy, ids, folder))
+            except Exception as exc:
+                diag_exception("geri getirme")
+                q.put(("error", describe_error(exc)))
+        threading.Thread(target=work, name="geri-getir", daemon=True).start()
+
+    def _drop_copy(self):
+        if self.copy:
+            Path(self.copy).unlink(missing_ok=True)
+            self.copy = None
+
+    def close(self):
+        if self.busy and not messagebox.askyesno(APP_NAME, "İşlem sürüyor. Pencere kapatılsın mı?", parent=self):
+            return
+        self._drop_copy()
+        self.destroy()
 
 
 class PruneWindow(ctk.CTkToplevel):
@@ -12613,7 +12921,8 @@ class LibraryTab:
                   "PDF işaretlemelerini kartlara aktar…": "_import_highlights"},
         "Düzenle ▾": {"Otomatik Etiketle": "_autotag", "Eksik Künyeleri Tamamla": "_complete",
                       "Künyeyi PDF'ten yeniden çıkar…": "_reextract", "Mükerrer kayıtları bul…": "_duplicates",
-                      "Anahtar kelimelere uymayanları ayıkla…": "_prune", "Yenileri İncelendi Say": "_mark_all_reviewed"},
+                      "Anahtar kelimelere uymayanları ayıkla…": "_prune", "Ayıklananları geri getir…": "_restore",
+                      "Yenileri İncelendi Say": "_mark_all_reviewed"},
         "Kaynakça ▾": {"Seçilenlerin Kaynakçası": "_bib_selected", "Listedekilerin Kaynakçası": "_bib_listed",
                        "Dışa Aktar (Jenni / Zotero)…": "_export", "Atıf ağı ve eksik kaynaklar…": "_citations"},
     }
@@ -13340,6 +13649,13 @@ class LibraryTab:
     def _mark_reviewed(self):
         self.lib.mark_reviewed([item["id"] for item in self.selected_items()])
         self.refresh()
+
+    def _restore(self):
+        win = getattr(self.app, "restore_win", None)
+        if win is not None and win.winfo_exists():
+            win.lift()
+            return
+        self.app.restore_win = RestoreWindow(self.app)
 
     def _prune(self):
         if getattr(self.app, "prune_running", False):
