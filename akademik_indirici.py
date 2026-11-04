@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.53"
+APP_VERSION = "2.54"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -4920,8 +4920,26 @@ def _text_hash(text: str) -> str:
     return hashlib.sha256((text or "").strip().encode("utf-8")).hexdigest()
 
 
+def library_default_keywords_path() -> Path:
+    """Kütüphaneye özel varsayılan liste (ör. LRF'nin kendi listesi): anahtar kelime dosyasının yanında durur."""
+    return keywords_path().with_name("anahtar_kelimeler_varsayilan.txt")
+
+
+def library_default_keywords() -> str:
+    """'Varsayılana Dön'ün döndüğü liste: kütüphanenin kendi varsayılanı, yoksa programın varsayılanı."""
+    try:
+        text = library_default_keywords_path().read_text(encoding="utf-8")
+        if parse_keyword_groups(text):
+            return text
+    except OSError:
+        pass
+    return DEFAULT_KEYWORDS
+
+
 def keywords_customized() -> bool:
     """Kullanıcı kendi listesini mi kullanıyor (varsayılandan farklı ve eski varsayılan değil)?"""
+    if library_default_keywords_path().is_file():
+        return False                      # kütüphanenin kendi varsayılanı var: programın listesi önerilmez
     try:
         text = keywords_path().read_text(encoding="utf-8")
     except OSError:
@@ -4933,7 +4951,7 @@ def load_keywords_text() -> str:
     try:
         text = keywords_path().read_text(encoding="utf-8")
     except OSError:
-        return DEFAULT_KEYWORDS
+        return library_default_keywords()
     if _text_hash(text) in OLD_DEFAULT_KEYWORD_HASHES:     # eski varsayılan → güncel varsayılan
         try:
             save_keywords_text(DEFAULT_KEYWORDS)
@@ -14055,9 +14073,12 @@ class ScanTab:
         self.app.toast("Anahtar kelimeler kaydedildi.")
 
     def _reset_keywords(self):
-        if messagebox.askyesno(APP_NAME, "Anahtar kelimeler varsayılan listeye dönsün mü?", parent=self.parent):
+        own = library_default_keywords_path().is_file()
+        which = f"“{active_profile()}” kütüphanesinin varsayılan listesine" if own else "programın varsayılan listesine"
+        if messagebox.askyesno(APP_NAME, f"Anahtar kelimeler {which} dönsün mü?\n\nKutudaki liste değişir; "
+                                         "'Kaydet'e basana kadar dosyaya yazılmaz.", parent=self.parent):
             self.kw_box.delete("1.0", "end")
-            self.kw_box.insert("1.0", DEFAULT_KEYWORDS)
+            self.kw_box.insert("1.0", library_default_keywords())
             self._count_terms()
 
     # ── tarama ──────────────────────────────────────────────────────────────
