@@ -67,7 +67,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.50"
+APP_VERSION = "2.51"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -6884,7 +6884,7 @@ class LibrarySync:
         rev = uuid.uuid4().hex
         _write_json(folder / SHARED_META_NAME, {"rev": rev, "machine": machine_name(), "items": self.lib.count(),
                                                 "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                                                "version": APP_VERSION})
+                                                "version": APP_VERSION, "name": active_profile()})
         self._mark_synced(rev, change)
         diag(f"ortak kütüphaneye gönderildi ({self.lib.count()} kaynak)")
         return "gonderildi"
@@ -10776,7 +10776,7 @@ def visible_profiles() -> list:
     return [n for n in load_profiles()["list"] if profile_finished(n)]
 
 
-def push_db_to_shared(db_path, shared_folder, items, report=None) -> str:
+def push_db_to_shared(db_path, shared_folder, items, report=None, name="") -> str:
     """Bir kütüphane veritabanını ortak klasöre yazar (LibrarySync.push'un ayarsız hâli). Dönüş: sürüm."""
     import uuid
     shared_folder = Path(shared_folder)
@@ -10786,9 +10786,11 @@ def push_db_to_shared(db_path, shared_folder, items, report=None) -> str:
     copy_with_progress(db_path, tmp, report)
     os.replace(tmp, target)
     rev = uuid.uuid4().hex
-    _write_json(shared_folder / SHARED_META_NAME, {"rev": rev, "machine": machine_name(), "items": items,
-                                                   "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                                                   "version": APP_VERSION})
+    meta = {"rev": rev, "machine": machine_name(), "items": items,
+            "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "version": APP_VERSION}
+    if name:
+        meta["name"] = name
+    _write_json(shared_folder / SHARED_META_NAME, meta)
     return rev
 
 
@@ -10926,7 +10928,8 @@ def split_library(lib, ids, new_name, new_folder, rest_folder, prefix, progress=
     if shared:
         remote = Path(new_folder) / SHARED_DIR_NAME
         rev = push_db_to_shared(new_db, remote, new_count,
-                                lambda d, t: progress(f"Yeni kütüphane Drive'a yazılıyor ({d} / {t} MB)…", d / max(t, 1)))
+                                lambda d, t: progress(f"Yeni kütüphane Drive'a yazılıyor ({d} / {t} MB)…", d / max(t, 1)),
+                                name=new_name)
         new_settings["sync"] = {"synced_change": new_change, "shared_rev": rev,
                                 "last_sync": datetime.now().strftime("%d.%m.%Y %H:%M")}
         stale = remote / "Metin Dizini"                  # karışık kütüphanenin dizin parçaları: baştan kurulacak
@@ -10962,6 +10965,148 @@ def split_library(lib, ids, new_name, new_folder, rest_folder, prefix, progress=
     diag(f"kütüphane ayrıldı: {new_count} kaynak → '{new_name}' ({new_folder}); kalan {result['rest_count']} "
          f"kaynak → {rest_folder}")
     return result
+
+
+# ── Drive'daki kütüphaneleri bulma ve bağlama: bir bilgisayarda kurulan kütüphane öbüründe de görünür.
+#    Bağlamak, kütüphaneyi Drive'daki hâliyle bu bilgisayara almaktır: yeniden numaralama yok, dosya taşıma
+#    yok, Drive'daki kopyanın üzerine yazma yok.
+
+FOUND_LIBS_NAME = "bulunan_kutuphaneler.json"
+
+
+def _norm_folder(folder) -> str:
+    return os.path.normcase(os.path.normpath(str(folder))) if folder else ""
+
+
+def library_folder_of(name) -> str:
+    return _read_json(profile_dir(name) / "ayarlar.json").get("library_folder") or ""
+
+
+def registered_library_folders() -> dict:
+    """Bu bilgisayarda kurulu kütüphanelerin klasörleri: {normalleştirilmiş klasör: ad}"""
+    return {_norm_folder(library_folder_of(n)): n for n in visible_profiles() if library_folder_of(n)}
+
+
+def library_display_name(folder, meta=None) -> str:
+    """Kütüphanenin adı: Drive'daki bilgi dosyasında yazan ad, yoksa klasör adı ('LRF Kütüphanesi' → 'LRF')."""
+    name = re.sub(r"\s+", " ", str((meta or {}).get("name") or "")).strip()
+    if name:
+        return name[:40]
+    base = Path(str(folder)).name
+    short = re.sub(r"[\s_-]*(kütüphanesi|kutuphanesi|kütüphane|kutuphane|library)$", "", base, flags=re.I).strip()
+    return (short or base)[:40]
+
+
+def shared_library_info(folder) -> dict:
+    """Klasörde Drive'a kaydedilmiş bir kütüphane varsa bilgisi, yoksa {}."""
+    shared = Path(str(folder)) / SHARED_DIR_NAME
+    if not (shared / SHARED_DB_NAME).is_file():
+        return {}
+    meta = _read_json(shared / SHARED_META_NAME)
+    return {"folder": os.path.normpath(str(folder)), "name": library_display_name(folder, meta),
+            "named": bool(meta.get("name")), "items": meta.get("items"), "machine": meta.get("machine") or "",
+            "saved_at": meta.get("saved_at") or ""}
+
+
+def found_libs_state() -> dict:
+    data = _read_json(app_base_dir() / FOUND_LIBS_NAME)
+    return {"ignored": list(data.get("ignored") or []), "accepted": list(data.get("accepted") or [])}
+
+
+def remember_found_lib(folder, accepted: bool):
+    state = found_libs_state()
+    key = _norm_folder(folder)
+    for k in ("ignored", "accepted"):
+        state[k] = [f for f in state[k] if f != key]
+    state["accepted" if accepted else "ignored"].append(key)
+    _write_json(app_base_dir() / FOUND_LIBS_NAME, state)
+
+
+def discover_libraries(roots=None, limit=300) -> list:
+    """Bu bilgisayarda kayıtlı olmayan, Drive'a kaydedilmiş kütüphaneler. Kayıtlı kütüphane klasörlerinin
+    yanındaki klasörlere (ör. G:\\Drive'ım içindekiler) bir düzey bakılır; derine inilmez."""
+    registered = registered_library_folders()
+    if roots is None:
+        roots = []
+        for folder in registered:
+            parent = os.path.dirname(folder)
+            if parent and parent not in roots:
+                roots.append(parent)
+    out, seen = [], set(registered)
+    for root in roots:
+        try:
+            entries = sorted(Path(root).iterdir(), key=lambda p: p.name.lower())[:limit]
+        except OSError:
+            continue
+        for p in entries:
+            key = _norm_folder(p)
+            if key in seen:
+                continue
+            try:
+                if not p.is_dir():
+                    continue
+                info = shared_library_info(p)
+            except OSError:
+                continue
+            if info:
+                seen.add(key)
+                out.append(info)
+    taken = {fold(n) for n in visible_profiles()}
+    for info in out:                                  # aynı adlı başka kütüphane varsa klasör adıyla ayır
+        if fold(info["name"]) in taken:
+            info["name"] = f"{info['name']} ({Path(info['folder']).name})"[:40]
+        taken.add(fold(info["name"]))
+    return out
+
+
+def connect_library(name, folder, progress=lambda text, frac=None: None) -> tuple:
+    """Drive'daki kütüphaneyi bu bilgisayara bağlar. Dönüş: (ad, kaynak sayısı)"""
+    folder = os.path.normpath(str(folder))
+    shared = Path(folder) / SHARED_DIR_NAME
+    src = shared / SHARED_DB_NAME
+    if not src.is_file():
+        raise ValueError("Bu klasörde Drive'a kaydedilmiş bir kütüphane bulunamadı.")
+    if _norm_folder(folder) in registered_library_folders():
+        raise ValueError(f"Bu klasör zaten '{registered_library_folders()[_norm_folder(folder)]}' kütüphanesinin.")
+    existing = next((n for n in load_profiles()["list"] if fold(n) == fold(name)), None)
+    if existing and profile_finished(existing):
+        raise ValueError(f"'{existing}' adında kurulu bir kütüphane zaten var; başka bir ad seçin.")
+    name = existing or add_profile(name, _load_settings_raw())
+    pdir = profile_dir(name)
+    settings_file = pdir / "ayarlar.json"
+    settings = _read_json(settings_file)
+    for k in ("sync", "last_report", "seen_report", "retry_next_no", "queue_next_no", "watch_since"):
+        settings.pop(k, None)
+    settings.update(library_folder=folder, shared_library=True, kurulum="yarim", bagli_kurulum=True)
+    _write_json(settings_file, settings)
+    diag(f"kütüphane bağlanıyor: '{name}' ← {folder}")
+    local = pdir / "kutuphane.db"
+    if local.exists():                                # yarım kalmış bir denemenin dosyası: silinmez, kenara
+        local.rename(pdir / f"kutuphane.yarim_{datetime.now():%Y%m%d_%H%M%S}.db")
+    import uuid
+    for attempt in range(2):
+        meta = _read_json(shared / SHARED_META_NAME)
+        tmp = pdir / f"alinan_{uuid.uuid4().hex[:8]}.db"
+        progress("Kütüphane Drive'dan alınıyor…", 0.0)
+        copy_with_progress(src, tmp, lambda d, t: progress(f"Kütüphane Drive'dan alınıyor ({d} / {t} MB)…",
+                                                           d / max(t, 1)))
+        if _read_json(shared / SHARED_META_NAME).get("rev") == meta.get("rev") or attempt:
+            break
+        tmp.unlink(missing_ok=True)                   # kopyalanırken öbür bilgisayar yeni sürüm yazdı: yeniden
+    os.replace(tmp, local)
+    progress("Kütüphane açılıyor…", None)
+    lib = Library(local, root=folder, relative=True)
+    try:
+        count, change = lib.count(), lib.change_no()
+    finally:
+        lib.close()
+    settings = _read_json(settings_file)
+    settings["sync"] = {"synced_change": change, "shared_rev": meta.get("rev"),
+                        "last_sync": datetime.now().strftime("%d.%m.%Y %H:%M")}
+    settings["kurulum"] = "tamam"
+    _write_json(settings_file, settings)
+    diag(f"kütüphane bağlandı: '{name}' ({count} kaynak, {meta.get('machine')} {meta.get('saved_at')})")
+    return name, count
 
 
 class ProgressWindow(ctk.CTkToplevel):
@@ -14941,6 +15086,7 @@ class App(ctk.CTk):
         self.after(25_000, self._warm_twins)
         self.after(8_000, self._repair_names)
         self.after(15_000, self._watch_downloads)
+        self.after(6_000, self._discover_libs)
         self._db_stamp = self._library_stamp()
         self.bind("<FocusIn>", self._on_focus, add="+")
         self.after(5 * 60_000, self._sync_tick)
@@ -15203,6 +15349,12 @@ class App(ctk.CTk):
             row=row, column=0, sticky="ew", padx=18, pady=pady)
 
     NEW_PROFILE = "+ Yeni kütüphane…"
+    CONNECT_PROFILE = "Drive'daki kütüphaneyi bağla…"
+    FOUND_SUFFIX = " · Drive'da"
+
+    def _profile_values(self) -> list:
+        found = [i["name"] + self.FOUND_SUFFIX for i in getattr(self, "found_libs", [])]
+        return visible_profiles() + found + [self.NEW_PROFILE, self.CONNECT_PROFILE]
 
     def run_split(self, ids, name, new_folder, rest_folder, prefix):
         """Kütüphane ayırmayı arka planda yürütür; bu sırada eşitleme, dizin ve izleme bekler."""
@@ -15236,7 +15388,7 @@ class App(ctk.CTk):
         self.folder_var.set(self.settings.get("library_folder") or "")
         self._twins_cache = None
         self.library_tab.refresh()
-        self.profile_menu.configure(values=visible_profiles() + [self.NEW_PROFILE])
+        self.profile_menu.configure(values=self._profile_values())
         if error:
             messagebox.showerror(APP_NAME, f"Ayırma tamamlanamadı:\n{error}\n\nAyrıntı tanılama kaydında. Hiçbir "
                                            "kaynak silinmedi.", parent=self)
@@ -15272,6 +15424,13 @@ class App(ctk.CTk):
         self.profile_menu.set(current)
         if choice == self.NEW_PROFILE:
             return self._new_profile()
+        if choice == self.CONNECT_PROFILE:
+            return self._connect_dialog()
+        if choice.endswith(self.FOUND_SUFFIX):
+            info = next((i for i in getattr(self, "found_libs", []) if i["name"] + self.FOUND_SUFFIX == choice), None)
+            if info:
+                return self._connect_library(info["name"], info["folder"], ask=True, info=info)
+            return
         if choice != current:
             self.switch_library(choice)
 
@@ -15308,7 +15467,20 @@ class App(ctk.CTk):
                                              "seçin.", parent=self)
             return
         if (Path(folder) / SHARED_DIR_NAME / SHARED_DB_NAME).is_file():
-            return self._read_existing(name, folder)
+            info = shared_library_info(folder)
+            choice = choice_dialog(
+                self, f"'{name}' kütüphanesi",
+                f"Bu klasörde Drive'a kaydedilmiş hazır bir kütüphane var ({info.get('items') or '?'} kaynak"
+                + (f", son kaydeden: {info['machine']}" if info.get("machine") else "") + ").\n\n"
+                "Başka bir bilgisayarda kurduğunuz kütüphaneyse 'Olduğu gibi bağla'yı seçin: kaynaklar, numaralar, "
+                "etiketler ve kartlar aynen gelir, Drive'daki kopyaya dokunulmaz.\n\n'İçinden ayıkla' yalnızca "
+                "klasördeki veri iki kütüphanenin karışımıysa gerekir.",
+                ["Olduğu gibi bağla (önerilen)", "İçinden ayıklayarak kur"])
+            if choice == 0:
+                return self._connect_library(name, folder)
+            if choice == 1:
+                return self._read_existing(name, folder)
+            return
         try:
             add_profile(name, dict(_load_settings_raw(), library_folder=folder))
         except (OSError, ValueError) as exc:
@@ -15322,11 +15494,126 @@ class App(ctk.CTk):
             (profile_dir(name) / "anahtar_kelimeler.txt").write_text(
                 DEFAULT_KEYWORDS.split("\n\n[", 1)[0] + "\n\n[İlk konu grubu]\n# bu satırın yerine arama terimlerinizi "
                 "yazın\n", encoding="utf-8")
-        self.profile_menu.configure(values=visible_profiles() + [self.NEW_PROFILE])
+        self.profile_menu.configure(values=self._profile_values())
         if messagebox.askyesno(APP_NAME, f"'{name}' kütüphanesi oluşturuldu. Şimdi ona geçilsin mi?\n\n"
                                          "Tarama sekmesinden anahtar kelimelerini yazabilir, Drive'da "
                                          "tutmak için 'Ortak kütüphane' kutusunu işaretleyebilirsiniz.", parent=self):
             self.switch_library(name)
+
+    # ── Drive'daki kütüphaneler ────────────────────────────────────────────────
+    def _discover_libs(self):
+        if getattr(self, "job_running", False) or getattr(self, "maintenance", False):
+            self.after(60_000, self._discover_libs)
+            return
+        events = self.events
+
+        def work():
+            try:
+                events.put(("libs_found", discover_libraries()))
+            except Exception:
+                diag_exception("Drive'daki kütüphaneleri arama")
+        threading.Thread(target=work, name="kutuphane-ara", daemon=True).start()
+
+    def _libs_found(self, found):
+        state = found_libs_state()
+        shown, announce, asked = [], [], 0
+        for info in found:
+            key = _norm_folder(info["folder"])
+            if key in state["ignored"]:
+                continue
+            if key in state["accepted"]:
+                shown.append(info)
+            elif info["named"]:
+                shown.append(info)
+                announce.append(info["name"])
+                remember_found_lib(info["folder"], True)
+            elif asked < 3:
+                asked += 1
+                ok = messagebox.askyesno(
+                    APP_NAME, f"Drive'da “{Path(info['folder']).name}” klasöründe bir kütüphane bulundu "
+                              f"({info.get('items') or '?'} kaynak"
+                              + (f", son kaydeden: {info['machine']}" if info.get("machine") else "") + ").\n\n"
+                              f"Kütüphane menüsünde “{info['name']}” adıyla gösterilsin mi? Seçtiğinizde bu "
+                              "bilgisayara bağlanır; Drive'daki kopyaya dokunulmaz.", parent=self)
+                remember_found_lib(info["folder"], ok)
+                if ok:
+                    shown.append(info)
+        self.found_libs = shown
+        self.profile_menu.configure(values=self._profile_values())
+        if announce:
+            self.toast(f"Drive'da {', '.join(announce)} kütüphanesi bulundu; üstteki Kütüphane menüsünden "
+                       "seçebilirsiniz.")
+
+    def _connect_dialog(self):
+        if self._job_busy():
+            return
+        folder = filedialog.askdirectory(parent=self, title="Drive'daki kütüphanenin klasörünü seçin "
+                                                             "(içinde '_Kütüphane Verisi' olan klasör)")
+        if not folder:
+            return
+        folder = os.path.normpath(folder)
+        info = shared_library_info(folder)
+        if not info:
+            messagebox.showinfo(APP_NAME, "Bu klasörde Drive'a kaydedilmiş bir kütüphane yok ('_Kütüphane Verisi' "
+                                          "bulunamadı).\n\nYeni bir kütüphane kurmak için '+ Yeni kütüphane…'yi "
+                                          "kullanın.", parent=self)
+            return
+        owner = registered_library_folders().get(_norm_folder(folder))
+        if owner:
+            messagebox.showinfo(APP_NAME, f"Bu klasör zaten '{owner}' kütüphanesi olarak bağlı.", parent=self)
+            return
+        name = info["name"]
+        if fold(name) in {fold(n) for n in visible_profiles()}:
+            dialog = ctk.CTkInputDialog(title="Kütüphanenin adı",
+                                        text=f"'{name}' adında bir kütüphane zaten var. Bu kütüphaneye bir ad verin:")
+            set_window_icon(dialog, delay=260)
+            name = (dialog.get_input() or "").strip()
+            if not name:
+                return
+        self._connect_library(name, folder, ask=True, info=info)
+
+    def _connect_library(self, name, folder, ask=False, info=None):
+        if self._job_busy():
+            return
+        busy = self._busy_reason()
+        if busy:
+            messagebox.showinfo(APP_NAME, f"Şu an {busy} sürüyor. Bitince yeniden deneyin.", parent=self)
+            return
+        info = info or shared_library_info(folder)
+        if ask and not messagebox.askyesno(
+                APP_NAME, f"“{name}” kütüphanesi bu bilgisayara bağlansın mı?\n\nKlasör: {folder}\n"
+                          f"Kaynak: {info.get('items') or '?'}"
+                          + (f" · son kaydeden: {info['machine']}" if info.get("machine") else "") + "\n\n"
+                          "Kütüphane Drive'daki hâliyle alınır: numaralar, etiketler, kartlar ve anahtar kelimeler "
+                          "aynen gelir. Drive'daki kopya değişmez, hiçbir dosya taşınmaz.", parent=self):
+            return
+        self._job_start(f"“{name}” kütüphanesi bağlanıyor")
+        events = self.events
+
+        def work():
+            try:
+                real, count = connect_library(name, folder,
+                                              lambda text, frac=None: events.put(("split_progress", text, frac)))
+                events.put(("lib_connected", real, folder, count, ""))
+            except Exception as exc:
+                diag_exception("kütüphane bağlama")
+                events.put(("lib_connected", name, folder, 0, describe_error(exc)))
+        threading.Thread(target=work, name="kutuphane-bagla", daemon=True).start()
+
+    def _lib_connected(self, name, folder, count, error):
+        self._job_end()
+        self.found_libs = [i for i in getattr(self, "found_libs", []) if _norm_folder(i["folder"]) != _norm_folder(folder)]
+        self.profile_menu.configure(values=self._profile_values())
+        if error:
+            messagebox.showerror(APP_NAME, f"Kütüphane bağlanamadı:\n{error}\n\nDrive'daki kopyaya dokunulmadı. "
+                                           "Drive'a ulaşılabildiğini kontrol edip yeniden deneyin.", parent=self)
+            return
+        messagebox.showinfo(APP_NAME, f"“{name}” kütüphanesi bağlandı: {count} kaynak. Numaralar, etiketler, kartlar "
+                                      "ve anahtar kelimeler öbür bilgisayardakiyle aynı; bundan sonra iki bilgisayar "
+                                      "Drive üzerinden eşitlenir.\n\nŞimdi bu kütüphaneye geçiliyor.\n\nClaude'da da "
+                                      f"görmek için “{name}” açıkken Ayarlar → 'Claude'a Bağla'ya bir kez basın "
+                                      "(her bilgisayarda ayrı yapılır).", parent=self)
+        self.switch_library(name)
 
     def _job_busy(self) -> bool:
         win = getattr(self, "job_window", None)
@@ -15430,7 +15717,7 @@ class App(ctk.CTk):
     def _profile_imported(self, name, res, error):
         self._job_end()
         self.library_tab.refresh()
-        self.profile_menu.configure(values=visible_profiles() + [self.NEW_PROFILE])
+        self.profile_menu.configure(values=self._profile_values())
         if error:
             messagebox.showerror(APP_NAME, f"Kütüphane kurulamadı. Takıldığı aşama ve neden:\n{error}\n\nHiçbir dosya "
                                            "silinmedi. Aynı adımları yeniden izlerseniz yarım kalan kurulum baştan "
@@ -15458,7 +15745,7 @@ class App(ctk.CTk):
         lib_box.grid(row=0, column=2, rowspan=2, sticky="e", padx=(0, 18))
         ctk.CTkLabel(lib_box, text="Kütüphane:", font=self.font_small, text_color=MUTED).pack(side="left", padx=(0, 6))
         self.profile_menu = ctk.CTkOptionMenu(lib_box, width=150, dynamic_resizing=False,
-                                              values=visible_profiles() + [self.NEW_PROFILE],
+                                              values=self._profile_values(),
                                               command=self._profile_chosen)
         self.profile_menu.set(active_profile())
         self.profile_menu.pack(side="left")
@@ -16088,6 +16375,10 @@ class App(ctk.CTk):
             self._profile_scanned(*message[1:])
         elif kind == "profile_imported":
             self._profile_imported(*message[1:])
+        elif kind == "libs_found":
+            self._libs_found(message[1])
+        elif kind == "lib_connected":
+            self._lib_connected(*message[1:])
         elif kind == "split_done":
             self._split_done(*message[1:])
         elif kind == "names_fixed":
