@@ -68,7 +68,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.55"
+APP_VERSION = "2.56"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -2273,21 +2273,339 @@ def book_record_by_isbn(session, isbn: str) -> dict:
     except (requests.RequestException, ValueError, AttributeError):
         pass
     try:
-        r = session.get(GOOGLE_BOOKS_API, params={"q": f"isbn:{isbn}"},
-                        timeout=API_TIMEOUT)
-        items = r.json().get("items") or [] if r.ok else []
+        items = google_books_get(session, "", {"q": f"isbn:{isbn}"}).get("items") or []
         if items:
-            v = items[0].get("volumeInfo", {})
-            title = v.get("title", "")
-            if v.get("subtitle"):
-                title += ": " + v["subtitle"]
-            year = re.match(r"\d{4}", v.get("publishedDate", "") or "")
-            return {"type": "book", "title": title, "authors": text_to_people("; ".join(v.get("authors") or [])),
-                    "year": year.group(0) if year else "", "publisher": v.get("publisher", ""),
-                    "language": (v.get("language") or "")[:2]}
+            rec = google_volume_record(items[0])
+            return {k: v for k, v in rec.items() if not k.startswith("_")}
+    except GoogleBooksLimit as exc:
+        diag(f"ISBN {isbn}: {exc}", throttle=True)
     except (requests.RequestException, ValueError, AttributeError):
         pass
     return {}
+
+
+# ── Kitap künyesi ve içerik bağlamı: yalnızca açık veri servislerinden (Google Books API, Crossref).
+#    Google Books önizleme sayfaları okunmaz (Google otomatik okumaya izin vermez); yalnızca künye, konu
+#    kategorileri, yayınevinin tanıtım metni ve Crossref'teki bölüm listesi (içindekiler) alınır.
+
+GOOGLE_BOOKS_KEY_PAGE = "https://developers.google.com/books/docs/v1/using#APIKey"
+BOOK_INFO_START, BOOK_INFO_END = "── Kitap bilgisi ──", "── /Kitap bilgisi ──"
+PLACEHOLDER_TITLE_RE = re.compile(r"kitab[ıi] \(başlığı düzenleyin\)\s*$")
+_BOOK_TYPES = ("book", "monograph", "edited-book", "reference-book", "book-set")
+
+
+class GoogleBooksLimit(Exception):
+    """Google Books günlük sınırı (anahtarsız kullanımda sık olur)."""
+
+
+def google_books_get(session, path="", params=None) -> dict:
+    """Google Books API isteği; yanıt denetlenir, sınıra takılınca bir kez bekleyip yeniden dener."""
+    params = dict(params or {})
+    try:
+        key = (load_settings().get("google_books_api_key") or "").strip()
+    except Exception:
+        key = ""
+    if key:
+        params["key"] = key
+    for attempt in range(2):
+        r = session.get(GOOGLE_BOOKS_API + path, params=params, timeout=API_TIMEOUT)
+        limited = r.status_code in (429, 503) or (r.status_code == 403 and re.search(
+            r"(?i)rate|quota|limit", r.text or ""))
+        if limited:
+            if attempt == 0:
+                time.sleep(4)
+                continue
+            raise GoogleBooksLimit("Google Books günlük sorgu sınırına takıldı")
+        if r.status_code == 404:
+            return {}
+        r.raise_for_status()
+        return r.json()
+    return {}
+
+
+def google_volume_id(url) -> str:
+    if not url:
+        return ""
+    host = (urlparse(url).hostname or "").lower()
+    if not ("books.google" in host or ("google." in host and "/books" in url)):
+        return ""
+    vid = parse_qs(urlparse(url).query).get("id", [""])[0]
+    if not vid:
+        m = re.search(r"/books/edition/[^/]+/([\w-]+)", url)
+        vid = m.group(1) if m else ""
+    return vid
+
+
+def google_volume_record(volume: dict) -> dict:
+    """Google Books cildinden künye + konu kategorileri + tanıtım metni."""
+    info = (volume or {}).get("volumeInfo") or {}
+    if not info.get("title"):
+        return {}
+    title = clean_text(info.get("title", "")) + (": " + clean_text(info["subtitle"]) if info.get("subtitle") else "")
+    year = re.match(r"\d{4}", info.get("publishedDate", "") or "")
+    isbns = []
+    for ident in info.get("industryIdentifiers") or []:
+        code = find_isbn(str(ident.get("identifier") or ""))
+        if code and code not in isbns:
+            isbns.append(code)
+    cats = []
+    for c in info.get("categories") or []:
+        for part in re.split(r"\s*/\s*", str(c)):
+            if part and part.lower() not in ("general",) and part not in cats:
+                cats.append(part)
+    return {"type": "book", "title": title, "authors": text_to_people("; ".join(info.get("authors") or [])),
+            "year": year.group(0) if year else "", "publisher": clean_text(info.get("publisher", "")),
+            "language": (info.get("language") or "")[:2], "keywords": join_keywords(cats) if cats else "",
+            "_isbns": isbns, "_description": clean_text(info.get("description", "")),
+            "_pages": info.get("pageCount") or ""}
+
+
+def crossref_book_by_isbns(session, isbns) -> dict:
+    """Kitabın Crossref kaydı (DOI'siyle) ISBN'lerinden biriyle."""
+    for isbn in isbns:
+        try:
+            r = session.get(CROSSREF_API.rstrip("/"), params={"filter": f"isbn:{isbn}", "rows": 5},
+                            timeout=API_TIMEOUT, headers={"Accept": "application/json"})
+            if not r.ok:
+                continue
+            for msg in r.json().get("message", {}).get("items", []):
+                if msg.get("type") in _BOOK_TYPES:
+                    rec = record_from_crossref(msg)
+                    if rec.get("title"):
+                        rec["type"] = "book"
+                        rec["_subjects"] = msg.get("subject") or []
+                        return rec
+        except (requests.RequestException, ValueError, AttributeError):
+            continue
+    return {}
+
+
+def crossref_book_by_title(session, title, authors) -> dict:
+    """ISBN'le bulunamayan kitabı başlık + yazarla arar; başlık birebir uymazsa kabul etmez."""
+    if not title or len(title) < 8:
+        return {}
+    family = fold(((authors or [{}])[0] or {}).get("family", "")) if authors else ""
+    try:
+        r = session.get(CROSSREF_API.rstrip("/"), params={
+            "query.bibliographic": f"{title} {family}".strip(), "rows": 5,
+            "filter": ",".join(f"type:{t}" for t in _BOOK_TYPES[:4])},
+            timeout=API_TIMEOUT, headers={"Accept": "application/json"})
+        items = r.json().get("message", {}).get("items", []) if r.ok else []
+    except (requests.RequestException, ValueError, AttributeError):
+        return {}
+    for msg in items:
+        rec = record_from_crossref(msg)
+        if not same_title(title, rec.get("title", "")):
+            continue
+        fams = {fold(p.get("family", "")) for p in (rec.get("authors") or []) + (rec.get("editors") or [])}
+        if family and fams and family not in fams:
+            continue
+        rec["type"] = "book"
+        rec["_subjects"] = msg.get("subject") or []
+        return rec
+    return {}
+
+
+def crossref_chapters(session, isbns, book_doi="") -> list:
+    """Crossref'te kitabın bölümleri (içindekiler): [(başlık, sayfa, doi, yazarlar)] sayfa sırasıyla."""
+    chapters, seen = [], set()
+    for isbn in isbns[:3]:
+        try:
+            r = session.get(CROSSREF_API.rstrip("/"), params={"filter": f"isbn:{isbn},type:book-chapter",
+                                                              "rows": 300},
+                            timeout=API_TIMEOUT, headers={"Accept": "application/json"})
+            items = r.json().get("message", {}).get("items", []) if r.ok else []
+        except (requests.RequestException, ValueError, AttributeError):
+            continue
+        for msg in items:
+            doi = (msg.get("DOI") or "").lower()
+            title = clean_text((msg.get("title") or [""])[0])
+            if not title or doi in seen:
+                continue
+            seen.add(doi)
+            authors = ", ".join(clean_text(a.get("family") or a.get("name") or "") for a in msg.get("author") or [])
+            chapters.append((title, clean_text(msg.get("page", "")), doi, authors))
+        if chapters:
+            break
+
+    def first_page(ch):
+        m = re.match(r"\d+", ch[1] or "")
+        return (0, int(m.group(0))) if m else (1, ch[0].lower())
+    return sorted(chapters, key=first_page)
+
+
+def book_info_block(description="", subjects=(), chapters=(), pages="", sources=()) -> str:
+    lines = [BOOK_INFO_START,
+             f"Kaynak: {', '.join(sources) or 'açık veri'} · {datetime.now():%d.%m.%Y} "
+             "(yalnızca künye, tanıtım ve içindekiler; kitabın metni okunmadı)"]
+    if pages:
+        lines.append(f"Sayfa sayısı: {pages}")
+    if subjects:
+        lines.append("Konular: " + "; ".join(subjects))
+    if description:
+        lines.append("Tanıtım: " + description[:2500])
+    if chapters:
+        lines.append("İçindekiler:")
+        for title, page, doi, authors in chapters:
+            lines.append(f"• {title}" + (f" — {authors}" if authors else "") + (f" (s. {page})" if page else "")
+                         + (f" · doi:{doi}" if doi else ""))
+    lines.append(BOOK_INFO_END)
+    return "\n".join(lines)
+
+
+def replace_book_block(notes, block) -> str:
+    notes = notes or ""
+    pattern = re.compile(re.escape(BOOK_INFO_START) + r".*?" + re.escape(BOOK_INFO_END), re.S)
+    if pattern.search(notes):
+        return pattern.sub(lambda _m: block, notes).strip()
+    return (notes.rstrip() + "\n\n" + block).strip() if notes.strip() else block
+
+
+def isbns_in_notes(notes) -> list:
+    found = []
+    for m in re.finditer(r"ISBN[^:\n]*:\s*([0-9Xx\-\s,;]+)", notes or ""):
+        for code in find_isbns(m.group(1)):
+            if code not in found:
+                found.append(code)
+    return found
+
+
+def enrich_book(session, item, url="", isbn_hint="") -> dict:
+    """Kitabın künyesini, ISBN'lerini, DOI'sini, konularını, tanıtımını ve içindekilerini açık servislerden toplar.
+    Dönüş: {"record", "isbns", "block", "text", "sources", "limited"}"""
+    url = url or (item or {}).get("url") or ""
+    isbns = []
+    for code in ([isbn_hint] if isbn_hint else []) + isbns_in_notes((item or {}).get("notes")):
+        code = find_isbn(code) if code else ""
+        if code and code not in isbns:
+            isbns.append(code)
+    sources, limited = [], ""
+    grec = {}
+    try:
+        vid = google_volume_id(url)
+        if vid:
+            grec = google_volume_record(google_books_get(session, "/" + quote(vid)))
+        if not grec and isbns:
+            data = google_books_get(session, "", {"q": f"isbn:{isbns[0]}"})
+            items = data.get("items") or []
+            grec = google_volume_record(items[0]) if items else {}
+    except GoogleBooksLimit as exc:
+        limited = str(exc)
+    except (requests.RequestException, ValueError, AttributeError) as exc:
+        diag(f"Google Books: {describe_error(exc)}", throttle=True)
+    if grec:
+        sources.append("Google Books")
+        for code in grec.get("_isbns") or []:
+            if code not in isbns:
+                isbns.append(code)
+    cref = crossref_book_by_isbns(session, isbns) if isbns else {}
+    title = (grec or {}).get("title") or (item or {}).get("title") or ""
+    if PLACEHOLDER_TITLE_RE.search(title):
+        title = ""
+    if not cref.get("doi") and title:
+        cref = crossref_book_by_title(session, title, (grec or {}).get("authors") or (item or {}).get("authors")) or cref
+    if cref:
+        sources.append("Crossref")
+    chapters = crossref_chapters(session, isbns, cref.get("doi", "")) if isbns else []
+    record = merge_records(cref, grec) if cref else merge_records(grec, {}) if grec else {}
+    subjects = split_keywords("; ".join([grec.get("keywords", "") if grec else "", "; ".join(cref.get("_subjects") or [])]))
+    if record:
+        record["type"] = "book"
+        record["keywords"] = join_keywords(subjects) if subjects else record.get("keywords", "")
+    description = (grec or {}).get("_description", "")
+    block = book_info_block(description, subjects, chapters, (grec or {}).get("_pages", ""), sources) \
+        if (description or subjects or chapters) else ""
+    text = " ".join([record.get("title", "") if record else "", description,
+                     " ".join(c[0] for c in chapters)]).strip()
+    return {"record": record, "isbns": isbns, "block": block, "text": text, "sources": sources,
+            "limited": limited, "chapters": len(chapters)}
+
+
+def apply_book_enrichment(library, item_id, info) -> list:
+    """Toplanan bilgiyi kayda işler: yalnızca boş alanlar dolar (yer tutucu başlık da boş sayılır), anahtar
+    kelimeler birleşir, notlardaki 'Kitap bilgisi' bölümü yenilenir. Dönüş: değişen alanlar."""
+    old = library.get(item_id)
+    if not old:
+        return []
+    rec = info.get("record") or {}
+    updates = {}
+    for k in RECORD_FIELDS:
+        if k in ("keywords", "url", "type"):
+            continue
+        v = rec.get(k)
+        if not v:
+            continue
+        cur = old.get(k)
+        if not cur or (k == "title" and PLACEHOLDER_TITLE_RE.search(str(cur))):
+            updates[k] = v
+    if rec.get("keywords"):
+        merged = join_keywords([old.get("keywords") or "", rec["keywords"]])
+        if merged != (old.get("keywords") or ""):
+            updates["keywords"] = merged
+    if old.get("type") in ("other", "", None) and rec.get("type"):
+        updates["type"] = rec["type"]
+    notes = old.get("notes") or ""
+    have = set(isbns_in_notes(notes))
+    extra = [c for c in info.get("isbns") or [] if c not in have]
+    if extra:
+        notes = (notes.rstrip() + "\n" if notes.strip() else "") + "ISBN: " + ", ".join(extra)
+    if info.get("block"):
+        notes = replace_book_block(notes, info["block"])
+    if notes != (old.get("notes") or ""):
+        updates["notes"] = notes
+    if updates:
+        library.update(item_id, updates)
+    has_file = bool(old.get("file_path")) and os.path.isfile(old["file_path"])
+    if info.get("text") and not has_file:
+        current = library.get_fulltext(item_id)
+        if not current or len(current) < 4000:          # açık metin/PDF yoksa tanıtım ve içindekiler aranabilsin
+            library.set_fulltext(item_id, info["text"])
+    return sorted(updates)
+
+
+def book_needs_enrichment(item) -> bool:
+    """Toplu tamamlamaya girecek kitaplar: bağlantısı ya da ISBN'i olup künyesi ya da içerik bilgisi eksik olanlar."""
+    if (item.get("type") or "") != "book":
+        return False
+    if not (google_volume_id(item.get("url")) or isbns_in_notes(item.get("notes"))):
+        return False
+    if PLACEHOLDER_TITLE_RE.search(item.get("title") or ""):
+        return True
+    missing = [f for f in ("authors", "year", "publisher", "doi", "keywords") if not item.get(f)]
+    return bool(missing) or BOOK_INFO_START not in (item.get("notes") or "")
+
+
+class BookEnrichWorker(threading.Thread):
+    """Seçilen kitapların künyesini ve içerik bilgisini sırayla tamamlar.
+    Mesajlar: ("bookfix", sıra, toplam, başlık) · ("bookfix_done", güncellenen, denenen, sınır_mesajı)"""
+
+    def __init__(self, library, items, events):
+        super().__init__(daemon=True, name="kitap-kunyesi")
+        self.library, self.items, self.events = library, items, events
+        self.cancel = threading.Event()
+
+    def run(self):
+        updated, tried, limited = [], 0, ""
+        session = make_session()
+        try:
+            for n, item in enumerate(self.items):
+                if self.cancel.is_set():
+                    break
+                self.events.put(("bookfix", n, len(self.items), item.get("title") or ""))
+                tried += 1
+                try:
+                    info = enrich_book(session, self.library.get(item["id"]) or item)
+                    if apply_book_enrichment(self.library, item["id"], info):
+                        updated.append(item.get("no") or item["id"])
+                    if info.get("limited"):
+                        limited = info["limited"]
+                        break
+                except Exception:
+                    diag_exception(f"kitap künyesi: {item.get('title', '')[:60]}")
+                time.sleep(1.0)
+        finally:
+            session.close()
+            self.events.put(("bookfix_done", updated, tried, limited))
 
 
 # ── Kitap boyutundaki PDF'ler: bildiri kitapları ve ISBN'li kitaplar ───────────────────────
@@ -2582,16 +2900,19 @@ def online_book_info(session, url) -> dict:
                 out["files"].sort(key=lambda u: not u.lower().endswith(".pdf"))
             return out
         if "books.google" in host or ("google." in host and "/books" in url):
-            vid = parse_qs(urlparse(url).query).get("id", [""])[0] or \
-                (re.search(r"/books/edition/[^/]+/([\w-]+)", url) or [None, ""])[1]
+            vid = google_volume_id(url)
             if vid:
-                v = session.get(GOOGLE_BOOKS_API + "/" + quote(vid), timeout=API_TIMEOUT).json()
-                info, access = v.get("volumeInfo", {}), v.get("accessInfo", {})
-                title = info.get("title", "") + (": " + info["subtitle"] if info.get("subtitle") else "")
-                out["record"].update(title=title, authors=text_to_people("; ".join(info.get("authors") or [])),
-                                     year=str(info.get("publishedDate") or "")[:4], publisher=info.get("publisher", ""),
-                                     language=(info.get("language") or "")[:2])
-                out["isbn"] = find_isbn(" ".join(i.get("identifier", "") for i in info.get("industryIdentifiers") or []))
+                try:
+                    v = google_books_get(session, "/" + quote(vid))
+                except GoogleBooksLimit as exc:
+                    out["error"] = str(exc)
+                    out["access"] = "restricted"
+                    out["preview"] = "önizleme"
+                    return out
+                access = v.get("accessInfo", {})
+                grec = google_volume_record(v)
+                out["record"].update({k: val for k, val in grec.items() if not k.startswith("_") and val})
+                out["isbn"] = (grec.get("_isbns") or [""])[0]
                 full = access.get("viewability") == "ALL_PAGES" and access.get("publicDomain")
                 out["access"] = "open" if full else "restricted"
                 out["preview"] = {"PARTIAL": "sınırlı önizleme", "ALL_PAGES": "tam görünüm",
@@ -2694,8 +3015,17 @@ def add_online_book(library, session, url, tags=(), library_folder=None, auto_ta
     else:
         item_id, _ = library.add(rec, tags=list(tags) + auto_group_tags(rec, info["text"][:20_000], auto_tags),
                                  source="bağlantı")
+    if rec.get("type") == "book" and (google_volume_id(url) or info["isbn"]):
+        try:                                       # künye, ISBN'ler, DOI, konular, tanıtım ve içindekiler
+            extra = enrich_book(session, library.get(item_id), url, info["isbn"])
+            apply_book_enrichment(library, item_id, extra)
+            if extra.get("limited") or info.get("error"):
+                diag(f"kitap bağlantısı {url}: {extra.get('limited') or info.get('error')}")
+        except Exception as exc:
+            diag(f"kitap bilgisi ({url}): {describe_error(exc)}")
     item = library.get(item_id)
-    notes = [n for n in [item.get("notes"), f"ISBN: {info['isbn']}" if info["isbn"] else ""] if n]
+    notes = [n for n in [item.get("notes"), f"ISBN: {info['isbn']}" if info["isbn"] and info["isbn"] not in
+                         isbns_in_notes(item.get("notes")) else ""] if n]
     attached = False
     if not (item["file_path"] and os.path.exists(item["file_path"])) and info["files"] and library_folder:
         for link in info["files"]:
@@ -2735,6 +3065,8 @@ def add_online_book(library, session, url, tags=(), library_folder=None, auto_ta
         joined = "\n".join(dict.fromkeys(n for n in notes if n))
         if joined != (item.get("notes") or ""):
             library.update(item_id, {"notes": joined})
+    if info.get("error") and PLACEHOLDER_TITLE_RE.search(library.get(item_id).get("title") or ""):
+        return item_id, created, "künye alınamadı: " + info["error"]
     return item_id, created, ("dosya" if attached else "metin" if info["text"] else info["access"])
 
 
@@ -12920,6 +13252,7 @@ class LibraryTab:
         "PDF ▾": {"PDF'sizleri Sırayla Aç": "_open_queue", "İndirilenler'i yeniden eşleştir…": "_rematch",
                   "PDF işaretlemelerini kartlara aktar…": "_import_highlights"},
         "Düzenle ▾": {"Otomatik Etiketle": "_autotag", "Eksik Künyeleri Tamamla": "_complete",
+                      "Kitapların künye ve içindekilerini tamamla…": "_bookfix",
                       "Künyeyi PDF'ten yeniden çıkar…": "_reextract", "Mükerrer kayıtları bul…": "_duplicates",
                       "Anahtar kelimelere uymayanları ayıkla…": "_prune", "Ayıklananları geri getir…": "_restore",
                       "Yenileri İncelendi Say": "_mark_all_reviewed"},
@@ -13090,7 +13423,8 @@ class LibraryTab:
         self.more_menu.grid(row=1, column=1, columnspan=2, sticky="ew", padx=2, pady=2)
 
     def _more_values(self):
-        return (["Klasörde Göster", "PDF Bağla / Değiştir…", "Künyeyi DOI'den Al", "VETİS (kampüs dışı)",
+        return (["Klasörde Göster", "PDF Bağla / Değiştir…", "Künyeyi DOI'den Al", "Kitap künyesini yenile (bağlantı/ISBN)",
+                 "VETİS (kampüs dışı)",
                  "Okurken Not Al"] + [f"Başka yerde ara: {site}" for site in SEARCH_SITES] + ["Kütüphaneden Çıkar"])
 
     def _more_action(self, choice):
@@ -13101,6 +13435,15 @@ class LibraryTab:
         if choice.startswith("Başka yerde ara: "):
             if self.current:
                 self._search_elsewhere(choice.split(": ", 1)[1])
+            return
+        if choice.startswith("Kitap künyesini yenile"):
+            item = self.lib.get(self.current) if self.current else None
+            if not item:
+                self.app.toast("Önce bir kaynak seçin.")
+            elif not (google_volume_id(item.get("url")) or isbns_in_notes(item.get("notes"))):
+                self.app.toast("Bu kaydın Google Books bağlantısı ya da ISBN'i yok; notlara 'ISBN: …' yazıp yeniden deneyin.")
+            else:
+                self._start_bookfix([item])
             return
         btn = buttons.get(choice)
         if btn is None:
@@ -13649,6 +13992,28 @@ class LibraryTab:
     def _mark_reviewed(self):
         self.lib.mark_reviewed([item["id"] for item in self.selected_items()])
         self.refresh()
+
+    def _bookfix(self):
+        chosen = [i for i in self.selected_items() if (i.get("type") or "") == "book"]
+        items = chosen if len(chosen) > 1 else [i for i in self.lib.all_items() if book_needs_enrichment(i)]
+        if not items:
+            messagebox.showinfo(APP_NAME, "Tamamlanacak kitap yok: bağlantısı (Google Books) ya da ISBN'i olup künyesi "
+                                          "veya içerik bilgisi eksik kitap bulunamadı.", parent=self.parent)
+            return
+        if not messagebox.askyesno(
+                APP_NAME, f"{len(items)} kitabın künyesi (yazar, yıl, yayınevi, ISBN, DOI), konuları, tanıtımı ve "
+                          "içindekileri açık veri servislerinden (Google Books, Crossref) tamamlansın mı?\n\nYalnızca "
+                          "boş alanlar dolar; yazdıklarınız değişmez. Kitapların sayfaları okunmaz.", parent=self.parent):
+            return
+        self._start_bookfix(items)
+
+    def _start_bookfix(self, items):
+        worker = getattr(self.app, "bookfix_worker", None)
+        if worker and worker.is_alive():
+            self.app.toast("Kitap künyeleri zaten tamamlanıyor.")
+            return
+        self.app.bookfix_worker = BookEnrichWorker(self.lib, items, self.app.events)
+        self.app.bookfix_worker.start()
 
     def _restore(self):
         win = getattr(self.app, "restore_win", None)
@@ -14251,6 +14616,18 @@ class ScanTab:
             self.oa_key.bind(ev, lambda _e: self.app.save_all_settings())
         ctk.CTkButton(oak, text="Al", width=40, height=26, fg_color="transparent", border_width=1, text_color=TEXT,
                       command=lambda: webbrowser.open_new_tab(OPENALEX_KEY_PAGE)).pack(side="left")
+        gbk = ctk.CTkFrame(side, fg_color="transparent")
+        gbk.grid(row=r, column=0, sticky="w", padx=10, pady=(0, 3)); r += 1
+        ctk.CTkLabel(gbk, text="Google Books anahtarı (kitap künyeleri için, isteğe bağlı):", text_color=MUTED,
+                     font=ctk.CTkFont(size=12)).pack(side="left")
+        self.gb_key = ctk.CTkEntry(gbk, width=130, height=26, show="•", placeholder_text="isteğe bağlı")
+        self.gb_key.pack(side="left", padx=6)
+        if s.get("google_books_api_key"):
+            self.gb_key.insert(0, s["google_books_api_key"])
+        for ev in ("<FocusOut>", "<Return>"):
+            self.gb_key.bind(ev, lambda _e: self.app.save_all_settings())
+        ctk.CTkButton(gbk, text="Al", width=40, height=26, fg_color="transparent", border_width=1, text_color=TEXT,
+                      command=lambda: webbrowser.open_new_tab(GOOGLE_BOOKS_KEY_PAGE)).pack(side="left")
         self.src_eric = ctk.BooleanVar(value=s.get("scan_eric", True))
         ctk.CTkCheckBox(side, text="ERIC (eğitim araştırmaları; çoğunun PDF'i açık)", variable=self.src_eric,
                         command=self.app.save_all_settings).grid(row=r, column=0, sticky="w", padx=10, pady=3); r += 1
@@ -16598,6 +16975,7 @@ class App(ctk.CTk):
                 "scan_dergipark": scan.src_dp.get(), "scan_crossref": scan.src_cr.get(),
                 "scan_openalex": scan.src_oa.get(), "scan_eric": scan.src_eric.get(),
                 "openalex_api_key": scan.oa_key.get().strip(),
+                "google_books_api_key": scan.gb_key.get().strip(),
                 "scan_yok": scan.src_yok.get(), "yok_skip_closed": scan.yok_skip_closed.get(),
                 "watch_downloads": scan.watch_var.get(), "scan_day": scan.day_menu.get(),
                 "auto_tag": scan.autotag_var.get(), "auto_update": scan.update_var.get(),
@@ -17021,6 +17399,18 @@ class App(ctk.CTk):
             self._profile_scanned(*message[1:])
         elif kind == "profile_imported":
             self._profile_imported(*message[1:])
+        elif kind == "bookfix":
+            n, total, title = message[1:]
+            self.library_tab.count_label.configure(text=f"Kitap künyesi tamamlanıyor {n + 1}/{total}: {shorten(title, 50)}")
+        elif kind == "bookfix_done":
+            updated, tried, limited = message[1:]
+            self.library_tab.refresh()
+            text = f"{tried} kitaptan {len(updated)} tanesinin künyesi/içerik bilgisi tamamlandı."
+            if limited:
+                text += (" Google Books günlük sınırına takıldı; Ayarlar'a ücretsiz Google Books anahtarı ekleyin ya da "
+                         "yarın yeniden deneyin.")
+            self.toast(text)
+            self._log("info", text)
         elif kind == "libs_found":
             self._libs_found(message[1])
         elif kind == "lib_connected":
