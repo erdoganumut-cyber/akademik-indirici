@@ -68,7 +68,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.56"
+APP_VERSION = "2.57"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -2575,9 +2575,15 @@ def book_needs_enrichment(item) -> bool:
     return bool(missing) or BOOK_INFO_START not in (item.get("notes") or "")
 
 
+_BOOK_FIELD_TR = {"title": "başlık", "authors": "yazar", "editors": "editör", "year": "yıl", "publisher": "yayınevi",
+                  "doi": "DOI", "keywords": "anahtar kelimeler", "notes": "notlar", "language": "dil",
+                  "container": "dizi/kitap", "type": "tür", "pages": "sayfa"}
+
+
 class BookEnrichWorker(threading.Thread):
     """Seçilen kitapların künyesini ve içerik bilgisini sırayla tamamlar.
-    Mesajlar: ("bookfix", sıra, toplam, başlık) · ("bookfix_done", güncellenen, denenen, sınır_mesajı)"""
+    Mesajlar: ("bookfix", sıra, toplam, başlık) · ("bookfix_done", güncellenen, denenen, sınır_mesajı, ayrıntı)
+    ayrıntı: [(No, başlık, değişen alanlar (Türkçe), bölüm sayısı, bulunamadıysa nedeni)]"""
 
     def __init__(self, library, items, events):
         super().__init__(daemon=True, name="kitap-kunyesi")
@@ -2585,7 +2591,7 @@ class BookEnrichWorker(threading.Thread):
         self.cancel = threading.Event()
 
     def run(self):
-        updated, tried, limited = [], 0, ""
+        updated, tried, limited, details = [], 0, "", []
         session = make_session()
         try:
             for n, item in enumerate(self.items):
@@ -2593,19 +2599,38 @@ class BookEnrichWorker(threading.Thread):
                     break
                 self.events.put(("bookfix", n, len(self.items), item.get("title") or ""))
                 tried += 1
+                current = self.library.get(item["id"]) or item
                 try:
-                    info = enrich_book(session, self.library.get(item["id"]) or item)
-                    if apply_book_enrichment(self.library, item["id"], info):
+                    info = enrich_book(session, current)
+                    changed = apply_book_enrichment(self.library, item["id"], info)
+                    if changed:
                         updated.append(item.get("no") or item["id"])
+                    why = ""
+                    if not changed:
+                        if info.get("limited"):
+                            why = "Google Books günlük sınırı"
+                        elif not info.get("isbns") and not google_volume_id(current.get("url")):
+                            why = "ISBN ya da Google Books bağlantısı yok"
+                        elif not info.get("record"):
+                            why = "Google Books ve Crossref'te künye bulunamadı"
+                        else:
+                            why = "eklenecek yeni bilgi yok (künye zaten dolu)"
+                    after = self.library.get(item["id"]) or current
+                    details.append((after.get("no") or item["id"], after.get("title") or "",
+                                    [_BOOK_FIELD_TR.get(f, f) for f in sorted(changed, key=lambda f: (
+                                        list(_BOOK_FIELD_TR).index(f) if f in _BOOK_FIELD_TR else 99))],
+                                    info.get("chapters") or 0, why))
                     if info.get("limited"):
                         limited = info["limited"]
                         break
-                except Exception:
+                except Exception as exc:
                     diag_exception(f"kitap künyesi: {item.get('title', '')[:60]}")
+                    details.append((item.get("no") or item["id"], item.get("title") or "", [], 0,
+                                    f"hata: {describe_error(exc)}"))
                 time.sleep(1.0)
         finally:
             session.close()
-            self.events.put(("bookfix_done", updated, tried, limited))
+            self.events.put(("bookfix_done", updated, tried, limited, details))
 
 
 # ── Kitap boyutundaki PDF'ler: bildiri kitapları ve ISBN'li kitaplar ───────────────────────
@@ -13437,7 +13462,7 @@ class LibraryTab:
                 self._search_elsewhere(choice.split(": ", 1)[1])
             return
         if choice.startswith("Kitap künyesini yenile"):
-            item = self.lib.get(self.current) if self.current else None
+            item = self.lib.get(self.current["id"]) if self.current else None
             if not item:
                 self.app.toast("Önce bir kaynak seçin.")
             elif not (google_volume_id(item.get("url")) or isbns_in_notes(item.get("notes"))):
@@ -17403,14 +17428,30 @@ class App(ctk.CTk):
             n, total, title = message[1:]
             self.library_tab.count_label.configure(text=f"Kitap künyesi tamamlanıyor {n + 1}/{total}: {shorten(title, 50)}")
         elif kind == "bookfix_done":
-            updated, tried, limited = message[1:]
-            self.library_tab.refresh()
-            text = f"{tried} kitaptan {len(updated)} tanesinin künyesi/içerik bilgisi tamamlandı."
+            updated, tried, limited, details = message[1:]
+            tab = self.library_tab
+            tab.refresh()
+            cur = tab.current
+            if cur and tab.lib.get(cur["id"]):
+                tab._show(tab.lib.get(cur["id"]))          # ayrıntı paneli de yeni hâliyle
+            lines = []
+            for no, title, fields, chapters, why in details:
+                if fields:
+                    extra = f" (içindekiler: {chapters} bölüm)" if chapters and "notlar" in fields else ""
+                    lines.append(f"No {no}: {', '.join(fields)}{extra} — {shorten(title, 60)}")
+                else:
+                    lines.append(f"No {no}: değişiklik yok — {why} — {shorten(title, 60)}")
+            text = f"{tried} kitaptan {len(updated)} tanesi güncellendi."
             if limited:
                 text += (" Google Books günlük sınırına takıldı; Ayarlar'a ücretsiz Google Books anahtarı ekleyin ya da "
                          "yarın yeniden deneyin.")
-            self.toast(text)
+            for line in lines:
+                self._log("info", "Kitap künyesi · " + line)
             self._log("info", text)
+            if len(details) <= 3:
+                self.toast(" · ".join(lines) or text)
+            else:
+                self.toast(text + " Ayrıntılar Tarama sekmesindeki günlükte.")
         elif kind == "libs_found":
             self._libs_found(message[1])
         elif kind == "lib_connected":
