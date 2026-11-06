@@ -68,7 +68,7 @@ if sys.stderr is None:
 
 
 APP_NAME = "Akademik Kaynak İndirici"
-APP_VERSION = "2.57"
+APP_VERSION = "2.58"
 # Bu kodu çalıştırabilecek en eski program (exe) sürümü. Yeni bir kütüphane eklenince yükseltilir;
 # eski exe bu durumda kendi sürümüyle açılır ve kullanıcıya exe'yi bir kez güncellemesini söyler.
 MIN_LAUNCHER = "2.6"
@@ -1588,7 +1588,7 @@ ITEM_TYPES = {
 }
 TYPE_BY_LABEL = {label: key for key, label in ITEM_TYPES.items()}
 RECORD_FIELDS = ("title", "authors", "year", "type", "container", "volume", "issue", "pages",
-                 "publisher", "doi", "url", "editors", "institution", "language", "keywords", "issn")
+                 "publisher", "doi", "url", "editors", "institution", "language", "keywords", "issn", "isbn")
 
 _CROSSREF_TYPES = {
     "journal-article": "article", "book-chapter": "chapter", "book-section": "chapter",
@@ -1848,6 +1848,9 @@ def finalize_record(rec: dict) -> dict:
     rec["title"] = rec["title"].rstrip(" .")
     rec["pages"] = re.sub(r"^(?:pp?\.|ss?\.)\s*", "", rec["pages"]).replace("--", "–").replace("-", "–")
     rec["doi"] = normalize_doi(rec["doi"]) or ""
+    if isinstance(rec.get("isbn"), (list, tuple)):
+        rec["isbn"] = join_isbns(rec["isbn"])
+    rec["isbn"] = join_isbns(rec.get("isbn") or "") or (rec.get("isbn") or "").strip()
     rec["issn"] = join_issns(find_issns(rec["issn"]))
     m = re.search(r"\b(1[5-9]\d\d|20\d\d)\b", rec["year"] or "")
     rec["year"] = m.group(1) if m else ""
@@ -2269,6 +2272,7 @@ def book_record_by_isbn(session, isbn: str) -> dict:
                     rec = record_from_crossref(msg)
                     if rec.get("title"):
                         rec["type"] = "book"
+                        rec["isbn"] = join_isbns([isbn] + list(msg.get("ISBN") or []))
                         return rec
     except (requests.RequestException, ValueError, AttributeError):
         pass
@@ -2276,7 +2280,9 @@ def book_record_by_isbn(session, isbn: str) -> dict:
         items = google_books_get(session, "", {"q": f"isbn:{isbn}"}).get("items") or []
         if items:
             rec = google_volume_record(items[0])
-            return {k: v for k, v in rec.items() if not k.startswith("_")}
+            out = {k: v for k, v in rec.items() if not k.startswith("_")}
+            out["isbn"] = join_isbns([isbn] + list(rec.get("_isbns") or []))
+            return out
     except GoogleBooksLimit as exc:
         diag(f"ISBN {isbn}: {exc}", throttle=True)
     except (requests.RequestException, ValueError, AttributeError):
@@ -2470,12 +2476,38 @@ def isbns_in_notes(notes) -> list:
     return found
 
 
+_ISBN_LINE_RE = re.compile(r"^[ \t]*ISBN[^:\n]*:[ \t]*[0-9Xx\- ,;]+[ \t]*$\n?", re.M)
+
+
+def strip_isbn_lines(notes) -> str:
+    """Notlardaki yalnızca ISBN taşıyan satırları ('ISBN: 978…') çıkarır."""
+    return re.sub(r"\n{3,}", "\n\n", _ISBN_LINE_RE.sub("", notes or "")).strip()
+
+
+def item_isbns(item) -> list:
+    """Kaydın ISBN alanındaki ve (eski kayıtlarda) notlarındaki ISBN'ler."""
+    out = find_isbns((item or {}).get("isbn") or "")
+    for code in isbns_in_notes((item or {}).get("notes")):
+        if code not in out:
+            out.append(code)
+    return out
+
+
+def join_isbns(*groups) -> str:
+    out = []
+    for g in groups:
+        for code in (find_isbns(g) if isinstance(g, str) else [find_isbn(str(c)) for c in g or []]):
+            if code and code not in out:
+                out.append(code)
+    return ", ".join(out)
+
+
 def enrich_book(session, item, url="", isbn_hint="") -> dict:
     """Kitabın künyesini, ISBN'lerini, DOI'sini, konularını, tanıtımını ve içindekilerini açık servislerden toplar.
     Dönüş: {"record", "isbns", "block", "text", "sources", "limited"}"""
     url = url or (item or {}).get("url") or ""
     isbns = []
-    for code in ([isbn_hint] if isbn_hint else []) + isbns_in_notes((item or {}).get("notes")):
+    for code in ([isbn_hint] if isbn_hint else []) + item_isbns(item):
         code = find_isbn(code) if code else ""
         if code and code not in isbns:
             isbns.append(code)
@@ -2530,7 +2562,7 @@ def apply_book_enrichment(library, item_id, info) -> list:
     rec = info.get("record") or {}
     updates = {}
     for k in RECORD_FIELDS:
-        if k in ("keywords", "url", "type"):
+        if k in ("keywords", "url", "type", "isbn"):
             continue
         v = rec.get(k)
         if not v:
@@ -2544,11 +2576,10 @@ def apply_book_enrichment(library, item_id, info) -> list:
             updates["keywords"] = merged
     if old.get("type") in ("other", "", None) and rec.get("type"):
         updates["type"] = rec["type"]
-    notes = old.get("notes") or ""
-    have = set(isbns_in_notes(notes))
-    extra = [c for c in info.get("isbns") or [] if c not in have]
-    if extra:
-        notes = (notes.rstrip() + "\n" if notes.strip() else "") + "ISBN: " + ", ".join(extra)
+    isbn = join_isbns(old.get("isbn") or "", isbns_in_notes(old.get("notes")), info.get("isbns") or [])
+    if isbn != (old.get("isbn") or ""):
+        updates["isbn"] = isbn
+    notes = strip_isbn_lines(old.get("notes")) if isbns_in_notes(old.get("notes")) else (old.get("notes") or "")
     if info.get("block"):
         notes = replace_book_block(notes, info["block"])
     if notes != (old.get("notes") or ""):
@@ -2567,7 +2598,7 @@ def book_needs_enrichment(item) -> bool:
     """Toplu tamamlamaya girecek kitaplar: bağlantısı ya da ISBN'i olup künyesi ya da içerik bilgisi eksik olanlar."""
     if (item.get("type") or "") != "book":
         return False
-    if not (google_volume_id(item.get("url")) or isbns_in_notes(item.get("notes"))):
+    if not (google_volume_id(item.get("url")) or item_isbns(item)):
         return False
     if PLACEHOLDER_TITLE_RE.search(item.get("title") or ""):
         return True
@@ -2577,13 +2608,13 @@ def book_needs_enrichment(item) -> bool:
 
 _BOOK_FIELD_TR = {"title": "başlık", "authors": "yazar", "editors": "editör", "year": "yıl", "publisher": "yayınevi",
                   "doi": "DOI", "keywords": "anahtar kelimeler", "notes": "notlar", "language": "dil",
-                  "container": "dizi/kitap", "type": "tür", "pages": "sayfa"}
+                  "container": "dizi/kitap", "type": "tür", "pages": "sayfa", "isbn": "ISBN"}
 
 
 class BookEnrichWorker(threading.Thread):
     """Seçilen kitapların künyesini ve içerik bilgisini sırayla tamamlar.
     Mesajlar: ("bookfix", sıra, toplam, başlık) · ("bookfix_done", güncellenen, denenen, sınır_mesajı, ayrıntı)
-    ayrıntı: [(No, başlık, değişen alanlar (Türkçe), bölüm sayısı, bulunamadıysa nedeni)]"""
+    ayrıntı: [(No, başlık, değişen alanlar (Türkçe), bölüm sayısı, bulunamadıysa nedeni, kimlik)]"""
 
     def __init__(self, library, items, events):
         super().__init__(daemon=True, name="kitap-kunyesi")
@@ -2609,7 +2640,8 @@ class BookEnrichWorker(threading.Thread):
                     if not changed:
                         if info.get("limited"):
                             why = "Google Books günlük sınırı"
-                        elif not info.get("isbns") and not google_volume_id(current.get("url")):
+                        elif not info.get("isbns") and not google_volume_id(current.get("url")) \
+                                and not current.get("isbn"):
                             why = "ISBN ya da Google Books bağlantısı yok"
                         elif not info.get("record"):
                             why = "Google Books ve Crossref'te künye bulunamadı"
@@ -2619,14 +2651,14 @@ class BookEnrichWorker(threading.Thread):
                     details.append((after.get("no") or item["id"], after.get("title") or "",
                                     [_BOOK_FIELD_TR.get(f, f) for f in sorted(changed, key=lambda f: (
                                         list(_BOOK_FIELD_TR).index(f) if f in _BOOK_FIELD_TR else 99))],
-                                    info.get("chapters") or 0, why))
+                                    info.get("chapters") or 0, why, item["id"]))
                     if info.get("limited"):
                         limited = info["limited"]
                         break
                 except Exception as exc:
                     diag_exception(f"kitap künyesi: {item.get('title', '')[:60]}")
                     details.append((item.get("no") or item["id"], item.get("title") or "", [], 0,
-                                    f"hata: {describe_error(exc)}"))
+                                    f"hata: {describe_error(exc)}", item["id"]))
                 time.sleep(1.0)
         finally:
             session.close()
@@ -2840,6 +2872,7 @@ def book_like_record(session, path) -> dict:
     if not proc and not looked:
         return {}
     rec = merge_records(proc, looked) if proc else merge_records(looked, {})
+    rec["isbn"] = join_isbns(rec.get("isbn") or "", isbns)
     if proc and not proc.get("editors") and looked.get("authors"):
         rec["editors"], rec["authors"] = looked["authors"], []        # bildiri kitabında yazar değil editör
     rec["type"] = "book"
@@ -3049,8 +3082,11 @@ def add_online_book(library, session, url, tags=(), library_folder=None, auto_ta
         except Exception as exc:
             diag(f"kitap bilgisi ({url}): {describe_error(exc)}")
     item = library.get(item_id)
-    notes = [n for n in [item.get("notes"), f"ISBN: {info['isbn']}" if info["isbn"] and info["isbn"] not in
-                         isbns_in_notes(item.get("notes")) else ""] if n]
+    if info["isbn"]:
+        isbn = join_isbns(item.get("isbn") or "", [info["isbn"]])
+        if isbn != (item.get("isbn") or ""):
+            library.update(item_id, {"isbn": isbn})
+    notes = [item.get("notes")] if item.get("notes") else []
     attached = False
     if not (item["file_path"] and os.path.exists(item["file_path"])) and info["files"] and library_folder:
         for link in info["files"]:
@@ -3122,7 +3158,7 @@ def catalog_ebook(library, session, path: Path, sha: str, tags=(), log=None, lib
     record = ebook_record(session, path, info)
     notes = []
     if info.get("isbn"):
-        notes.append(f"ISBN: {info['isbn']}")
+        record["isbn"] = join_isbns(record.get("isbn") or "", [find_isbn(info["isbn"]) or info["isbn"]])
     if acsm:
         notes.append(ACSM_NOTE)
     elif info.get("drm"):
@@ -3134,6 +3170,8 @@ def catalog_ebook(library, session, path: Path, sha: str, tags=(), log=None, lib
     if existing:
         old = library.get(existing)
         library.add_tags(existing, tags)
+        if record.get("isbn") and not old.get("isbn"):
+            library.update(existing, {"isbn": record["isbn"]})
         if acsm or (old["file_path"] and Path(old["file_path"]).is_file()):
             if log:
                 log("muted", f"   📚 Zaten kütüphanede: {old['title'][:80]}")
@@ -3525,6 +3563,7 @@ def to_bibtex(records) -> str:
                    ("pages", (rec.get("pages") or "").replace("–", "--")),
                    ("publisher", rec.get("publisher")),
                    ("school", rec.get("institution") if kind.endswith("thesis") else ""),
+                   ("isbn", rec.get("isbn") if kind == "book" else ""),
                    ("doi", rec.get("doi")), ("url", rec.get("url")), ("language", rec.get("language")),
                    ("keywords", ", ".join(split_keywords(rec.get("keywords", "")) + list(rec.get("tags") or [])))]
         body = ",\n".join(f"  {k} = {{{_bib_escape(str(v))}}}" for k, v in fields if v)
@@ -3545,6 +3584,8 @@ def to_ris(records) -> str:
                            ("DO", rec.get("doi")), ("UR", rec.get("url")), ("LA", rec.get("language"))):
             if value:
                 lines.append(f"{tag}  - {value}")
+        if rec.get("type") == "book":
+            lines += [f"SN  - {code}" for code in find_isbns(rec.get("isbn") or "")]
         lines += [f"KW  - {t}" for t in split_keywords(rec.get("keywords", "")) + list(rec.get("tags") or [])]
         lines.append("ER  - ")
         out.append("\n".join(lines))
@@ -3666,6 +3707,7 @@ _EXTRA_COLUMNS = {
     "pdf_tried": "TEXT DEFAULT ''",     # PDF'siz kaynak için en son ne zaman PDF arandı (YYYY-AA-GG)
     "no": "INTEGER DEFAULT 0",          # kayıt numarası: 1, 2, 3… (eklenme sırası, hiç değişmez)
     "ai_ozet": "TEXT DEFAULT ''",       # Claude'un kaynağı okuyup kaydettiği yapılandırılmış özet
+    "isbn": "TEXT DEFAULT ''",          # kitabın ISBN'leri ('9780197760031, 9780197791967')
 }
 
 
@@ -3786,6 +3828,17 @@ class Library:
                 if column not in have:
                     self.db.execute(f"ALTER TABLE items ADD COLUMN {column} {decl}")
             self._number_items()
+            self._move_isbn_notes()
+
+    def _move_isbn_notes(self):
+        """Notlarda 'ISBN: …' satırı olup ISBN alanı boş olan kayıtların ISBN'lerini alana taşır (bir kez)."""
+        rows = self.db.execute("SELECT id, notes FROM items WHERE (isbn IS NULL OR isbn='') "
+                               "AND notes LIKE '%ISBN%'").fetchall()
+        for item_id, notes in rows:
+            codes = isbns_in_notes(notes)
+            if codes:
+                self.db.execute("UPDATE items SET isbn=?, notes=? WHERE id=?",
+                                (", ".join(codes), strip_isbn_lines(notes), item_id))
 
     def _number_items(self):
         """Numarasız (ya da başka kayıtla aynı numaralı) kaynaklara sıradaki numarayı verir.
@@ -4066,13 +4119,13 @@ class Library:
             cur = self.db.execute(
                 "INSERT INTO items (title, authors, year, type, container, volume, issue, pages, "
                 "publisher, doi, url, editors, institution, language, file_path, sha256, added, "
-                "source, is_new, matched, keywords, issn, no) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "source, is_new, matched, keywords, issn, isbn, no) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (rec["title"], json.dumps(rec["authors"], ensure_ascii=False), rec["year"], rec["type"],
                  rec["container"], rec["volume"], rec["issue"], rec["pages"], rec["publisher"],
                  rec["doi"], rec["url"], json.dumps(rec["editors"], ensure_ascii=False),
                  rec["institution"], rec["language"], self._stored(file_path), sha,
                  datetime.now().strftime("%Y-%m-%d"), source, 1 if is_new else 0, matched,
-                 rec["keywords"], rec["issn"],
+                 rec["keywords"], rec["issn"], rec.get("isbn") or "",
                  max(self.db.execute("SELECT COALESCE(MAX(no), 0) FROM items").fetchone()[0], self._last_no()) + 1))
             item_id = cur.lastrowid
             self.db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('last_no', "
@@ -5025,7 +5078,7 @@ def parse_bibtex(text: str) -> list:
                "doi": fields.get("doi", ""), "url": fields.get("url", ""),
                "publisher": fields.get("publisher", ""), "institution": fields.get("school") or fields.get("institution", ""),
                "language": fields.get("language", ""), "_kw": split_keywords(fields.get("keywords", "")),
-               "_issn": [fields.get("issn", "")], "_abstract": fields.get("abstract", "")}
+               "_issn": [fields.get("issn", ""), fields.get("isbn", "")], "_abstract": fields.get("abstract", "")}
         out.append(rec)
     return out
 
@@ -5049,7 +5102,9 @@ def import_references(library, path, tags=(), auto_tags=None) -> tuple:
             continue
         abstract = rec.pop("_abstract", "")
         rec["keywords"] = join_keywords(rec.pop("_kw", []))
-        rec["issn"] = join_issns(rec.pop("_issn", []))
+        codes = rec.pop("_issn", [])
+        rec["issn"] = join_issns(codes)
+        rec["isbn"] = join_isbns(" ".join(codes)) if rec.get("type") in ("book", "chapter") else ""
         known = library.find_by_doi(rec.get("doi")) or library.find_by_title(rec.get("title"))
         if known:
             library.add_tags(known, tags)
@@ -13397,7 +13452,8 @@ class LibraryTab:
                 ("volume", "Cilt", ""), ("issue", "Sayı", ""), ("pages", "Sayfa", "45–67"),
                 ("publisher", "Yayınevi", ""), ("editors", "Editörler", "Soyad, Ad; Soyad, Ad"),
                 ("institution", "Kurum (tez)", ""), ("doi", "DOI", "10.xxxx/…"),
-                ("issn", "ISSN", "1234-5678"), ("url", "Link", ""),
+                ("issn", "ISSN", "1234-5678"), ("isbn", "ISBN", "978… (kitaplar; birden çoksa virgülle)"),
+                ("url", "Link", ""),
                 ("keywords", "Anahtar kelimeler", "makalenin kendi anahtar kelimeleri"),
                 ("tags", "Etiketler", "virgülle ayırın")], start=1):
             entry = ctk.CTkEntry(form, placeholder_text=hint, height=30)
@@ -13405,9 +13461,11 @@ class LibraryTab:
             self.f[key] = entry
         self.f_type = ctk.CTkOptionMenu(form, values=list(ITEM_TYPES.values()), height=30)
         self._field(form, row + 1, "Tür", self.f_type)
+        self.f_notes = ctk.CTkTextbox(form, height=120, wrap="word", border_width=1, font=ctk.CTkFont(size=12))
+        self._field(form, row + 2, "Notlar", self.f_notes)
         self.matched_label = ctk.CTkLabel(form, text="", text_color=MUTED, font=ctk.CTkFont(size=11),
                                           anchor="w", justify="left", wraplength=360)
-        self.matched_label.grid(row=row + 2, column=0, columnspan=2, sticky="ew", padx=4, pady=(6, 0))
+        self.matched_label.grid(row=row + 3, column=0, columnspan=2, sticky="ew", padx=4, pady=(6, 0))
 
         btns = ctk.CTkFrame(tab, fg_color="transparent")
         btns.grid(row=2, column=0, sticky="ew", pady=(6, 0))
@@ -13465,8 +13523,8 @@ class LibraryTab:
             item = self.lib.get(self.current["id"]) if self.current else None
             if not item:
                 self.app.toast("Önce bir kaynak seçin.")
-            elif not (google_volume_id(item.get("url")) or isbns_in_notes(item.get("notes"))):
-                self.app.toast("Bu kaydın Google Books bağlantısı ya da ISBN'i yok; notlara 'ISBN: …' yazıp yeniden deneyin.")
+            elif not (google_volume_id(item.get("url")) or item_isbns(item)):
+                self.ask_isbn(item)
             else:
                 self._start_bookfix([item])
             return
@@ -13739,6 +13797,7 @@ class LibraryTab:
             self.remove_btn.configure(state="normal")
             self.reviewed_btn.configure(state="normal")
         self.f_title.delete("1.0", "end")
+        self.f_notes.delete("1.0", "end")
         for entry in self.f.values():
             entry.delete(0, "end")
         for w in self.cards_frame.winfo_children():
@@ -13766,6 +13825,8 @@ class LibraryTab:
             tried = f" · son arama: {item['pdf_tried']}" if item.get("pdf_tried") else ""
             self.pdf_label.configure(text=f"{no}PDF yok{hint}{tried}", text_color=LOG_COLORS["warn"])
         self.f_title.insert("1.0", item["title"])
+        if item.get("notes"):
+            self.f_notes.insert("1.0", item["notes"])
         values = dict(item, authors=people_to_text(item["authors"]), editors=people_to_text(item["editors"]),
                       tags=", ".join(item["tags"]))
         for key, entry in self.f.items():
@@ -13805,7 +13866,15 @@ class LibraryTab:
         tags = clean_tags(rec.pop("tags"))
         fixed = finalize_record(rec)
         fixed["title"] = rec["title"].strip().rstrip(".")       # kullanıcının yazımına dokunma
-        self.lib.update(self.current["id"], {k: fixed[k] for k in RECORD_FIELDS})
+        if rec.get("isbn") and not find_isbns(rec["isbn"]):
+            messagebox.showwarning(APP_NAME, "ISBN geçerli görünmüyor (10 ya da 13 haneli olmalı, ör. 978-0-19-776003-1). "
+                                   "Yazdığınız biçimiyle kaydedildi; kontrol edin.", parent=self.parent)
+        update = {k: fixed[k] for k in RECORD_FIELDS}
+        old = self.lib.get(self.current["id"]) or {}
+        notes = self.f_notes.get("1.0", "end").strip()
+        if notes != (old.get("notes") or "").strip():
+            update["notes"] = notes
+        self.lib.update(self.current["id"], update)
         self.lib.set_tags(self.current["id"], tags)
         item_id = self.current["id"]
         # PDF'in adı yeni künyeye uysun
@@ -14031,6 +14100,29 @@ class LibraryTab:
                           "boş alanlar dolar; yazdıklarınız değişmez. Kitapların sayfaları okunmaz.", parent=self.parent):
             return
         self._start_bookfix(items)
+
+    def ask_isbn(self, item, why=""):
+        """Kitabın ISBN'ini sorar; yazılırsa ISBN alanına kaydedip künyeyi ISBN'den yeniden tamamlar."""
+        first = ("Google künye vermedi; kitabın ISBN'ini yazın." if why else
+                 "Bu kaydın ISBN'i ya da Google Books bağlantısı yok; kitabın ISBN'ini yazın.")
+        dialog = ctk.CTkInputDialog(title="Kitabın ISBN'i", text=(
+            f"{first}\n\n{shorten(item.get('title') or '', 80)}\n\nISBN kitabın künye sayfasında, arka kapağında ya da "
+            "yayınevinin sayfasında yazar (978… ile başlayan 13 hane). Birden çok baskının ISBN'ini virgülle yazabilirsiniz."))
+        value = (dialog.get_input() or "").strip()
+        if not value:
+            return False
+        codes = find_isbns(value)
+        if not codes:
+            messagebox.showwarning(APP_NAME, "Geçerli bir ISBN bulunamadı. 10 ya da 13 haneli olmalı "
+                                   "(ör. 978-0-19-776003-1).", parent=self.parent)
+            return False
+        current = self.lib.get(item["id"]) or item
+        self.lib.update(item["id"], {"isbn": join_isbns(current.get("isbn") or "", codes)})
+        if self.current and self.current.get("id") == item["id"]:
+            self._show(self.lib.get(item["id"]))
+        self.app.toast(f"ISBN kaydedildi ({', '.join(codes)}); künye ISBN'den tamamlanıyor…")
+        self._start_bookfix([self.lib.get(item["id"])])
+        return True
 
     def _start_bookfix(self, items):
         worker = getattr(self.app, "bookfix_worker", None)
@@ -14301,7 +14393,7 @@ class LibraryTab:
                         existing.append(found)
                         continue
                     item_id, _ = lib.add(rec, tags=list(tags) + auto_group_tags(rec, "", auto), source="elle")
-                    lib.update(item_id, {"notes": f"ISBN: {isbn}"})
+                    lib.update(item_id, {"isbn": join_isbns(lib.get(item_id).get("isbn") or "", [isbn])})
                     added.append(item_id)
             except Exception:
                 diag_exception("ISBN ile ekleme")
@@ -17435,7 +17527,7 @@ class App(ctk.CTk):
             if cur and tab.lib.get(cur["id"]):
                 tab._show(tab.lib.get(cur["id"]))          # ayrıntı paneli de yeni hâliyle
             lines = []
-            for no, title, fields, chapters, why in details:
+            for no, title, fields, chapters, why, _id in details:
                 if fields:
                     extra = f" (içindekiler: {chapters} bölüm)" if chapters and "notlar" in fields else ""
                     lines.append(f"No {no}: {', '.join(fields)}{extra} — {shorten(title, 60)}")
@@ -17452,6 +17544,10 @@ class App(ctk.CTk):
                 self.toast(" · ".join(lines) or text)
             else:
                 self.toast(text + " Ayrıntılar Tarama sekmesindeki günlükte.")
+            if len(details) == 1 and not details[0][2]:
+                why, item = details[0][4], tab.lib.get(details[0][5])
+                if item and not item_isbns(item) and not why.startswith("eklenecek") and not why.startswith("hata"):
+                    self.after(150, lambda it=item, w=why: tab.ask_isbn(it, w))     # ISBN'le yeniden denensin
         elif kind == "libs_found":
             self._libs_found(message[1])
         elif kind == "lib_connected":
